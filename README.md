@@ -85,10 +85,6 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 
 ## 🧪 Development
 
-- **Run Tests**: `cargo test`
-- **Linting**: `cargo clippy`
-- **Formatting**: `cargo fmt`
-
 ### Stress Testing
 
 You can use the provided `test_dispatcher.sh` script to simulate multiple users and verify the dispatcher's behavior under load:
