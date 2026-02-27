@@ -21,15 +21,23 @@
 
 Ensure you have [Rust](https://rustup.rs/) (2024 edition or later) and [Ollama](https://ollama.ai/) installed.
 
+### Option 1: Install via Cargo (Recommended)
+
+```bash
+cargo install --git https://github.com/yourusername/ollamaMQ.git
+```
+
+### Option 2: From Source
+
 1. Clone the repository:
    ```bash
    git clone https://github.com/yourusername/ollamaMQ.git
    cd ollamaMQ
    ```
 
-2. Build the project:
+2. Build and install locally:
    ```bash
-   cargo build --release
+   cargo install --path .
    ```
 
 ## 🏃 Usage
@@ -37,9 +45,22 @@ Ensure you have [Rust](https://rustup.rs/) (2024 edition or later) and [Ollama](
 1. Start your local Ollama instance (defaulting to `localhost:11434`).
 2. Run `ollamaMQ`:
    ```bash
-   cargo run
+   ollamaMQ
    ```
-   The dispatcher will start listening on `http://0.0.0.0:11435`.
+
+### Command Line Arguments
+
+`ollamaMQ` supports several options to configure the proxy:
+
+- `-p, --port <PORT>`: Port to listen on (default: `11435`)
+- `-o, --ollama-url <URL>`: Ollama server URL (default: `http://localhost:11434`)
+- `-h, --help`: Print help message
+- `-V, --version`: Print version information
+
+**Example:**
+```bash
+ollamaMQ --port 8080 --ollama-url http://192.168.1.5:11434
+```
 
 ### API Proxying
 
