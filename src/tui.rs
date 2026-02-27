@@ -107,7 +107,7 @@ impl TuiDashboard {
         let queues_table = self.render_queues(state, content_chunks[1].width);
         f.render_stateful_widget(queues_table, content_chunks[1], &mut self.table_state);
 
-        // Render Help Bar
+        // Render Help Bar (now also showing version)
         f.render_widget(self.render_help(), main_chunks[2]);
 
         // Render Detailed Help if toggled
@@ -288,7 +288,7 @@ impl TuiDashboard {
 
         Table::new(rows, col_widths)
         .header(
-            Row::new(vec!["User ID", "Visualization", "Num (%)"])
+            Row::new(vec!["User ID", "Progress", "Num (%)"])
                 .style(Style::default().fg(Color::Yellow).bold())
                 .bottom_margin(1),
         )
@@ -302,8 +302,20 @@ impl TuiDashboard {
     }
 
     fn render_help(&self) -> Paragraph<'_> {
+        let version = env!("CARGO_PKG_VERSION");
+        let version_span = Span::styled(
+            format!(" v{} ", version),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        );
+
         Paragraph::new(" Press '?' for help, 'q' to quit, 'j/k' to scroll")
-            .block(Block::default().borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title_bottom(
+                        Line::from(version_span).alignment(Alignment::Right)
+                    ),
+            )
             .style(Style::default().fg(Color::White))
     }
 

@@ -24,7 +24,7 @@ Ensure you have [Rust](https://rustup.rs/) (2024 edition or later) and [Ollama](
 ### Option 1: Install via Cargo (Recommended)
 
 ```bash
-cargo install --git https://github.com/Chleba/ollamaMQ.git
+cargo install ollamaMQ
 ```
 
 ### Option 2: From Source
