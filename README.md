@@ -15,7 +15,7 @@
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints, making it easy to use with existing tools and libraries.
 - **Async Architecture**: Built on `tokio` and `axum` for non-blocking I/O and high concurrency.
 
-![ollamaMQ TUI Dashboard](demo.png)
+![ollamaMQ TUI Dashboard](demo.gif)
 
 ## 🛠️ Installation
 
@@ -70,6 +70,10 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 - **`q`** or **Esc**: Exit the dashboard.
 - **`h`**: Toggle detailed help.
 
+### Logging
+
+Logs are automatically written to `ollamamq.log` in the current working directory. This keeps the terminal clear for the TUI dashboard while allowing you to monitor system events and debug backend communication.
+
 ## 🏗️ Architecture
 
 - **`src/main.rs`**: Entry point, HTTP server initialization, and TUI lifecycle management.
@@ -93,7 +97,7 @@ You can use the provided `test_dispatcher.sh` script to simulate multiple users 
 ./test_dispatcher.sh
 ```
 
-![ollamaMQ Stress Test](demo-test.png)
+![ollamaMQ Stress Test](demo-test.gif)
 
 ## 📝 License
 

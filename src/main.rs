@@ -19,8 +19,12 @@ struct TuiState {
 
 #[tokio::main]
 async fn main() {
+    let file_appender = tracing_appender::rolling::never(".", "ollamamq.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking)
+        .with_ansi(false)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
