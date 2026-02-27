@@ -2,6 +2,11 @@
 name = "ollamaMQ"
 version = "0.1.1"
 edition = "2024"
+description = "High-performance Ollama proxy with per-user fair-share queuing, round-robin scheduling, and a real-time TUI dashboard."
+license = "MIT"
+authors = ["Chleba <chlebik@gmail.com>"]
+repository = "https://github.com/Chleba/ollamaMQ"
+homepage = "https://github.com/Chleba/ollamaMQ"
 
 [dependencies]
 axum = "0.8.8"
