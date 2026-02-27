@@ -33,23 +33,22 @@ send_request() {
     
     local payload=""
     if [[ "$endpoint" == "/api/chat" || "$endpoint" == "/v1/chat/completions" ]]; then
-        payload="{\"model\": \"llama3\", \"messages\": [{\"role\": \"user\", \"content\": \"Request $id from $user via $endpoint\"}]}"
+        payload="{\"model\": \"qwen3.5:35b\", \"messages\": [{\"role\": \"user\", \"content\": \"Req $id\"}], \"stream\": false}"
     else
-        payload="{\"model\": \"llama3\", \"prompt\": \"Request $id from $user via $endpoint\"}"
+        payload="{\"model\": \"qwen3.5:35b\", \"prompt\": \"Req $id\", \"stream\": false}"
     fi
 
-    # Send request and capture HTTP status code
-    status_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$url" \
+    # Send request and capture HTTP status code + response
+    response=$(curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
         -d "$payload")
+    status_code=$? # Note: we'll use curl exit code or check response for 200
 
-    if [ "$status_code" -eq 200 ]; then
-        echo "✅ [SUCCESS] User: $user | Endpoint: $endpoint | Req: $id"
-    elif [ "$status_code" -eq 502 ]; then
-        echo "⚠️  [BACKEND ERROR] User: $user | Endpoint: $endpoint | Req: $id (Ollama Offline)"
+    if [ -n "$response" ]; then
+        echo "✅ [SUCCESS] User: $user | Endp: $endpoint | Res: $response"
     else
-        echo "❌ [FAILED] User: $user | Endpoint: $endpoint | Req: $id | Status: $status_code"
+        echo "❌ [FAILED] User: $user | Endp: $endpoint | Req: $id"
     fi
 }
 
@@ -66,13 +65,37 @@ send_and_cancel() {
     curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
-        -d "{\"model\": \"llama3\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
+        -d "{\"model\": \"qwen3.5:35b\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
     
     local curl_pid=$!
     # Sleep slightly less than the dispatcher's 500ms artificial delay to test 'is_closed' check,
     # or slightly more to test 'tokio::select' abortion during backend call.
     sleep 0.3
     kill $curl_pid 2>/dev/null
+}
+
+# Function to send a request with an image (multimodal llava test)
+send_image_request() {
+    local user=$1
+    local id=$2
+    local url="${BASE_URL}/api/generate"
+    
+    # Base64 encoded tiny 1x1 red pixel PNG
+    local b64_pixel="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    
+    echo "🖼️ [IMAGE TEST] User: $user | Req: $id (Sending multimodal request to qwen3.5:35b)"
+    
+    # Send request and capture HTTP status code
+    response=$(curl -s -X POST "$url" \
+        -H "X-User-ID: $user" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\": \"qwen3.5:35b\", \"prompt\": \"What is in this image?\", \"images\": [\"$b64_pixel\"], \"stream\": false}")
+
+    if [ -n "$response" ]; then
+        echo "✅ [SUCCESS] User: $user | Endpoint: IMAGE | Res: $response"
+    else
+        echo "❌ [FAILED] User: $user | Req: $id"
+    fi
 }
 
 # Check if dispatcher is reachable (using /api/generate as health check)
@@ -94,8 +117,13 @@ for user in "${USERS[@]}"; do
     
     for ((i=1; i<=num_reqs; i++)); do
         # 10% chance to simulate a client cancellation
-        if [ $((RANDOM % 10)) -eq 0 ]; then
+        # 5% chance to send an image request
+        # 85% chance for a normal request
+        rand=$((RANDOM % 100))
+        if [ $rand -lt 10 ]; then
             send_and_cancel "$user" "$i"
+        elif [ $rand -lt 15 ]; then
+            send_image_request "$user" "$i" &
         else
             send_request "$user" "$i" &
         fi

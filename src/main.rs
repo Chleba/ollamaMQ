@@ -47,6 +47,7 @@ async fn main() {
         .route("/api/chat", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
         .route("/v1/completions", post(proxy_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:11435")

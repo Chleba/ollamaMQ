@@ -43,26 +43,20 @@ pub async fn run_worker(state: Arc<AppState>) {
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .unwrap();
-    let mut current_user_keys: Vec<String> = Vec::new();
     let mut current_idx = 0;
 
     loop {
         let task_opt = {
             let mut queues = state.queues.lock().unwrap();
-
-            // Sync current_user_keys with actual queues to handle new users
-            for user_id in queues.keys() {
-                if !current_user_keys.contains(user_id) {
-                    current_user_keys.push(user_id.clone());
-                }
-            }
-
-            // Keep users in keys but only process those with tasks
-            let active_users: Vec<String> = current_user_keys
-                .iter()
-                .filter(|k| queues.contains_key(*k) && !queues.get(*k).unwrap().is_empty())
-                .cloned()
+            
+            // Get all user IDs that currently have tasks
+            let mut active_users: Vec<String> = queues.iter()
+                .filter(|(_, q)| !q.is_empty())
+                .map(|(k, _)| k.clone())
                 .collect();
+            
+            // Sort to ensure stable round-robin
+            active_users.sort();
 
             if active_users.is_empty() {
                 None
@@ -106,8 +100,24 @@ pub async fn run_worker(state: Arc<AppState>) {
                             Ok(response) => {
                                 let mut stream = response.bytes_stream();
                                 let mut client_disconnected = false;
-                                while let Some(chunk) = stream.next().await {
-                                    if task.responder.send(chunk).await.is_err() {
+                                let mut first_chunk = true;
+
+                                while let Some(chunk_res) = stream.next().await {
+                                    let chunk = match chunk_res {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            info!("Error reading from backend: {}", e);
+                                            break;
+                                        }
+                                    };
+
+                                    if first_chunk {
+                                        let content = String::from_utf8_lossy(&chunk);
+                                        info!("Response for user {}: {}", user_id, content.trim());
+                                        first_chunk = false;
+                                    }
+
+                                    if task.responder.send(Ok(chunk)).await.is_err() {
                                         info!("Client disconnected during streaming for user {}", user_id);
                                         client_disconnected = true;
                                         break;
@@ -139,6 +149,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 }
             }
             None => {
+                info!("Worker idle, waiting for tasks...");
                 state.notify.notified().await;
             }
         }
