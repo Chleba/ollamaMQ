@@ -24,15 +24,17 @@ pub struct AppState {
     pub processed_counts: Mutex<HashMap<String, usize>>,
     pub dropped_counts: Mutex<HashMap<String, usize>>,
     pub notify: Notify,
+    pub ollama_url: String,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(ollama_url: String) -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
             processed_counts: Mutex::new(HashMap::new()),
             dropped_counts: Mutex::new(HashMap::new()),
             notify: Notify::new(),
+            ollama_url,
         }
     }
 }
@@ -87,7 +89,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // Artificial delay to make TUI observation easier
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                let url = format!("http://localhost:11434{}", task.path);
+                let url = format!("{}{}", state.ollama_url, task.path);
                 
                 let res_fut = client
                     .post(url)

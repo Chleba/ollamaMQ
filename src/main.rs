@@ -2,6 +2,7 @@ use axum::{
     Router,
     routing::post,
 };
+use clap::Parser;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::info;
@@ -12,6 +13,18 @@ mod dispatcher;
 
 use crate::dispatcher::{AppState, run_worker, proxy_handler};
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 11435)]
+    port: u16,
+
+    /// Ollama server URL
+    #[arg(short, long, default_value = "http://localhost:11434")]
+    ollama_url: String,
+}
+
 struct TuiState {
     visible: bool,
     toggle_notify: Arc<Notify>,
@@ -19,6 +32,9 @@ struct TuiState {
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+    let ollama_url = args.ollama_url.trim_end_matches('/').to_string();
+    
     let file_appender = tracing_appender::rolling::never(".", "ollamamq.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
@@ -30,7 +46,7 @@ async fn main() {
         )
         .init();
 
-    let state = Arc::new(AppState::new());
+    let state = Arc::new(AppState::new(ollama_url));
 
     let tui_state = Arc::new(Mutex::new(TuiState {
         visible: true,
@@ -50,10 +66,11 @@ async fn main() {
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:11435")
+    let addr = format!("0.0.0.0:{}", args.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap();
-    info!("Dispatcher running on http://0.0.0.0:11435");
+    info!("Dispatcher running on http://{}", addr);
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
