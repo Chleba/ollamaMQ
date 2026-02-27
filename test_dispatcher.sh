@@ -46,7 +46,7 @@ send_request() {
     status_code=$? # Note: we'll use curl exit code or check response for 200
 
     if [ -n "$response" ]; then
-        echo "✅ [SUCCESS] User: $user | Endp: $endpoint | Res: $response"
+        echo "✅ [SUCCESS] User: $user | Endp: $endpoint | Res: ${response:0:100}"
     else
         echo "❌ [FAILED] User: $user | Endp: $endpoint | Req: $id"
     fi
@@ -92,7 +92,7 @@ send_image_request() {
         -d "{\"model\": \"qwen3.5:35b\", \"prompt\": \"What is in this image?\", \"images\": [\"$b64_pixel\"], \"stream\": false}")
 
     if [ -n "$response" ]; then
-        echo "✅ [SUCCESS] User: $user | Endpoint: IMAGE | Res: $response"
+        echo "✅ [SUCCESS] User: $user | Endpoint: IMAGE | Res: ${response:0:100}"
     else
         echo "❌ [FAILED] User: $user | Req: $id"
     fi
