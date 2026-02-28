@@ -1,17 +1,28 @@
 use axum::{
     body::{Body, Bytes},
-    extract::State,
-    http::{HeaderMap},
+    extract::{State, ConnectInfo},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures_util::StreamExt;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, HashSet},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
+    fs,
 };
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::info;
+use tracing::{info, warn};
+use serde::{Serialize, Deserialize};
+
+const BLOCKED_FILE: &str = "blocked_items.json";
+
+#[derive(Serialize, Deserialize, Default)]
+struct BlockedConfig {
+    ips: HashSet<IpAddr>,
+    users: HashSet<String>,
+}
 
 pub struct Task {
     pub path: String,
@@ -23,19 +34,91 @@ pub struct AppState {
     pub queues: Mutex<HashMap<String, VecDeque<Task>>>,
     pub processed_counts: Mutex<HashMap<String, usize>>,
     pub dropped_counts: Mutex<HashMap<String, usize>>,
+    pub user_ips: Mutex<HashMap<String, IpAddr>>,
+    pub blocked_ips: Mutex<HashSet<IpAddr>>,
+    pub blocked_users: Mutex<HashSet<String>>,
     pub notify: Notify,
     pub ollama_url: String,
 }
 
 impl AppState {
     pub fn new(ollama_url: String) -> Self {
+        let (blocked_ips, blocked_users) = Self::load_blocked_items();
         Self {
             queues: Mutex::new(HashMap::new()),
             processed_counts: Mutex::new(HashMap::new()),
             dropped_counts: Mutex::new(HashMap::new()),
+            user_ips: Mutex::new(HashMap::new()),
+            blocked_ips: Mutex::new(blocked_ips),
+            blocked_users: Mutex::new(blocked_users),
             notify: Notify::new(),
             ollama_url,
         }
+    }
+
+    fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
+        if let Ok(content) = fs::read_to_string(BLOCKED_FILE) {
+            if let Ok(config) = serde_json::from_str::<BlockedConfig>(&content) {
+                return (config.ips, config.users);
+            }
+        }
+        (HashSet::new(), HashSet::new())
+    }
+
+    fn save_blocked_items(&self) {
+        let config = BlockedConfig {
+            ips: self.blocked_ips.lock().unwrap().clone(),
+            users: self.blocked_users.lock().unwrap().clone(),
+        };
+        if let Ok(content) = serde_json::to_string_pretty(&config) {
+            let _ = fs::write(BLOCKED_FILE, content);
+        }
+    }
+
+    pub fn block_ip(&self, ip: IpAddr) {
+        {
+            let mut ips = self.blocked_ips.lock().unwrap();
+            ips.insert(ip);
+        }
+        self.save_blocked_items();
+        warn!("IP blocked: {}", ip);
+    }
+
+    pub fn block_user(&self, user_id: String) {
+        {
+            let mut users = self.blocked_users.lock().unwrap();
+            users.insert(user_id.clone());
+        }
+        self.save_blocked_items();
+        warn!("User blocked: {}", user_id);
+    }
+
+    #[allow(dead_code)]
+    pub fn unblock_ip(&self, ip: IpAddr) {
+        {
+            let mut ips = self.blocked_ips.lock().unwrap();
+            ips.remove(&ip);
+        }
+        self.save_blocked_items();
+        info!("IP unblocked: {}", ip);
+    }
+
+    #[allow(dead_code)]
+    pub fn unblock_user(&self, user_id: &str) {
+        {
+            let mut users = self.blocked_users.lock().unwrap();
+            users.remove(user_id);
+        }
+        self.save_blocked_items();
+        info!("User unblocked: {}", user_id);
+    }
+
+    pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
+        self.blocked_ips.lock().unwrap().contains(ip)
+    }
+
+    pub fn is_user_blocked(&self, user_id: &str) -> bool {
+        self.blocked_users.lock().unwrap().contains(user_id)
     }
 }
 
@@ -160,18 +243,35 @@ pub async fn run_worker(state: Arc<AppState>) {
 
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
+    let ip = addr.ip();
     let user_id = headers
         .get("X-User-ID")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("anonymous")
         .to_string();
 
-    info!("Received {} request from user: {}", path, user_id);
+    info!("Received {} request from user: {} (IP: {})", path, user_id, ip);
+
+    if state.is_ip_blocked(&ip) {
+        warn!("Blocked request from IP: {} for user: {}", ip, user_id);
+        return (StatusCode::FORBIDDEN, "IP blocked").into_response();
+    }
+
+    if state.is_user_blocked(&user_id) {
+        warn!("Blocked request from user: {} (IP: {})", user_id, ip);
+        return (StatusCode::FORBIDDEN, "User blocked").into_response();
+    }
+
+    {
+        let mut ips = state.user_ips.lock().unwrap();
+        ips.insert(user_id.clone(), ip);
+    }
 
     let (tx, rx) = mpsc::channel(32);
     let task = Task {

@@ -998,6 +998,8 @@ dependencies = [
  "futures-util",
  "ratatui",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tracing",
