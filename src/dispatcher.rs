@@ -39,10 +39,11 @@ pub struct AppState {
     pub blocked_users: Mutex<HashSet<String>>,
     pub notify: Notify,
     pub ollama_url: String,
+    pub timeout: u64,
 }
 
 impl AppState {
-    pub fn new(ollama_url: String) -> Self {
+    pub fn new(ollama_url: String, timeout: u64) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         Self {
             queues: Mutex::new(HashMap::new()),
@@ -53,6 +54,7 @@ impl AppState {
             blocked_users: Mutex::new(blocked_users),
             notify: Notify::new(),
             ollama_url,
+            timeout,
         }
     }
 
@@ -125,7 +127,7 @@ impl AppState {
 pub async fn run_worker(state: Arc<AppState>) {
     // 5-minute timeout for backend requests
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(state.timeout))
         .build()
         .unwrap();
     let mut current_idx = 0;

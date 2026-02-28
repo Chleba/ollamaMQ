@@ -27,6 +27,10 @@ struct Args {
     #[arg(short, long, default_value = "http://localhost:11434")]
     ollama_url: String,
 
+    /// Request timeout in seconds
+    #[arg(short, long, default_value_t = 300)]
+    timeout: u64,
+
     /// Disable TUI dashboard
     #[arg(long)]
     no_tui: bool,
@@ -69,7 +73,7 @@ async fn main() {
             .init();
     }
 
-    let state = Arc::new(AppState::new(ollama_url));
+    let state = Arc::new(AppState::new(ollama_url, args.timeout));
 
     let worker_state = state.clone();
     tokio::spawn(async move {

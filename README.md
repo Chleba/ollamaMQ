@@ -77,13 +77,14 @@ docker run -d \
 
 - `-p, --port <PORT>`: Port to listen on (default: `11435`)
 - `-o, --ollama-url <URL>`: Ollama server URL (default: `http://localhost:11434`)
+- `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI)
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
 
 **Example:**
 ```bash
-ollamaMQ --port 8080 --ollama-url http://192.168.1.5:11434 --no-tui
+ollamaMQ --port 8080 --ollama-url http://192.168.1.5:11434 --timeout 600 --no-tui
 ```
 
 **Docker Example:**
@@ -91,7 +92,7 @@ ollamaMQ --port 8080 --ollama-url http://192.168.1.5:11434 --no-tui
 docker run -d \
   --name ollamamq \
   -p 8080:8080 \
-  chlebon/ollamamq --port 8080 --ollama-url http://192.168.1.5:11434
+  chlebon/ollamamq --port 8080 --ollama-url http://192.168.1.5:11434 --timeout 600
 ```
 
 ### API Proxying
@@ -168,6 +169,7 @@ The Dockerfile uses a multi-stage build:
 |----------|-------------|--------|
 | `OLLAMA_URL` | URL of the Ollama server | `http://localhost:11434` |
 | `PORT` | Port for ollamaMQ to listen on | `11435` |
+| `TIMEOUT` | Request timeout in seconds | `300` |
 
 ### Connecting to Different Ollama Servers
 
