@@ -989,7 +989,7 @@ checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
 
 [[package]]
 name = "ollamaMQ"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "bytes",
@@ -998,6 +998,8 @@ dependencies = [
  "futures-util",
  "ratatui",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tracing",

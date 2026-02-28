@@ -4,6 +4,7 @@ use axum::{
 };
 use clap::Parser;
 use std::sync::{Arc, Mutex};
+use std::net::SocketAddr;
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -97,14 +98,14 @@ async fn main() {
         }));
 
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
 
         // Run TUI on the main thread
         tui_loop(tui_state, state).await;
     } else {
         // Just run the server on the main thread
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
     }
 }
 
