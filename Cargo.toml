@@ -1,6 +1,6 @@
 [package]
 name = "ollamaMQ"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "High-performance Ollama proxy with per-user fair-share queuing, round-robin scheduling, and a real-time TUI dashboard."
 license = "MIT"
