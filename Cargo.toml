@@ -1,6 +1,6 @@
 [package]
 name = "ollamaMQ"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 description = "High-performance Ollama proxy with per-user fair-share queuing, round-robin scheduling, and a real-time TUI dashboard."
 license = "MIT"
@@ -11,7 +11,7 @@ homepage = "https://github.com/Chleba/ollamaMQ"
 [dependencies]
 axum = "0.8.8"
 bytes = "1.11.1"
-reqwest = { version = "0.13.2", features = ["json", "stream"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "stream", "rustls"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

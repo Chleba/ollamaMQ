@@ -1,0 +1,38 @@
+services:
+  # Optional: Uncomment if you want to run Ollama in Docker as well
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   ports:
+  #     - "11434:11434"
+  #   restart: unless-stopped
+
+  ollamamq:
+    build: .
+    image: chlebon/ollamamq:latest
+    container_name: ollamamq
+    ports:
+      - "11435:11435"
+    environment:
+      # If using host Ollama on Linux:
+      # 1. Ensure Ollama is listening on 0.0.0.0 (export OLLAMA_HOST=0.0.0.0)
+      # 2. Use http://host.docker.internal:11434
+      # If using the 'ollama' service above, use http://ollama:11434
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - PORT=11435
+      - RUST_LOG=info
+    command: ["--no-tui"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:11435/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# volumes:
+#   ollama_data:

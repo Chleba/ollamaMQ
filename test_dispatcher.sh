@@ -2,6 +2,7 @@
 
 # Configuration
 BASE_URL="http://localhost:11435"
+MODEL="${MODEL:-qwen3.5:35b}"
 ENDPOINTS=("/api/generate" "/api/chat" "/v1/chat/completions" "/v1/completions")
 
 # Expanded list of 50 users to thoroughly test scrolling and high load
@@ -33,9 +34,9 @@ send_request() {
     
     local payload=""
     if [[ "$endpoint" == "/api/chat" || "$endpoint" == "/v1/chat/completions" ]]; then
-        payload="{\"model\": \"qwen3.5:35b\", \"messages\": [{\"role\": \"user\", \"content\": \"Req $id\"}], \"stream\": false}"
+        payload="{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Req $id\"}], \"stream\": false}"
     else
-        payload="{\"model\": \"qwen3.5:35b\", \"prompt\": \"Req $id\", \"stream\": false}"
+        payload="{\"model\": \"$MODEL\", \"prompt\": \"Req $id\", \"stream\": false}"
     fi
 
     # Send request and capture HTTP status code + response
@@ -98,10 +99,10 @@ send_image_request() {
     fi
 }
 
-# Check if dispatcher is reachable (using /api/generate as health check)
-if ! curl -s -o /dev/null "${BASE_URL}/api/generate" --max-time 2; then
+# Check if dispatcher is reachable (using /health)
+if ! curl -s -o /dev/null "${BASE_URL}/health" --max-time 2; then
     echo "❌ Error: Dispatcher is not reachable at ${BASE_URL}"
-    echo "   Please run 'cargo run' in another terminal first."
+    echo "   Please run 'docker compose up' or 'cargo run' in another terminal first."
     exit 1
 fi
 
