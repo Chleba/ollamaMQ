@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Build outputs
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+demo.gif
+demo-test.gif
+
+# Test files
+test_dispatcher.sh
+
+# Docker files (not needed in image)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Logs
+*.log
+
+# CI/CD
+.github/
+.gitlab-ci.yml

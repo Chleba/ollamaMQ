@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    routing::post,
+    routing::{get, post},
 };
 use clap::Parser;
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,8 @@ mod dispatcher;
 
 use crate::dispatcher::{AppState, run_worker, proxy_handler};
 
+use std::io::IsTerminal;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -23,6 +25,10 @@ struct Args {
     /// Ollama server URL
     #[arg(short, long, default_value = "http://localhost:11434")]
     ollama_url: String,
+
+    /// Disable TUI dashboard
+    #[arg(long)]
+    no_tui: bool,
 }
 
 struct TuiState {
@@ -35,23 +41,34 @@ async fn main() {
     let args = Args::parse();
     let ollama_url = args.ollama_url.trim_end_matches('/').to_string();
     
-    let file_appender = tracing_appender::rolling::never(".", "ollamamq.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    // Determine if we should run TUI
+    let use_tui = !args.no_tui && std::io::stdout().is_terminal();
 
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Keep the guard alive for the duration of main
+    let _guard: Option<tracing_appender::non_blocking::WorkerGuard>;
+
+    if use_tui {
+        let file_appender = tracing_appender::rolling::never(".", "ollamamq.log");
+        let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
+        _guard = Some(g);
+
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+    } else {
+        _guard = None;
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     let state = Arc::new(AppState::new(ollama_url));
-
-    let tui_state = Arc::new(Mutex::new(TuiState {
-        visible: true,
-        toggle_notify: Arc::new(Notify::new()),
-    }));
 
     let worker_state = state.clone();
     tokio::spawn(async move {
@@ -59,6 +76,7 @@ async fn main() {
     });
 
     let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
         .route("/api/generate", post(proxy_handler))
         .route("/api/chat", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
@@ -72,12 +90,22 @@ async fn main() {
         .unwrap();
     info!("Dispatcher running on http://{}", addr);
 
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    if use_tui {
+        let tui_state = Arc::new(Mutex::new(TuiState {
+            visible: true,
+            toggle_notify: Arc::new(Notify::new()),
+        }));
 
-    // Run TUI on the main thread
-    tui_loop(tui_state, state).await;
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Run TUI on the main thread
+        tui_loop(tui_state, state).await;
+    } else {
+        // Just run the server on the main thread
+        axum::serve(listener, app).await.unwrap();
+    }
 }
 
 async fn tui_loop(tui_state: Arc<Mutex<TuiState>>, state: Arc<AppState>) {
