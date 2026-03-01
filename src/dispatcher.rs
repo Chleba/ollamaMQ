@@ -1,20 +1,20 @@
 use axum::{
     body::{Body, Bytes},
-    extract::{State, ConnectInfo},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    fs,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    fs,
 };
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
-use serde::{Serialize, Deserialize};
 
 const BLOCKED_FILE: &str = "blocked_items.json";
 
@@ -59,10 +59,10 @@ impl AppState {
     }
 
     fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
-        if let Ok(content) = fs::read_to_string(BLOCKED_FILE) {
-            if let Ok(config) = serde_json::from_str::<BlockedConfig>(&content) {
-                return (config.ips, config.users);
-            }
+        if let Ok(content) = fs::read_to_string(BLOCKED_FILE)
+            && let Ok(config) = serde_json::from_str::<BlockedConfig>(&content)
+        {
+            return (config.ips, config.users);
         }
         (HashSet::new(), HashSet::new())
     }
@@ -135,13 +135,14 @@ pub async fn run_worker(state: Arc<AppState>) {
     loop {
         let task_opt = {
             let mut queues = state.queues.lock().unwrap();
-            
+
             // Get all user IDs that currently have tasks
-            let mut active_users: Vec<String> = queues.iter()
+            let mut active_users: Vec<String> = queues
+                .iter()
                 .filter(|(_, q)| !q.is_empty())
                 .map(|(k, _)| k.clone())
                 .collect();
-            
+
             // Sort to ensure stable round-robin
             active_users.sort();
 
@@ -154,7 +155,7 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                 let user_id = active_users[current_idx].clone();
                 let task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
-                
+
                 current_idx += 1;
                 Some((user_id, task))
             }
@@ -175,11 +176,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                 let url = format!("{}{}", state.ollama_url, task.path);
-                
-                let res_fut = client
-                    .post(url)
-                    .body(task.body)
-                    .send();
+
+                let res_fut = client.post(url).body(task.body).send();
 
                 tokio::select! {
                     res = res_fut => {
@@ -210,7 +208,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         break;
                                     }
                                 }
-                                
+
                                 if client_disconnected {
                                     let mut dropped = state.dropped_counts.lock().unwrap();
                                     *dropped.entry(user_id).or_insert(0) += 1;
@@ -258,7 +256,10 @@ pub async fn proxy_handler(
         .unwrap_or("anonymous")
         .to_string();
 
-    info!("Received {} request from user: {} (IP: {})", path, user_id, ip);
+    info!(
+        "Received {} request from user: {} (IP: {})",
+        path, user_id, ip
+    );
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
