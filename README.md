@@ -30,6 +30,7 @@ cargo install ollamaMQ
 ### Option 2: From Source
 
 1. Clone the repository:
+
    ```bash
    git clone https://github.com/Chleba/ollamaMQ.git
    cd ollamaMQ
@@ -83,11 +84,13 @@ docker run -d \
 - `-V, --version`: Print version information
 
 **Example:**
+
 ```bash
 ollamaMQ --port 8080 --ollama-url http://192.168.1.5:11434 --timeout 600 --no-tui
 ```
 
 **Docker Example:**
+
 ```bash
 docker run -d \
   --name ollamamq \
@@ -100,13 +103,17 @@ docker run -d \
 Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-ID` header.
 
 #### Supported Endpoints:
+
+- `GET /` (Ollama Native)
 - `GET /health` (Internal health check)
+- `GET /api/tags` (Ollama Native)
 - `POST /api/generate` (Ollama Native)
 - `POST /api/chat` (Ollama Native)
 - `POST /v1/chat/completions` (OpenAI Compatible)
 - `POST /v1/completions` (OpenAI Compatible)
 
 #### Example (cURL):
+
 ```bash
 curl -X POST http://localhost:11435/api/chat \
   -H "X-User-ID: developer-1" \
@@ -151,8 +158,9 @@ services:
     restart: unless-stopped
 ```
 
-**Note for Linux Users:** 
+**Note for Linux Users:**
 When running in Docker on Linux to access a host-based Ollama:
+
 1.  **Listen on all interfaces:** Ollama must be configured to listen on `0.0.0.0`. You can do this by setting `export OLLAMA_HOST=0.0.0.0` before starting the Ollama service (or editing the systemd unit file).
 2.  **Firewall:** Ensure your firewall (e.g., `ufw`) allows traffic from the Docker bridge (usually `172.17.0.1/16`) to port `11434`.
 3.  **Host Gateway:** The `extra_hosts` setting in `docker-compose.yml` maps `host.docker.internal` to your host's IP address.
@@ -160,20 +168,22 @@ When running in Docker on Linux to access a host-based Ollama:
 ### Dockerfile
 
 The Dockerfile uses a multi-stage build:
+
 - **Build stage**: Uses `rust:1.85-alpine` to compile the release binary
 - **Runtime stage**: Uses `alpine:3.20` with only `ca-certificates` for a minimal footprint (~10MB)
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|--------|
-| `OLLAMA_URL` | URL of the Ollama server | `http://localhost:11434` |
-| `PORT` | Port for ollamaMQ to listen on | `11435` |
-| `TIMEOUT` | Request timeout in seconds | `300` |
+| Variable     | Description                    | Default                  |
+| ------------ | ------------------------------ | ------------------------ |
+| `OLLAMA_URL` | URL of the Ollama server       | `http://localhost:11434` |
+| `PORT`       | Port for ollamaMQ to listen on | `11435`                  |
+| `TIMEOUT`    | Request timeout in seconds     | `300`                    |
 
 ### Connecting to Different Ollama Servers
 
 #### Local Ollama (on host machine)
+
 ```bash
 docker run -d \
   --name ollamamq \
@@ -183,6 +193,7 @@ docker run -d \
 ```
 
 #### Remote Ollama Server
+
 ```bash
 docker run -d \
   --name ollamamq \
@@ -192,6 +203,7 @@ docker run -d \
 ```
 
 #### Custom Port on Same Server
+
 ```bash
 docker run -d \
   --name ollamamq \
@@ -202,6 +214,7 @@ docker run -d \
 ```
 
 #### Ollama in Docker (different container)
+
 ```bash
 docker run -d \
   --name ollamamq \
@@ -217,6 +230,7 @@ docker run -d \
 - **11434**: The Ollama server port (internal, not exposed)
 
 To change the proxy port, use the `PORT` environment variable:
+
 ```bash
 docker run -d \
   --name ollamamq \
@@ -232,6 +246,7 @@ docker run -d \
 - **`src/tui.rs`**: Implementation of the terminal-based monitoring dashboard.
 
 ### Request Flow
+
 1. Client sends a request to one of the supported endpoints with `X-User-ID`.
 2. `ollamaMQ` pushes the request into a user-specific queue.
 3. The background worker selects the next user in rotation and pops a task.

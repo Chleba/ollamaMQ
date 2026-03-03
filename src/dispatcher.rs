@@ -3,6 +3,7 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
+    routing::MethodFilter,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ struct BlockedConfig {
 pub struct Task {
     pub path: String,
     pub body: Bytes,
+    pub method: MethodFilter,
     pub responder: mpsc::Sender<Result<Bytes, reqwest::Error>>,
 }
 
@@ -59,10 +61,10 @@ impl AppState {
     }
 
     fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
-        if let Ok(content) = fs::read_to_string(BLOCKED_FILE)
-            && let Ok(config) = serde_json::from_str::<BlockedConfig>(&content)
-        {
-            return (config.ips, config.users);
+        if let Ok(content) = fs::read_to_string(BLOCKED_FILE) {
+            if let Ok(config) = serde_json::from_str::<BlockedConfig>(&content) {
+                return (config.ips, config.users);
+            }
         }
         (HashSet::new(), HashSet::new())
     }
@@ -177,7 +179,12 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                 let url = format!("{}{}", state.ollama_url, task.path);
 
-                let res_fut = client.post(url).body(task.body).send();
+                let res_fut = match task.method {
+                    MethodFilter::POST => client.post(url).body(task.body),
+                    MethodFilter::GET => client.get(url),
+                    _ => continue,
+                }
+                .send();
 
                 tokio::select! {
                     res = res_fut => {
@@ -241,12 +248,33 @@ pub async fn run_worker(state: Arc<AppState>) {
     }
 }
 
-pub async fn proxy_handler(
+pub async fn proxy_get_handler(
+    state: State<Arc<AppState>>,
+    addr: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_handler(state, addr, headers, uri, body, MethodFilter::GET)
+}
+
+pub async fn proxy_post_handler(
+    state: State<Arc<AppState>>,
+    addr: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_handler(state, addr, headers, uri, body, MethodFilter::POST)
+}
+
+fn proxy_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Bytes,
+    method: MethodFilter,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
     let ip = addr.ip();
@@ -281,6 +309,7 @@ pub async fn proxy_handler(
         path,
         responder: tx,
         body,
+        method,
     };
 
     {
