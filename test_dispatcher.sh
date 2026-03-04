@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-BASE_URL="http://localhost:11435"
+BASE_URL="${BASE_URL:-http://localhost:11435}"
 MODEL="${MODEL:-qwen3.5:35b}"
 ENDPOINTS=("/api/generate" "/api/chat" "/v1/chat/completions" "/v1/completions")
 
@@ -66,7 +66,7 @@ send_and_cancel() {
     curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
-        -d "{\"model\": \"qwen3.5:35b\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
+        -d "{\"model\": \"${MODEL}\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
     
     local curl_pid=$!
     # Sleep slightly less than the dispatcher's 500ms artificial delay to test 'is_closed' check,
@@ -84,13 +84,13 @@ send_image_request() {
     # Base64 encoded tiny 1x1 red pixel PNG
     local b64_pixel="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     
-    echo "🖼️ [IMAGE TEST] User: $user | Req: $id (Sending multimodal request to qwen3.5:35b)"
+    echo "🖼️ [IMAGE TEST] User: $user | Req: $id (Sending multimodal request to ${MODEL})"
     
     # Send request and capture HTTP status code
     response=$(curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
-        -d "{\"model\": \"qwen3.5:35b\", \"prompt\": \"What is in this image?\", \"images\": [\"$b64_pixel\"], \"stream\": false}")
+        -d "{\"model\": \"${MODEL}\", \"prompt\": \"What is in this image?\", \"images\": [\"$b64_pixel\"], \"stream\": false}")
 
     if [ -n "$response" ]; then
         echo "✅ [SUCCESS] User: $user | Endpoint: IMAGE | Res: ${response:0:100}"
