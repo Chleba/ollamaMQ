@@ -61,10 +61,10 @@ impl AppState {
     }
 
     fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
-        if let Ok(content) = fs::read_to_string(BLOCKED_FILE) {
-            if let Ok(config) = serde_json::from_str::<BlockedConfig>(&content) {
-                return (config.ips, config.users);
-            }
+        if let Ok(content) = fs::read_to_string(BLOCKED_FILE)
+            && let Ok(config) = serde_json::from_str::<BlockedConfig>(&content)
+        {
+            return (config.ips, config.users);
         }
         (HashSet::new(), HashSet::new())
     }
@@ -248,25 +248,22 @@ pub async fn run_worker(state: Arc<AppState>) {
     }
 }
 
-pub async fn proxy_get_handler(
-    state: State<Arc<AppState>>,
-    addr: ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    uri: axum::extract::OriginalUri,
-    body: Bytes,
-) -> impl IntoResponse {
-    proxy_handler(state, addr, headers, uri, body, MethodFilter::GET)
+macro_rules! proxy_method_handler {
+    ($name:ident, $method:expr) => {
+        pub async fn $name(
+            state: State<Arc<AppState>>,
+            addr: ConnectInfo<SocketAddr>,
+            headers: HeaderMap,
+            uri: axum::extract::OriginalUri,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            proxy_handler(state, addr, headers, uri, body, $method)
+        }
+    };
 }
 
-pub async fn proxy_post_handler(
-    state: State<Arc<AppState>>,
-    addr: ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    uri: axum::extract::OriginalUri,
-    body: Bytes,
-) -> impl IntoResponse {
-    proxy_handler(state, addr, headers, uri, body, MethodFilter::POST)
-}
+proxy_method_handler!(proxy_get_handler, MethodFilter::GET);
+proxy_method_handler!(proxy_post_handler, MethodFilter::POST);
 
 fn proxy_handler(
     State(state): State<Arc<AppState>>,
