@@ -1,7 +1,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
 use futures_util::StreamExt;
@@ -25,6 +25,7 @@ struct BlockedConfig {
 }
 
 pub struct Task {
+    pub method: Method,
     pub path: String,
     pub body: Bytes,
     pub responder: mpsc::Sender<Result<Bytes, reqwest::Error>>,
@@ -177,7 +178,12 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                 let url = format!("{}{}", state.ollama_url, task.path);
 
-                let res_fut = client.post(url).body(task.body).send();
+                let res_fut = match task.method {
+                    Method::POST => client.post(url).body(task.body),
+                    Method::GET => client.get(url),
+                    _ => continue,
+                }
+                .send();
 
                 tokio::select! {
                     res = res_fut => {
@@ -244,6 +250,7 @@ pub async fn run_worker(state: Arc<AppState>) {
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    method: Method,
     headers: HeaderMap,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Bytes,
@@ -279,6 +286,7 @@ pub async fn proxy_handler(
     let (tx, rx) = mpsc::channel(32);
     let task = Task {
         path,
+        method,
         responder: tx,
         body,
     };
