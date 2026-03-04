@@ -84,6 +84,7 @@ async fn main() {
         .route("/", get(proxy_get_handler))
         .route("/health", get(|| async { "OK" }))
         .route("/api/tags", get(proxy_get_handler))
+        .route("/api/embed", post(proxy_post_handler))
         .route("/api/generate", post(proxy_post_handler))
         .route("/api/chat", post(proxy_post_handler))
         .route("/v1/chat/completions", post(proxy_post_handler))
