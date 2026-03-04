@@ -111,6 +111,8 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 - `POST /api/embed` (Ollama Native)
 - `POST /api/generate` (Ollama Native)
 - `POST /api/chat` (Ollama Native)
+- `GET /v1/models` (OpenAI Compatible)
+- `POST /v1/embeddings` (OpenAI Compatible)
 - `POST /v1/chat/completions` (OpenAI Compatible)
 - `POST /v1/completions` (OpenAI Compatible)
 
