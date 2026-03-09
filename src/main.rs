@@ -3,16 +3,16 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use std::sync::{Arc, Mutex};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod tui;
 mod dispatcher;
+mod tui;
 
-use crate::dispatcher::{AppState, run_worker, proxy_handler};
+use crate::dispatcher::{AppState, proxy_handler, run_worker};
 
 use std::io::IsTerminal;
 
@@ -45,7 +45,7 @@ struct TuiState {
 async fn main() {
     let args = Args::parse();
     let ollama_url = args.ollama_url.trim_end_matches('/').to_string();
-    
+
     // Determine if we should run TUI
     let use_tui = !args.no_tui && std::io::stdout().is_terminal();
 
@@ -82,17 +82,21 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
+        .route("/", get(proxy_handler))
+        .route("/api/tags", get(proxy_handler))
+        .route("/api/version", get(proxy_handler))
+        .route("/api/embed", post(proxy_handler))
         .route("/api/generate", post(proxy_handler))
         .route("/api/chat", post(proxy_handler))
+        .route("/v1/models", get(proxy_handler))
+        .route("/v1/embeddings", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
         .route("/v1/completions", post(proxy_handler))
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state.clone());
 
     let addr = format!("0.0.0.0:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Dispatcher running on http://{}", addr);
 
     if use_tui {
@@ -102,14 +106,24 @@ async fn main() {
         }));
 
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         // Run TUI on the main thread
         tui_loop(tui_state, state).await;
     } else {
         // Just run the server on the main thread
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     }
 }
 
