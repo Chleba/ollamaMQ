@@ -9,8 +9,10 @@
 ## 🚀 Features
 
 - **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama or LM Studio instances using a **Least Connections + Round Robin** strategy. Automatically detects backend API type (Ollama `/api/*` vs OpenAI `/v1/*`) and routes each request to a compatible backend.
+- **Model-Aware Routing**: Automatically identifies the requested model from the request body and routes the request only to backends that have that specific model loaded. This prevents 404 errors when different models are distributed across multiple backends.
+- **Smart Model Matching**: Robust matching that handles common variations like `:latest` tags and case-insensitivity. For example, a request for `llama3` will correctly match `llama3:latest` on the backend.
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
-- **Backend Health Checks**: Automatically monitors backend status every 10 seconds (via `/v1/models`, `/api/tags`, or `/`); offline instances are temporarily skipped and marked in the TUI.
+- **Backend Health Checks**: Automatically monitors backend status every 10 seconds. Probes for both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Offline instances are temporarily skipped and marked in the TUI.
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
@@ -148,22 +150,24 @@ curl -X POST http://localhost:11435/api/chat \
 
 The interactive TUI dashboard provides a live view of the dispatcher's state:
 
-- **`j` / `k`** or **Arrows**: Navigate the user/blocked list.
-- **`Tab`** or **`h` / `l`**: Switch between the Users and Blocked panels.
+- **`j` / `k`** or **Arrows**: Navigate the selected list (Users, Backends, or Blocked Items).
+- **`Tab`** or **`h` / `l`**: Switch between the **Backends**, **Users**, and **Blocked** panels.
+- **`Space`** or **`Enter`**: Expand/collapse the available models list for the selected backend (in the Backends panel).
 - **`p`**: Toggle **VIP** status for the selected user (absolute priority).
-- **`b`**: Toggle **Boost** status for the selected user (prioritizes every 5th request).
+- **`b`**: Toggle **Boost** status for the selected user (prioritizes every 2nd request).
 - **`x`**: Block the selected user.
 - **`X`**: Block the selected user's IP address.
 - **`u`**: Unblock the selected user or IP (works in both panels).
 - **`q`** or **Esc**: Exit the dashboard and stop the application.
-- **`?`**: Toggle detailed help.
+- **`?`**: Toggle detailed help overlay.
 
 **Visual Indicators:**
+- `▶` / `▼`: Indicates if a backend's model list is collapsed or expanded.
 - `★` (Magenta): **VIP User** (absolute priority).
-- `⚡` (Yellow): **Boosted User** (every 5th request priority).
+- `⚡` (Yellow): **Boosted User** (every 2nd request priority).
 - `▶` (Cyan): Request is currently being processed/streamed.
-- `●` (Green): User has requests waiting in the queue.
-- `○` (Gray): User is idle (no active or queued requests).
+- `●` (Green): Backend is Online or User has requests waiting in the queue.
+- `○` (Gray): User is idle or Backend is Offline.
 - `✖` (Red): User or IP is blocked.
 
 ### Logging

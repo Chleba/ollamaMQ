@@ -17,6 +17,7 @@ use crate::dispatcher::{AppState, BackendApiType, BackendStatus};
 
 #[derive(PartialEq)]
 enum Panel {
+    Backends,
     Users,
     Blocked,
 }
@@ -37,8 +38,10 @@ struct StateSnapshot {
 
 pub struct TuiDashboard {
     table_state: TableState,
+    backend_table_state: TableState,
     blocked_table_state: TableState,
     active_panel: Panel,
+    expanded_backends: HashSet<String>,
     show_help: bool,
 }
 
@@ -46,8 +49,10 @@ impl TuiDashboard {
     pub fn new() -> Self {
         Self {
             table_state: TableState::default(),
+            backend_table_state: TableState::default(),
             blocked_table_state: TableState::default(),
             active_panel: Panel::Users,
+            expanded_backends: HashSet::new(),
             show_help: false,
         }
     }
@@ -117,11 +122,33 @@ impl TuiDashboard {
                             return Ok(false);
                         }
                         KeyCode::Char('?') => self.show_help = !self.show_help,
-                        KeyCode::Tab | KeyCode::Char('l') | KeyCode::Char('h') => {
+                        KeyCode::Tab | KeyCode::Char('l') => {
                             self.active_panel = match self.active_panel {
+                                Panel::Backends => Panel::Users,
                                 Panel::Users => Panel::Blocked,
+                                Panel::Blocked => Panel::Backends,
+                            };
+                        }
+                        KeyCode::Char('h') => {
+                            self.active_panel = match self.active_panel {
+                                Panel::Backends => Panel::Blocked,
+                                Panel::Users => Panel::Backends,
                                 Panel::Blocked => Panel::Users,
                             };
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if self.active_panel == Panel::Backends {
+                                if let Some(i) = self.backend_table_state.selected() {
+                                    if i < snapshot.backends.len() {
+                                        let url = snapshot.backends[i].url.clone();
+                                        if self.expanded_backends.contains(&url) {
+                                            self.expanded_backends.remove(&url);
+                                        } else {
+                                            self.expanded_backends.insert(url);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         KeyCode::Char('p') => {
                             if self.active_panel == Panel::Users {
@@ -236,7 +263,10 @@ impl TuiDashboard {
                             }
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            if self.active_panel == Panel::Users {
+                            if self.active_panel == Panel::Backends {
+                                let i = self.backend_table_state.selected().unwrap_or(0).saturating_sub(1);
+                                self.backend_table_state.select(Some(i));
+                            } else if self.active_panel == Panel::Users {
                                 let i = self.table_state.selected().unwrap_or(0).saturating_sub(1);
                                 self.table_state.select(Some(i));
                             } else {
@@ -245,7 +275,13 @@ impl TuiDashboard {
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            if self.active_panel == Panel::Users {
+                            if self.active_panel == Panel::Backends {
+                                let len = snapshot.backends.len();
+                                if len > 0 {
+                                    let i = self.backend_table_state.selected().map(|s| (s + 1).min(len.saturating_sub(1))).unwrap_or(0);
+                                    self.backend_table_state.select(Some(i));
+                                }
+                            } else if self.active_panel == Panel::Users {
                                 let len = snapshot.user_ids.len();
                                 if len > 0 {
                                     let i = self.table_state.selected().map(|s| (s + 1).min(len.saturating_sub(1))).unwrap_or(0);
@@ -267,7 +303,13 @@ impl TuiDashboard {
     }
 
     fn render(&mut self, f: &mut Frame, snapshot: &StateSnapshot) {
-        if self.active_panel == Panel::Users {
+        if self.active_panel == Panel::Backends {
+            if snapshot.backends.is_empty() {
+                self.backend_table_state.select(None);
+            } else if self.backend_table_state.selected().is_none() {
+                self.backend_table_state.select(Some(0));
+            }
+        } else if self.active_panel == Panel::Users {
             if snapshot.user_ids.is_empty() {
                 self.table_state.select(None);
             } else if self.table_state.selected().is_none() {
@@ -298,13 +340,13 @@ impl TuiDashboard {
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(25),
-                Constraint::Percentage(40),
                 Constraint::Percentage(35),
+                Constraint::Percentage(35),
+                Constraint::Percentage(30),
             ])
             .split(main_chunks[1]);
 
-        f.render_widget(self.render_backends(snapshot), content_chunks[0]);
+        f.render_stateful_widget(self.render_backends(snapshot), content_chunks[0], &mut self.backend_table_state);
         f.render_stateful_widget(self.render_users(snapshot), content_chunks[1], &mut self.table_state);
 
         let right_chunks = Layout::default()
@@ -355,6 +397,7 @@ impl TuiDashboard {
     fn render_backends(&self, snapshot: &StateSnapshot) -> Table<'static> {
         let rows: Vec<Row> = snapshot.backends.iter().map(|b| {
             let url = b.url.replace("http://", "").replace("https://", "");
+            let is_expanded = self.expanded_backends.contains(&b.url);
             
             let (status_sym, status_style) = if b.is_online {
                 ("● ", Style::default().fg(Color::Green))
@@ -376,25 +419,61 @@ impl TuiDashboard {
                 Style::default().fg(Color::Gray)
             };
 
-            Row::new(vec![
-                Cell::from(Line::from(vec![
+            let mut name_lines = vec![
+                Line::from(vec![
+                    Span::styled(if is_expanded { "▼ " } else { "▶ " }, Style::default().fg(Color::DarkGray)),
                     Span::styled(status_sym, status_style),
                     Span::styled(url, if b.is_online { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT) }),
-                ])),
+                ])
+            ];
+
+            if is_expanded {
+                let mut models: Vec<String> = b.available_models.iter().cloned().collect();
+                models.sort();
+                
+                if models.is_empty() {
+                    name_lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("└ (No models found)", Style::default().fg(Color::DarkGray).italic()),
+                    ]));
+                } else {
+                    let total_models = models.len();
+                    for m in models.into_iter().take(15) {
+                        name_lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("└ ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(m, Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
+                    if total_models > 15 {
+                        name_lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(format!("  ... and {} more", total_models - 15), Style::default().fg(Color::DarkGray).italic()),
+                        ]));
+                    }
+                }
+            }
+
+            let height = name_lines.len() as u16;
+
+            Row::new(vec![
+                Cell::from(Text::from(name_lines)),
                 Cell::from(type_str).style(type_style),
                 Cell::from(b.active_requests.to_string()).style(req_style),
                 Cell::from(b.processed_count.to_string()).style(Style::default().fg(Color::DarkGray)),
-            ])
+            ]).height(height)
         }).collect();
 
         Table::new(rows, [
-            Constraint::Min(10),
+            Constraint::Min(15),
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(6),
         ])
         .header(Row::new(vec!["Backend", "API", "Act", "Done"]).style(Style::default().fg(Color::Yellow).bold()).bottom_margin(1))
-        .block(Block::default().title(" Backend Instances ").borders(Borders::ALL))
+        .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ")
+        .block(Block::default().title(" Backend Instances ").borders(Borders::ALL).border_style(if self.active_panel == Panel::Backends { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) }))
     }
 
     fn render_users(&self, snapshot: &StateSnapshot) -> Table<'static> {
@@ -465,11 +544,11 @@ impl TuiDashboard {
     }
 
     fn render_help(&self) -> Paragraph<'static> {
-        Paragraph::new(" Tab: Switch | p: VIP | b: Boost | x: Block User | X: Block IP | u: Unblock | q: Quit")
+        Paragraph::new(" h/l/Tab: Switch Panel | j/k: Nav | Space/Enter: Expand Models | p: VIP | b: Boost | q: Quit")
             .block(Block::default().borders(Borders::ALL).title_bottom(Line::from(format!(" v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Right)))
     }
 
     fn render_detailed_help(&self) -> Paragraph<'static> {
-        Paragraph::new("\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued").block(Block::default().title(" Help ").borders(Borders::ALL)).style(Style::default().fg(Color::Gray))
+        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued").block(Block::default().title(" Help ").borders(Borders::ALL)).style(Style::default().fg(Color::Gray))
     }
 }

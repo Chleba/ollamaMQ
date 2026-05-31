@@ -49,7 +49,14 @@ struct TuiState {
 async fn main() {
     let args = Args::parse();
     let backend_urls: Vec<String> = args.backend_urls.iter()
-        .map(|url| url.trim_end_matches('/').to_string())
+        .map(|url| {
+            let trimmed = url.trim_end_matches('/').to_string();
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                format!("http://{}", trimmed)
+            } else {
+                trimmed
+            }
+        })
         .collect();
 
     // Determine if we should run TUI

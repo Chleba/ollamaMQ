@@ -272,8 +272,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // Probe Ollama API: /api/tags → expects {"models": [...]}
                 {
                     let check_url = format!("{}/api/tags", url);
-                    if let Ok(res) = health_client.get(&check_url).send().await {
-                        if res.status().is_success() {
+                    match health_client.get(&check_url).send().await {
+                        Ok(res) if res.status().is_success() => {
                             is_online = true;
                             if let Ok(body) = res.text().await {
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -285,9 +285,19 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 models.insert(name.to_string());
                                             }
                                         }
+                                    } else {
+                                        warn!("Backend {} responded 200 to /api/tags but 'models' array not found or invalid. Body: {}", url, body);
                                     }
+                                } else {
+                                    warn!("Backend {} responded 200 to /api/tags but body is not valid JSON", url);
                                 }
                             }
+                        }
+                        Ok(res) => {
+                            debug!("Backend {} /api/tags returned status: {}", url, res.status());
+                        }
+                        Err(e) => {
+                            debug!("Backend {} /api/tags error: {}", url, e);
                         }
                     }
                 }
@@ -295,8 +305,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // Probe OpenAI API: /v1/models → expects {"data": [...]}
                 {
                     let check_url = format!("{}/v1/models", url);
-                    if let Ok(res) = health_client.get(&check_url).send().await {
-                        if res.status().is_success() {
+                    match health_client.get(&check_url).send().await {
+                        Ok(res) if res.status().is_success() => {
                             is_online = true;
                             if let Ok(body) = res.text().await {
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -308,9 +318,19 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 models.insert(id.to_string());
                                             }
                                         }
+                                    } else {
+                                        warn!("Backend {} responded 200 to /v1/models but 'data' array not found or invalid. Body: {}", url, body);
                                     }
+                                } else {
+                                    warn!("Backend {} responded 200 to /v1/models but body is not valid JSON", url);
                                 }
                             }
+                        }
+                        Ok(res) => {
+                            debug!("Backend {} /v1/models returned status: {}", url, res.status());
+                        }
+                        Err(e) => {
+                            debug!("Backend {} /v1/models error: {}", url, e);
                         }
                     }
                 }
