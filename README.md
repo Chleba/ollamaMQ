@@ -1,6 +1,6 @@
 # ollamaMQ
 
-`ollamaMQ` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple Ollama backends using a fair-share round-robin scheduler with least-connections load balancing.
+`ollamaMQ` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) or [LM Studio](https://lmstudio.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple backends using a fair-share round-robin scheduler with least-connections load balancing.
 
 ![Rust](https://img.shields.io/badge/rust-2024-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -8,12 +8,12 @@
 
 ## 🚀 Features
 
-- **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama instances using a **Least Connections + Round Robin** strategy.
+- **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama or LM Studio instances using a **Least Connections + Round Robin** strategy. Automatically detects backend API type (Ollama `/api/*` vs OpenAI `/v1/*`) and routes each request to a compatible backend.
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
-- **Backend Health Checks**: Automatically monitors backend status every 10 seconds; offline instances are temporarily skipped and marked in the TUI.
+- **Backend Health Checks**: Automatically monitors backend status every 10 seconds (via `/v1/models`, `/api/tags`, or `/`); offline instances are temporarily skipped and marked in the TUI.
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends.
-- **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from Ollama, ensuring compatibility with tools like **Claude Code**.
+- **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
@@ -81,7 +81,7 @@ docker run -d \
 `ollamaMQ` supports several options to configure the proxy:
 
 - `-p, --port <PORT>`: Port to listen on (default: `11435`)
-- `-o, --ollama-urls <URL1,URL2>`: Comma-separated list of Ollama server URLs (default: `http://localhost:11434`)
+- `-o, --backend-urls <URL1,URL2>`: Comma-separated list of backend server URLs (Ollama, LM Studio, etc.) (default: `http://localhost:11434`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI)
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
@@ -110,7 +110,7 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 #### Supported Endpoints:
 
 - `GET /health` (Internal health check)
-- `GET /` (Ollama Status)
+- `GET /` (Backend Status)
 - `POST /api/generate`
 - `POST /api/chat`
 - `POST /api/embed`

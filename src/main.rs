@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    routing::{any, get, post},
+    routing::{any, get},
 };
 use clap::Parser;
 use std::net::SocketAddr;
@@ -23,9 +23,9 @@ struct Args {
     #[arg(short, long, default_value_t = 11435)]
     port: u16,
 
-    /// Ollama server URLs (comma-separated list)
-    #[arg(short, long, value_delimiter = ',', default_value = "http://localhost:11434")]
-    ollama_urls: Vec<String>,
+    /// Backend server URLs (e.g., Ollama, LM Studio) (comma-separated list)
+    #[arg(short, long, value_delimiter = ',', default_value = "http://localhost:11434", alias = "ollama-urls")]
+    backend_urls: Vec<String>,
 
     /// Request timeout in seconds
     #[arg(short, long, default_value_t = 300)]
@@ -48,7 +48,7 @@ struct TuiState {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let ollama_urls: Vec<String> = args.ollama_urls.iter()
+    let backend_urls: Vec<String> = args.backend_urls.iter()
         .map(|url| url.trim_end_matches('/').to_string())
         .collect();
 
@@ -79,7 +79,7 @@ async fn main() {
             .init();
     }
 
-    let state = Arc::new(AppState::new(ollama_urls, args.timeout));
+    let state = Arc::new(AppState::new(backend_urls, args.timeout));
 
     let worker_state = state.clone();
     tokio::spawn(async move {

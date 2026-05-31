@@ -13,7 +13,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::dispatcher::{AppState, BackendStatus};
+use crate::dispatcher::{AppState, BackendApiType, BackendStatus};
 
 #[derive(PartialEq)]
 enum Panel {
@@ -362,6 +362,14 @@ impl TuiDashboard {
                 ("○ ", Style::default().fg(Color::Red))
             };
 
+            let type_str = b.api_type.display();
+            let type_style = match b.api_type {
+                BackendApiType::Unknown => Style::default().fg(Color::Yellow),
+                BackendApiType::Both => Style::default().fg(Color::Rgb(0, 255, 255)).bold(),
+                BackendApiType::Ollama => Style::default().fg(Color::Green),
+                BackendApiType::OpenAi => Style::default().fg(Color::Blue),
+            };
+
             let req_style = if b.active_requests > 0 {
                 Style::default().fg(Color::Cyan).bold()
             } else {
@@ -373,6 +381,7 @@ impl TuiDashboard {
                     Span::styled(status_sym, status_style),
                     Span::styled(url, if b.is_online { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT) }),
                 ])),
+                Cell::from(type_str).style(type_style),
                 Cell::from(b.active_requests.to_string()).style(req_style),
                 Cell::from(b.processed_count.to_string()).style(Style::default().fg(Color::DarkGray)),
             ])
@@ -380,11 +389,12 @@ impl TuiDashboard {
 
         Table::new(rows, [
             Constraint::Min(10),
+            Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(6),
         ])
-        .header(Row::new(vec!["Backend", "Act", "Done"]).style(Style::default().fg(Color::Yellow).bold()).bottom_margin(1))
-        .block(Block::default().title(" Ollama Instances ").borders(Borders::ALL))
+        .header(Row::new(vec!["Backend", "API", "Act", "Done"]).style(Style::default().fg(Color::Yellow).bold()).bottom_margin(1))
+        .block(Block::default().title(" Backend Instances ").borders(Borders::ALL))
     }
 
     fn render_users(&self, snapshot: &StateSnapshot) -> Table<'static> {
