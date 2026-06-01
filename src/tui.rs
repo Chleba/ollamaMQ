@@ -427,6 +427,16 @@ impl TuiDashboard {
                 ])
             ];
 
+            // Display Active or Last used model on a new line
+            if let Some(model) = b.current_model.clone() {
+                let prefix = if b.active_requests > 0 { "  ▶ Active: " } else { "  ↺ Last:   " };
+                let color = if b.active_requests > 0 { Color::Cyan } else { Color::DarkGray };
+                name_lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(color)),
+                    Span::styled(model, Style::default().fg(color).bold()),
+                ]));
+            }
+
             if is_expanded {
                 let mut models: Vec<String> = b.available_models.iter().cloned().collect();
                 models.sort();
@@ -434,21 +444,29 @@ impl TuiDashboard {
                 if models.is_empty() {
                     name_lines.push(Line::from(vec![
                         Span::raw("  "),
-                        Span::styled("└ (No models found)", Style::default().fg(Color::DarkGray).italic()),
+                        Span::styled("└ (No models discovered yet)", Style::default().fg(Color::DarkGray).italic()),
                     ]));
                 } else {
                     let total_models = models.len();
-                    for m in models.into_iter().take(15) {
+                    for m in models.into_iter().take(5) {
+                        let is_loaded = b.loaded_models.contains(&m);
+                        let m_style = if is_loaded {
+                            Style::default().fg(Color::Green).bold()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+
                         name_lines.push(Line::from(vec![
                             Span::raw("  "),
                             Span::styled("└ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(m, Style::default().fg(Color::DarkGray)),
+                            Span::styled(m, m_style),
+                            if is_loaded { Span::styled(" (In RAM)", Style::default().fg(Color::Green).italic()) } else { Span::raw("") },
                         ]));
                     }
-                    if total_models > 15 {
+                    if total_models > 5 {
                         name_lines.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(format!("  ... and {} more", total_models - 15), Style::default().fg(Color::DarkGray).italic()),
+                            Span::styled(format!("  ... and {} more", total_models - 5), Style::default().fg(Color::DarkGray).italic()),
                         ]));
                     }
                 }

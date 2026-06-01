@@ -105,6 +105,8 @@ pub struct BackendStatus {
     pub is_online: bool,
     pub api_type: BackendApiType,
     pub available_models: HashSet<String>,
+    pub loaded_models: HashSet<String>,
+    pub current_model: Option<String>,
 }
 
 pub struct AppState {
@@ -136,6 +138,8 @@ impl AppState {
                 is_online: true,
                 api_type: BackendApiType::Unknown,
                 available_models: HashSet::new(),
+                loaded_models: HashSet::new(),
+                current_model: None,
             })
             .collect();
 
@@ -268,6 +272,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 let mut is_online = false;
                 let mut detected_type = BackendApiType::Unknown;
                 let mut models = HashSet::new();
+                let mut loaded = HashSet::new();
 
                 // Probe Ollama API: /api/tags → expects {"models": [...]}
                 {
@@ -298,6 +303,26 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
                         Err(e) => {
                             debug!("Backend {} /api/tags error: {}", url, e);
+                        }
+                    }
+
+                    // Also check for loaded models via /api/ps if it was an Ollama-like response
+                    if is_online {
+                        let ps_url = format!("{}/api/ps", url);
+                        if let Ok(res) = health_client.get(&ps_url).send().await {
+                            if res.status().is_success() {
+                                if let Ok(body) = res.text().await {
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                                        if let Some(models_json) = json.get("models").and_then(|m| m.as_array()) {
+                                            for m in models_json {
+                                                if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                                                    loaded.insert(name.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -355,6 +380,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     backends[idx].api_type = detected_type;
                 }
                 backends[idx].available_models = models;
+                backends[idx].loaded_models = loaded;
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
@@ -457,6 +483,7 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                         *last_idx = selected_backend_idx;
                         backends[selected_backend_idx].active_requests += 1;
+                        backends[selected_backend_idx].current_model = task.requested_model.clone();
 
                         Some((user_id.clone(), task, selected_backend_idx, backends[selected_backend_idx].url.clone()))
                     }

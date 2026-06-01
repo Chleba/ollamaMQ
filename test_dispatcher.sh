@@ -2,7 +2,9 @@
 
 # Configuration
 BASE_URL="${BASE_URL:-http://localhost:11435}"
-MODEL="${MODEL:-qwen3.5:35b}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-llama3}"
+LMSTUDIO_MODEL="${LMSTUDIO_MODEL:-qwen2.5-7b-instruct}"
+MODELS=("$OLLAMA_MODEL" "$LMSTUDIO_MODEL")
 ENDPOINTS=("/api/generate" "/api/chat" "/v1/chat/completions" "/v1/completions")
 
 # Expanded list of 50 users to thoroughly test scrolling and high load
@@ -21,6 +23,8 @@ USERS=(
 
 echo "🚀 Starting 50-User Stress Test for ollamaMQ..."
 echo "Target Base: $BASE_URL"
+echo "Ollama Model: $OLLAMA_MODEL"
+echo "LM Studio Model: $LMSTUDIO_MODEL"
 echo "Endpoints: ${ENDPOINTS[*]}"
 echo "Total Potential Users: ${#USERS[@]}"
 echo "----------------------------------------"
@@ -30,13 +34,14 @@ send_request() {
     local user=$1
     local id=$2
     local endpoint=${ENDPOINTS[$RANDOM % ${#ENDPOINTS[@]}]}
+    local model=${MODELS[$RANDOM % ${#MODELS[@]}]}
     local url="${BASE_URL}${endpoint}"
     
     local payload=""
     if [[ "$endpoint" == "/api/chat" || "$endpoint" == "/v1/chat/completions" ]]; then
-        payload="{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Req $id\"}], \"stream\": false}"
+        payload="{\"model\": \"$model\", \"messages\": [{\"role\": \"user\", \"content\": \"Req $id\"}], \"stream\": false}"
     else
-        payload="{\"model\": \"$MODEL\", \"prompt\": \"Req $id\", \"stream\": false}"
+        payload="{\"model\": \"$model\", \"prompt\": \"Req $id\", \"stream\": false}"
     fi
 
     # Send request and capture HTTP status code + response
@@ -44,12 +49,11 @@ send_request() {
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
         -d "$payload")
-    status_code=$? # Note: we'll use curl exit code or check response for 200
 
     if [ -n "$response" ]; then
-        echo "✅ [SUCCESS] User: $user | Endp: $endpoint | Res: ${response:0:100}"
+        echo "✅ [SUCCESS] User: $user | Model: $model | Endp: $endpoint | Res: ${response:0:100}"
     else
-        echo "❌ [FAILED] User: $user | Endp: $endpoint | Req: $id"
+        echo "❌ [FAILED] User: $user | Model: $model | Endp: $endpoint | Req: $id"
     fi
 }
 
@@ -58,19 +62,18 @@ send_and_cancel() {
     local user=$1
     local id=$2
     local endpoint=${ENDPOINTS[$RANDOM % ${#ENDPOINTS[@]}]}
+    local model=${MODELS[$RANDOM % ${#MODELS[@]}]}
     local url="${BASE_URL}${endpoint}"
     
-    echo "🏃 [CANCEL TEST] User: $user | Req: $id (Will disconnect early)"
+    echo "🏃 [CANCEL TEST] User: $user | Model: $model | Req: $id (Will disconnect early)"
     
     # Start curl in background, wait a tiny bit, then kill it
     curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
-        -d "{\"model\": \"${MODEL}\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
+        -d "{\"model\": \"${model}\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
     
     local curl_pid=$!
-    # Sleep slightly less than the dispatcher's 500ms artificial delay to test 'is_closed' check,
-    # or slightly more to test 'tokio::select' abortion during backend call.
     sleep 0.3
     kill $curl_pid 2>/dev/null
 }
@@ -79,18 +82,19 @@ send_and_cancel() {
 send_image_request() {
     local user=$1
     local id=$2
+    local model="$OLLAMA_MODEL"
     local url="${BASE_URL}/api/generate"
     
     # Base64 encoded tiny 1x1 red pixel PNG
     local b64_pixel="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     
-    echo "🖼️ [IMAGE TEST] User: $user | Req: $id (Sending multimodal request to ${MODEL})"
+    echo "🖼️ [IMAGE TEST] User: $user | Req: $id (Sending multimodal request to ${model})"
     
     # Send request and capture HTTP status code
     response=$(curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
         -H "Content-Type: application/json" \
-        -d "{\"model\": \"${MODEL}\", \"prompt\": \"What is in this image?\", \"images\": [\"$b64_pixel\"], \"stream\": false}")
+        -d "{\"model\": \"${model}\", \"prompt\": \"What is in this image?\", \"images\": [\"$b64_pixel\"], \"stream\": false}")
 
     if [ -n "$response" ]; then
         echo "✅ [SUCCESS] User: $user | Endpoint: IMAGE | Res: ${response:0:100}"
