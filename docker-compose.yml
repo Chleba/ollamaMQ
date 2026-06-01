@@ -16,11 +16,11 @@ services:
     ports:
       - "11435:11435"
     environment:
-      # If using host Ollama on Linux:
-      # 1. Ensure Ollama is listening on 0.0.0.0 (export OLLAMA_HOST=0.0.0.0)
-      # 2. Use http://host.docker.internal:11434
-      # If using the 'ollama' service above, use http://ollama:11434
-      - OLLAMA_URLS=http://host.docker.internal:11434
+      # URLs of backend servers (Ollama, LM Studio, etc.)
+      # If using host Ollama/LM Studio on Linux:
+      # 1. Ensure the server is listening on 0.0.0.0
+      # 2. Use http://host.docker.internal:<port>
+      - BACKEND_URLS=http://host.docker.internal:11434,http://host.docker.internal:1234
       - PORT=11435
       - TIMEOUT=300
       - RUST_LOG=info
