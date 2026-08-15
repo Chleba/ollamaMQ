@@ -251,6 +251,41 @@ fn smart_model_match(requested: &str, available: &HashSet<String>) -> bool {
     false
 }
 
+/// Probe LM Studio's native `/api/v1/models` endpoint and return the set of models that are
+/// currently LOADED (i.e. their `loaded_instances` array is non-empty). This endpoint is
+/// LM-Studio-specific: Ollama and generic OpenAI servers 404 it, in which case an empty set is
+/// returned. Used to prefer routing to a backend that already holds the model in GPU memory.
+async fn probe_lmstudio_loaded_models(client: &reqwest::Client, url: &str) -> HashSet<String> {
+    let mut loaded = HashSet::new();
+    let check_url = format!("{}/api/v1/models", url);
+
+    let Ok(res) = client.get(&check_url).send().await else { return loaded; };
+    if !res.status().is_success() {
+        return loaded; // 404 / non-2xx on non-LM-Studio backends → skip gracefully
+    }
+    let Ok(body) = res.text().await else { return loaded; };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else { return loaded; };
+    let Some(models_json) = json.get("models").and_then(|m| m.as_array()) else { return loaded; };
+
+    for m in models_json {
+        // A model is LOADED iff its "loaded_instances" array is non-empty.
+        let is_loaded = m.get("loaded_instances")
+            .and_then(|li| li.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+        if is_loaded {
+            // Insert both "key" and "id" (if present) to maximize match coverage with available_models.
+            if let Some(key) = m.get("key").and_then(|k| k.as_str()) {
+                loaded.insert(key.to_string());
+            }
+            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                loaded.insert(id.to_string());
+            }
+        }
+    }
+    loaded
+}
+
 pub async fn run_worker(state: Arc<AppState>) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(state.timeout))
@@ -360,6 +395,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                     }
                 }
 
+                // Probe LM Studio native API for loaded models (loaded_instances non-empty).
+                // LM-Studio-specific endpoint; Ollama / generic OpenAI servers 404 it (handled
+                // gracefully inside the helper). Populates `loaded` without touching `models`.
+                loaded.extend(probe_lmstudio_loaded_models(&health_client, &url).await);
+
                 // Fallback: just check root if both specific probes failed
                 if !is_online {
                     let check_url = format!("{}/", url);
@@ -463,6 +503,20 @@ pub async fn run_worker(state: Arc<AppState>) {
                         })
                         .map(|(i, _)| i)
                         .collect();
+
+                    // Prefer backends where the requested model is already loaded in GPU memory
+                    // (LM Studio: loaded_instances; Ollama: /api/ps). available_models stays the
+                    // HARD requirement; loaded_models is only a PREFERENCE among eligible backends.
+                    // If no eligible backend has it loaded, fall back to the full available set
+                    // so on-demand loading still works.
+                    let eligible_indices = if let Some(ref model) = task_ref.requested_model {
+                        let loaded_eligible: Vec<usize> = eligible_indices.iter().cloned()
+                            .filter(|&i| smart_model_match(model, &backends[i].loaded_models))
+                            .collect();
+                        if loaded_eligible.is_empty() { eligible_indices } else { loaded_eligible }
+                    } else {
+                        eligible_indices
+                    };
 
                     if eligible_indices.is_empty() {
                         if let Some(ref model) = task_ref.requested_model {

@@ -42,6 +42,7 @@ pub struct TuiDashboard {
     blocked_table_state: TableState,
     active_panel: Panel,
     expanded_backends: HashSet<String>,
+    show_all_backends: HashSet<String>,
     show_help: bool,
 }
 
@@ -53,6 +54,7 @@ impl TuiDashboard {
             blocked_table_state: TableState::default(),
             active_panel: Panel::Users,
             expanded_backends: HashSet::new(),
+            show_all_backends: HashSet::new(),
             show_help: false,
         }
     }
@@ -147,6 +149,18 @@ impl TuiDashboard {
                                             self.expanded_backends.insert(url);
                                         }
                                     }
+                                }
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            if self.active_panel != Panel::Backends {
+                                // not in backends panel
+                            } else if let Some(i) = self.backend_table_state.selected().filter(|&i| i < snapshot.backends.len()) {
+                                let url = snapshot.backends[i].url.clone();
+                                if self.show_all_backends.contains(&url) {
+                                    self.show_all_backends.remove(&url);
+                                } else {
+                                    self.show_all_backends.insert(url);
                                 }
                             }
                         }
@@ -448,7 +462,9 @@ impl TuiDashboard {
                     ]));
                 } else {
                     let total_models = models.len();
-                    for m in models.into_iter().take(5) {
+                    let show_all = self.show_all_backends.contains(&b.url);
+                    let limit = if show_all { total_models } else { 5.min(total_models) };
+                    for m in models.into_iter().take(limit) {
                         let is_loaded = b.loaded_models.contains(&m);
                         let m_style = if is_loaded {
                             Style::default().fg(Color::Green).bold()
@@ -463,7 +479,7 @@ impl TuiDashboard {
                             if is_loaded { Span::styled(" (In RAM)", Style::default().fg(Color::Green).italic()) } else { Span::raw("") },
                         ]));
                     }
-                    if total_models > 5 {
+                    if !show_all && total_models > 5 {
                         name_lines.push(Line::from(vec![
                             Span::raw("  "),
                             Span::styled(format!("  ... and {} more", total_models - 5), Style::default().fg(Color::DarkGray).italic()),
@@ -562,11 +578,11 @@ impl TuiDashboard {
     }
 
     fn render_help(&self) -> Paragraph<'static> {
-        Paragraph::new(" h/l/Tab: Switch Panel | j/k: Nav | Space/Enter: Expand Models | p: VIP | b: Boost | q: Quit")
+        Paragraph::new(" h/l/Tab: Switch Panel | j/k: Nav | Space/Enter: Expand Models | a: Show All | p: VIP | b: Boost | q: Quit")
             .block(Block::default().borders(Borders::ALL).title_bottom(Line::from(format!(" v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Right)))
     }
 
     fn render_detailed_help(&self) -> Paragraph<'static> {
-        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued").block(Block::default().title(" Help ").borders(Borders::ALL)).style(Style::default().fg(Color::Gray))
+        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  SHOW ALL MODELS: 'a' (in Backends panel)\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued").block(Block::default().title(" Help ").borders(Borders::ALL)).style(Style::default().fg(Color::Gray))
     }
 }
