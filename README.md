@@ -83,6 +83,7 @@ docker run -d \
 `ollamaMQ` supports several options to configure the proxy:
 
 - `-p, --port <PORT>`: Port to listen on (default: `11435`)
+- `-H, --host <HOST>`: Host/interface to bind to (default: `127.0.0.1`, loopback only). Set `--host 0.0.0.0` to allow LAN/Docker access.
 - `-o, --backend-urls <URL1,URL2>`: Comma-separated list of backend server URLs (Ollama, LM Studio, etc.) (default: `http://localhost:11434`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI). In this mode, logs are written verbosely to **stderr** (default level `debug`) so they can be captured by a service manager's journal, Docker, or piped to a file.
@@ -277,7 +278,45 @@ The Dockerfile uses a multi-stage build:
 | ------------- | ------------------------------ | ------------------------ |
 | `OLLAMA_URLS` | URLs of the Ollama servers     | `http://localhost:11434` |
 | `PORT`        | Port for ollamaMQ to listen on | `11435`                  |
+| `HOST`        | Host/interface to bind to      | `0.0.0.0`                |
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
+| `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
+
+### 🔒 Security (Optional API-Key Auth)
+
+By default, `ollamaMQ` only listens on loopback (`127.0.0.1`), so it is only reachable from the local machine. If you expose it to the network with `--host 0.0.0.0`, set the `OLLAMA_MQ_API_KEY` environment variable to a secret key to protect the proxy. Auth is **opt-in**: if the variable is unset or empty, behavior is unchanged and no key is required.
+
+When a key is set, every request **except `/health`** must present it via one of two headers:
+
+- `Authorization: Bearer <key>`
+- `X-API-Key: <key>`
+
+Requests with a missing or wrong key get `401 Unauthorized` (`{"error":"unauthorized"}`). The `/health` endpoint always stays unauthenticated so health checks and Docker healthchecks keep working.
+
+```bash
+# Enable auth
+OLLAMA_MQ_API_KEY=supersecret ollamaMQ --no-tui
+
+# Call the API with the key (either header works)
+curl -X POST http://localhost:11435/api/chat \
+  -H "Authorization: Bearer supersecret" \
+  -H "X-User-ID: developer-1" \
+  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Hi"}]}'
+
+# ...or with X-API-Key
+curl http://localhost:11435/api/tags -H "X-API-Key: supersecret"
+
+# /health never requires a key
+curl http://localhost:11435/health
+```
+
+In Docker, just pass the variable through — the binary reads it directly from the environment:
+
+```bash
+docker run -d --name ollamamq -p 11435:11435 \
+  -e OLLAMA_MQ_API_KEY=supersecret \
+  chlebon/ollamamq
+```
 
 ### Connecting to Different Ollama Servers
 

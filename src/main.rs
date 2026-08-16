@@ -1,5 +1,9 @@
 use axum::{
     Router,
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{any, get},
 };
 use clap::Parser;
@@ -23,6 +27,10 @@ struct Args {
     #[arg(short, long, default_value_t = 11435)]
     port: u16,
 
+    /// Host/interface to bind to
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    host: String,
+
     /// Backend server URLs (e.g., Ollama, LM Studio) (comma-separated list)
     #[arg(short, long, value_delimiter = ',', default_value = "http://localhost:11434", alias = "ollama-urls")]
     backend_urls: Vec<String>,
@@ -43,6 +51,71 @@ struct Args {
 struct TuiState {
     visible: bool,
     toggle_notify: Arc<Notify>,
+}
+
+/// Constant-time string comparison to avoid timing side-channels when checking API keys.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Build the 401 response with JSON content type and a Bearer challenge hint.
+fn unauthorized_response() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("www-authenticate", "Bearer")
+        .body(axum::body::Body::from("{\"error\":\"unauthorized\"}"))
+        .unwrap()
+}
+
+/// Optional API-key auth middleware. If no key is configured (state is None),
+/// all requests pass through untouched.
+async fn auth_middleware(
+    State(api_key): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = api_key else {
+        return next.run(request).await;
+    };
+
+    let headers = request.headers();
+    let provided = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                // Auth-scheme is case-insensitive per RFC 7235; "Bearer " is 7 ASCII bytes.
+                .and_then(|v| {
+                    if v.len() > 7 && v.get(..7)?.eq_ignore_ascii_case("Bearer ") {
+                        Some(v[7..].to_string())
+                    } else {
+                        None
+                    }
+                })
+        });
+
+    let provided = match provided {
+        Some(p) => p,
+        None => return unauthorized_response(),
+    };
+
+    if constant_time_eq(&provided, &expected) {
+        next.run(request).await
+    } else {
+        unauthorized_response()
+    }
 }
 
 #[tokio::main]
@@ -93,8 +166,10 @@ async fn main() {
         run_worker(worker_state).await;
     });
 
+    // Optional API-key auth: enabled only when OLLAMA_MQ_API_KEY is set (non-empty).
+    let api_key = std::env::var("OLLAMA_MQ_API_KEY").ok().filter(|k| !k.is_empty());
+
     let mut app = Router::new()
-        .route("/health", get(|| async { "OK" }))
         // Ollama API Endpoints (Explicitly listed)
         .route("/", any(proxy_handler))
         .route("/api/generate", any(proxy_handler))
@@ -123,11 +198,19 @@ async fn main() {
         app = app.fallback(proxy_handler);
     }
 
+    // Protect all proxy routes (including the fallback) with optional API-key auth.
+    // /health is registered separately below and stays unauthenticated.
     let app = app
+        .layer(middleware::from_fn_with_state(api_key, auth_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB limit
         .with_state(state.clone());
 
-    let addr = format!("0.0.0.0:{}", args.port);
+    let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .merge(app)
+        .with_state(state.clone());
+
+    let addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Dispatcher running on http://{}", addr);
 
