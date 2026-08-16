@@ -1,0 +1,23 @@
+[Unit]
+Description=ollamaMQ - Ollama/LM Studio message queue dispatcher and load balancer
+Documentation=https://github.com/Chleba/ollamaMQ
+After=network.target
+
+[Service]
+Type=simple
+
+# Add Your User & Group that OllamaMQ should be run
+User=root
+Group=root
+
+# Path to the ollamaMQ binary — adjust to your install location (e.g. ~/.cargo/bin/ollamaMQ)
+# --no-tui sends verbose logs to stderr, which systemd captures into the journal
+# WorkingDirectory=
+ExecStart=/usr/local/bin/ollamaMQ -p 11436 -b http://localhost:1234 --no-tui
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

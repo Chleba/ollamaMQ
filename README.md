@@ -85,7 +85,7 @@ docker run -d \
 - `-p, --port <PORT>`: Port to listen on (default: `11435`)
 - `-o, --backend-urls <URL1,URL2>`: Comma-separated list of backend server URLs (Ollama, LM Studio, etc.) (default: `http://localhost:11434`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
-- `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI)
+- `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI). In this mode, logs are written verbosely to **stderr** (default level `debug`) so they can be captured by a service manager's journal, Docker, or piped to a file.
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
@@ -172,7 +172,68 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 
 ### Logging
 
-Logs are automatically written to `ollamamq.log` in the current working directory. This keeps the terminal clear for the TUI dashboard while allowing you to monitor system events and debug backend communication.
+`ollamaMQ` uses [`tracing`](https://docs.rs/tracing) and behaves differently depending on the mode:
+
+- **TUI mode** (default, interactive terminal): Logs are written to the `ollamamq.log` file in the current working directory. This keeps the terminal clear for the dashboard. Default level is `info`.
+- **`--no-tui` mode** (Docker/CI/service): Logs are written to **stderr** at a default level of `debug`, so you can see everything — backend health checks, per-request routing, backend detection, and errors. This is ideal for capturing output via the systemd journal, Docker, or piping to a file.
+
+Override the level at any time with the standard `RUST_LOG` environment variable:
+
+```bash
+# Most verbose (all debug detail)
+RUST_LOG=debug ollamaMQ --no-tui
+
+# Quieter (info + errors only)
+RUST_LOG=info ollamaMQ --no-tui
+```
+
+### Running as a systemd Service
+
+To run `ollamaMQ` as a background service with full log visibility in the journal:
+
+1. Copy the provided service file to your system's unit directory:
+
+   ```bash
+   sudo cp ollamamq.service /etc/systemd/system/
+   ```
+
+2. Edit the file and set the correct `ExecStart` path to your installed binary (e.g. `~/.cargo/bin/ollamaMQ`) and your backend URLs:
+
+   ```ini
+   ExecStart=/usr/local/bin/ollamaMQ --no-tui --port 11435 --backend-urls http://localhost:11434
+   ```
+
+   > **Note:** If you installed `ollamaMQ` with `cargo install`, the binary is at `~/.cargo/bin/ollamaMQ`, **not** `/usr/local/bin/ollamaMQ`. Point `ExecStart` at the real path, or create a symlink so the default path works:
+   >
+   > ```bash
+   > # Find the real path
+   > which ollamaMQ
+   >
+   > # Option A: edit ExecStart to use the real path
+   > # Option B: symlink it to the expected location
+   > sudo ln -s "$HOME/.cargo/bin/ollamaMQ" /usr/local/bin/ollamaMQ
+   > ```
+
+3. Reload systemd, then enable and start the service:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now ollamamq
+   ```
+
+4. Follow the logs in real time via the journal:
+
+   ```bash
+   journalctl -u ollamamq -f
+   ```
+
+   Or show the most recent 100 lines:
+
+   ```bash
+   journalctl -u ollamamq -n 100
+   ```
+
+Because `--no-tui` defaults to `debug` logging on stderr, **all** dispatcher events (backend health, request routing, errors) are captured in the journal — no separate log file needed.
 
 ## 🐳 Docker
 
