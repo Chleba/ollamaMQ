@@ -3,8 +3,8 @@ use axum::{
     extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{any, get},
+    response::Response,
+    routing::{any, get, post},
 };
 use clap::Parser;
 use std::net::SocketAddr;
@@ -13,9 +13,11 @@ use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod control;
 mod dispatcher;
 mod tui;
 
+use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
 use crate::dispatcher::{AppState, proxy_handler, run_worker};
 
 use std::io::IsTerminal;
@@ -32,7 +34,13 @@ struct Args {
     host: String,
 
     /// Backend server URLs (e.g., Ollama, LM Studio) (comma-separated list)
-    #[arg(short, long, value_delimiter = ',', default_value = "http://localhost:11434", alias = "ollama-urls")]
+    #[arg(
+        short,
+        long,
+        value_delimiter = ',',
+        default_value = "http://localhost:11434",
+        alias = "ollama-urls"
+    )]
     backend_urls: Vec<String>,
 
     /// Request timeout in seconds
@@ -46,6 +54,12 @@ struct Args {
     /// Allow all routes (enable fallback proxy)
     #[arg(long, default_value_t = false)]
     allow_all_routes: bool,
+
+    /// How long (seconds) models stay loaded after a model-control "load"
+    /// request (sent as Ollama `keep_alive`; LM Studio loads are unaffected
+    /// beyond its own TTL). Ollama's own default is only 5 minutes.
+    #[arg(long, default_value_t = 86400)]
+    load_keep_alive: u64,
 }
 
 struct TuiState {
@@ -121,7 +135,9 @@ async fn auth_middleware(
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let backend_urls: Vec<String> = args.backend_urls.iter()
+    let backend_urls: Vec<String> = args
+        .backend_urls
+        .iter()
         .map(|url| {
             let trimmed = url.trim_end_matches('/').to_string();
             if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
@@ -159,7 +175,11 @@ async fn main() {
             .init();
     }
 
-    let state = Arc::new(AppState::new(backend_urls, args.timeout));
+    let state = Arc::new(AppState::new(
+        backend_urls,
+        args.timeout,
+        args.load_keep_alive,
+    ));
 
     let worker_state = state.clone();
     tokio::spawn(async move {
@@ -167,7 +187,9 @@ async fn main() {
     });
 
     // Optional API-key auth: enabled only when OLLAMA_MQ_API_KEY is set (non-empty).
-    let api_key = std::env::var("OLLAMA_MQ_API_KEY").ok().filter(|k| !k.is_empty());
+    let api_key = std::env::var("OLLAMA_MQ_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
 
     let mut app = Router::new()
         // Ollama API Endpoints (Explicitly listed)
@@ -191,7 +213,12 @@ async fn main() {
         .route("/v1/completions", any(proxy_handler))
         .route("/v1/embeddings", any(proxy_handler))
         .route("/v1/models", any(proxy_handler))
-        .route("/v1/models/{model}", any(proxy_handler));
+        .route("/v1/models/{model}", any(proxy_handler))
+        // Local admin API (model load/unload control) — never proxied to
+        // backends, protected by the same optional API-key auth.
+        .route("/admin/models", get(admin_models_state))
+        .route("/admin/models/load", post(admin_model_load))
+        .route("/admin/models/unload", post(admin_model_unload));
 
     // Optional fallback
     if args.allow_all_routes {

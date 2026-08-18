@@ -97,6 +97,16 @@ pub fn detect_api_family(path: &str) -> ApiFamily {
     }
 }
 
+/// One entry from LM Studio's native model list (`GET /api/v1/models`):
+/// the model key, optional display name, and ids of currently loaded instances
+/// (used by model control to resolve the `instance_id` for unloading).
+#[derive(Clone, Debug)]
+pub struct LmModelInfo {
+    pub key: String,
+    pub display_name: Option<String>,
+    pub loaded_instance_ids: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct BackendStatus {
     pub url: String,
@@ -107,6 +117,11 @@ pub struct BackendStatus {
     pub available_models: HashSet<String>,
     pub loaded_models: HashSet<String>,
     pub current_model: Option<String>,
+    /// True when the backend speaks the LM Studio native REST API
+    /// (`/api/v1/models*`), which enables model load/unload control.
+    pub lmstudio: bool,
+    /// LM Studio native model list (empty for other backend types).
+    pub native_models: Vec<LmModelInfo>,
 }
 
 pub struct AppState {
@@ -125,12 +140,24 @@ pub struct AppState {
     pub backends: Mutex<Vec<BackendStatus>>,
     pub last_backend_idx: Mutex<usize>,
     pub timeout: u64,
+    /// Shared HTTP client for proxying and backend control probes.
+    pub client: reqwest::Client,
+    /// In-flight model control operations, keyed by backend index
+    /// (at most one per backend). Backends with an entry are treated as busy
+    /// by the scheduler.
+    pub control_ops: Mutex<HashMap<usize, crate::control::ControlOp>>,
+    /// Recent finished control operations (bounded), for TUI feedback.
+    pub control_history: Mutex<VecDeque<crate::control::ControlResult>>,
+    /// `keep_alive` (seconds) sent with control "load" requests so explicitly
+    /// loaded models stay resident (Ollama's own default is only 5 minutes).
+    pub load_keep_alive: u64,
 }
 
 impl AppState {
-    pub fn new(backend_urls: Vec<String>, timeout: u64) -> Self {
+    pub fn new(backend_urls: Vec<String>, timeout: u64, load_keep_alive: u64) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
-        let backends = backend_urls.into_iter()
+        let backends = backend_urls
+            .into_iter()
             .map(|url| BackendStatus {
                 url,
                 active_requests: 0,
@@ -140,8 +167,15 @@ impl AppState {
                 available_models: HashSet::new(),
                 loaded_models: HashSet::new(),
                 current_model: None,
+                lmstudio: false,
+                native_models: Vec::new(),
             })
             .collect();
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout))
+            .build()
+            .unwrap();
 
         Self {
             queues: Mutex::new(HashMap::new()),
@@ -159,6 +193,10 @@ impl AppState {
             backends: Mutex::new(backends),
             last_backend_idx: Mutex::new(0),
             timeout,
+            client,
+            control_ops: Mutex::new(HashMap::new()),
+            control_history: Mutex::new(VecDeque::new()),
+            load_keep_alive,
         }
     }
 
@@ -228,6 +266,17 @@ impl AppState {
     }
 }
 
+/// Per-pair normalization used by both the set-level matcher and model-name
+/// resolution in `control.rs`: compares names ignoring the `:tag` suffix and
+/// case (so `llama3` matches `llama3:latest`).
+pub fn smart_model_match_one(requested: &str, model: &str) -> bool {
+    let requested_low = requested.to_lowercase();
+    let requested_no_tag = requested_low.split(':').next().unwrap_or(&requested_low);
+    let model_low = model.to_lowercase();
+    let model_no_tag = model_low.split(':').next().unwrap_or(&model_low);
+    requested_no_tag == model_no_tag
+}
+
 fn smart_model_match(requested: &str, available: &HashSet<String>) -> bool {
     // 1. Exact match
     if available.contains(requested) {
@@ -235,62 +284,13 @@ fn smart_model_match(requested: &str, available: &HashSet<String>) -> bool {
     }
 
     // 2. Normalized match (handle :latest and case sensitivity)
-    let requested_low = requested.to_lowercase();
-    let requested_no_tag = requested_low.split(':').next().unwrap_or(&requested_low);
-
-    for model in available {
-        let model_low = model.to_lowercase();
-        let model_no_tag = model_low.split(':').next().unwrap_or(&model_low);
-
-        // Match if names match (ignoring tags if requested has no tag, or if one is :latest)
-        if requested_no_tag == model_no_tag {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Probe LM Studio's native `/api/v1/models` endpoint and return the set of models that are
-/// currently LOADED (i.e. their `loaded_instances` array is non-empty). This endpoint is
-/// LM-Studio-specific: Ollama and generic OpenAI servers 404 it, in which case an empty set is
-/// returned. Used to prefer routing to a backend that already holds the model in GPU memory.
-async fn probe_lmstudio_loaded_models(client: &reqwest::Client, url: &str) -> HashSet<String> {
-    let mut loaded = HashSet::new();
-    let check_url = format!("{}/api/v1/models", url);
-
-    let Ok(res) = client.get(&check_url).send().await else { return loaded; };
-    if !res.status().is_success() {
-        return loaded; // 404 / non-2xx on non-LM-Studio backends → skip gracefully
-    }
-    let Ok(body) = res.text().await else { return loaded; };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else { return loaded; };
-    let Some(models_json) = json.get("models").and_then(|m| m.as_array()) else { return loaded; };
-
-    for m in models_json {
-        // A model is LOADED iff its "loaded_instances" array is non-empty.
-        let is_loaded = m.get("loaded_instances")
-            .and_then(|li| li.as_array())
-            .map(|arr| !arr.is_empty())
-            .unwrap_or(false);
-        if is_loaded {
-            // Insert both "key" and "id" (if present) to maximize match coverage with available_models.
-            if let Some(key) = m.get("key").and_then(|k| k.as_str()) {
-                loaded.insert(key.to_string());
-            }
-            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
-                loaded.insert(id.to_string());
-            }
-        }
-    }
-    loaded
+    available
+        .iter()
+        .any(|m| smart_model_match_one(requested, m))
 }
 
 pub async fn run_worker(state: Arc<AppState>) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(state.timeout))
-        .build()
-        .unwrap();
+    let client = state.client.clone();
     let mut current_idx = 0;
 
     // Background Health Check
@@ -300,127 +300,37 @@ pub async fn run_worker(state: Arc<AppState>) {
         loop {
             let backends_to_check: Vec<(usize, String)> = {
                 let backends = health_state.backends.lock().unwrap();
-                backends.iter().enumerate().map(|(i, b)| (i, b.url.clone())).collect()
+                backends
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (i, b.url.clone()))
+                    .collect()
             };
 
             for (idx, url) in backends_to_check {
-                let mut is_online = false;
-                let mut detected_type = BackendApiType::Unknown;
-                let mut models = HashSet::new();
-                let mut loaded = HashSet::new();
-
-                // Probe Ollama API: /api/tags → expects {"models": [...]}
-                {
-                    let check_url = format!("{}/api/tags", url);
-                    match health_client.get(&check_url).send().await {
-                        Ok(res) if res.status().is_success() => {
-                            is_online = true;
-                            if let Ok(body) = res.text().await {
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                                    if let Some(models_json) = json.get("models").and_then(|m| m.as_array()) {
-                                        detected_type = detected_type.merge(BackendApiType::Ollama);
-                                        debug!("Backend {} confirmed Ollama API via /api/tags", url);
-                                        for m in models_json {
-                                            if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                                                models.insert(name.to_string());
-                                            }
-                                        }
-                                    } else {
-                                        warn!("Backend {} responded 200 to /api/tags but 'models' array not found or invalid. Body: {}", url, body);
-                                    }
-                                } else {
-                                    warn!("Backend {} responded 200 to /api/tags but body is not valid JSON", url);
-                                }
-                            }
-                        }
-                        Ok(res) => {
-                            debug!("Backend {} /api/tags returned status: {}", url, res.status());
-                        }
-                        Err(e) => {
-                            debug!("Backend {} /api/tags error: {}", url, e);
-                        }
-                    }
-
-                    // Also check for loaded models via /api/ps if it was an Ollama-like response
-                    if is_online {
-                        let ps_url = format!("{}/api/ps", url);
-                        if let Ok(res) = health_client.get(&ps_url).send().await {
-                            if res.status().is_success() {
-                                if let Ok(body) = res.text().await {
-                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                                        if let Some(models_json) = json.get("models").and_then(|m| m.as_array()) {
-                                            for m in models_json {
-                                                if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                                                    loaded.insert(name.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Probe OpenAI API: /v1/models → expects {"data": [...]}
-                {
-                    let check_url = format!("{}/v1/models", url);
-                    match health_client.get(&check_url).send().await {
-                        Ok(res) if res.status().is_success() => {
-                            is_online = true;
-                            if let Ok(body) = res.text().await {
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                                    if let Some(data_json) = json.get("data").and_then(|d| d.as_array()) {
-                                        detected_type = detected_type.merge(BackendApiType::OpenAi);
-                                        debug!("Backend {} confirmed OpenAI API via /v1/models", url);
-                                        for m in data_json {
-                                            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
-                                                models.insert(id.to_string());
-                                            }
-                                        }
-                                    } else {
-                                        warn!("Backend {} responded 200 to /v1/models but 'data' array not found or invalid. Body: {}", url, body);
-                                    }
-                                } else {
-                                    warn!("Backend {} responded 200 to /v1/models but body is not valid JSON", url);
-                                }
-                            }
-                        }
-                        Ok(res) => {
-                            debug!("Backend {} /v1/models returned status: {}", url, res.status());
-                        }
-                        Err(e) => {
-                            debug!("Backend {} /v1/models error: {}", url, e);
-                        }
-                    }
-                }
-
-                // Probe LM Studio native API for loaded models (loaded_instances non-empty).
-                // LM-Studio-specific endpoint; Ollama / generic OpenAI servers 404 it (handled
-                // gracefully inside the helper). Populates `loaded` without touching `models`.
-                loaded.extend(probe_lmstudio_loaded_models(&health_client, &url).await);
-
-                // Fallback: just check root if both specific probes failed
-                if !is_online {
-                    let check_url = format!("{}/", url);
-                    if let Ok(res) = health_client.get(&check_url).send().await {
-                        if res.status().is_success() {
-                            is_online = true;
-                        }
-                    }
-                }
+                let probe = crate::control::probe_backend(&health_client, &url).await;
 
                 let mut backends = health_state.backends.lock().unwrap();
-                if backends[idx].is_online != is_online {
-                    info!("Backend {} status changed to: {}", url, if is_online { "ONLINE" } else { "OFFLINE" });
-                    backends[idx].is_online = is_online;
+                if backends[idx].is_online != probe.is_online {
+                    info!(
+                        "Backend {} status changed to: {}",
+                        url,
+                        if probe.is_online { "ONLINE" } else { "OFFLINE" }
+                    );
+                    backends[idx].is_online = probe.is_online;
                 }
-                if backends[idx].api_type != detected_type {
-                    info!("Backend {} API type detected: {}", url, detected_type.display());
-                    backends[idx].api_type = detected_type;
+                if backends[idx].api_type != probe.api_type {
+                    info!(
+                        "Backend {} API type detected: {}",
+                        url,
+                        probe.api_type.display()
+                    );
+                    backends[idx].api_type = probe.api_type;
                 }
-                backends[idx].available_models = models;
-                backends[idx].loaded_models = loaded;
+                backends[idx].available_models = probe.available_models;
+                backends[idx].loaded_models = probe.loaded_models;
+                backends[idx].lmstudio = probe.lmstudio;
+                backends[idx].native_models = probe.native_models;
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
@@ -429,15 +339,20 @@ pub async fn run_worker(state: Arc<AppState>) {
     loop {
         let selection_opt = {
             let mut queues = state.queues.lock().unwrap();
+            // Backends with a model control op (load/unload) in flight are treated as
+            // busy: loading a new model can evict whatever is currently running.
+            let control_busy: HashSet<usize> =
+                state.control_ops.lock().unwrap().keys().copied().collect();
             let mut backends = state.backends.lock().unwrap();
             let mut last_idx = state.last_backend_idx.lock().unwrap();
-            
+
             // 1. Pick a user and peek at their front task to know required API family
             let vip = state.vip_user.lock().unwrap().clone();
             let boost = state.boost_user.lock().unwrap().clone();
             let mut counter = state.global_counter.lock().unwrap();
 
-            let mut active_users: Vec<String> = queues.keys()
+            let mut active_users: Vec<String> = queues
+                .keys()
                 .filter(|u| !queues.get(*u).unwrap().is_empty())
                 .cloned()
                 .collect();
@@ -446,20 +361,40 @@ pub async fn run_worker(state: Arc<AppState>) {
                 None
             } else {
                 active_users.sort_by(|a, b| {
-                    let a_total = state.processed_counts.lock().unwrap().get(a).cloned().unwrap_or(0);
-                    let b_total = state.processed_counts.lock().unwrap().get(b).cloned().unwrap_or(0);
+                    let a_total = state
+                        .processed_counts
+                        .lock()
+                        .unwrap()
+                        .get(a)
+                        .cloned()
+                        .unwrap_or(0);
+                    let b_total = state
+                        .processed_counts
+                        .lock()
+                        .unwrap()
+                        .get(b)
+                        .cloned()
+                        .unwrap_or(0);
                     a_total.cmp(&b_total).then_with(|| a.cmp(b))
                 });
 
                 let mut target_user = None;
-                if let Some(ref v) = vip { if active_users.contains(v) { target_user = Some(v.clone()); } }
-                if target_user.is_none() {
-                    if let Some(ref b) = boost {
-                        if active_users.contains(b) && *counter % 2 == 0 { target_user = Some(b.clone()); }
+                if let Some(ref v) = vip {
+                    if active_users.contains(v) {
+                        target_user = Some(v.clone());
                     }
                 }
                 if target_user.is_none() {
-                    if current_idx >= active_users.len() { current_idx = 0; }
+                    if let Some(ref b) = boost {
+                        if active_users.contains(b) && *counter % 2 == 0 {
+                            target_user = Some(b.clone());
+                        }
+                    }
+                }
+                if target_user.is_none() {
+                    if current_idx >= active_users.len() {
+                        current_idx = 0;
+                    }
                     target_user = Some(active_users[current_idx].clone());
                     current_idx += 1;
                 }
@@ -468,18 +403,25 @@ pub async fn run_worker(state: Arc<AppState>) {
                 if let Some(ref user_id) = target_user {
                     let task_ref = queues.get(user_id).unwrap().front().unwrap();
                     let api_family = detect_api_family(&task_ref.path);
-                    debug!("Request for user {}: path={} family={:?}", user_id, task_ref.path, api_family);
+                    debug!(
+                        "Request for user {}: path={} family={:?}",
+                        user_id, task_ref.path, api_family
+                    );
 
                     // Find eligible backends: online, not busy, and support the required API + Model
                     let eligible_indices: Vec<usize> = backends.iter()
                         .enumerate()
-                        .filter(|(_, b)| {
+                        .filter(|(i, b)| {
                             let online = b.is_online;
                             let free = b.active_requests < 1;
-                            if !online || !free {
-                                debug!("Backend {} rejected: online={}, active={}", b.url, online, b.active_requests);
+                            let no_op = !control_busy.contains(i);
+                            if !online || !free || !no_op {
+                                debug!(
+                                    "Backend {} rejected: online={}, active={}, control_op={}",
+                                    b.url, online, b.active_requests, !no_op
+                                );
                             }
-                            online && free
+                            online && free && no_op
                         })
                         .filter(|(_, b)| {
                             // If a specific model is requested, backend MUST have it.
@@ -510,19 +452,31 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // If no eligible backend has it loaded, fall back to the full available set
                     // so on-demand loading still works.
                     let eligible_indices = if let Some(ref model) = task_ref.requested_model {
-                        let loaded_eligible: Vec<usize> = eligible_indices.iter().cloned()
+                        let loaded_eligible: Vec<usize> = eligible_indices
+                            .iter()
+                            .cloned()
                             .filter(|&i| smart_model_match(model, &backends[i].loaded_models))
                             .collect();
-                        if loaded_eligible.is_empty() { eligible_indices } else { loaded_eligible }
+                        if loaded_eligible.is_empty() {
+                            eligible_indices
+                        } else {
+                            loaded_eligible
+                        }
                     } else {
                         eligible_indices
                     };
 
                     if eligible_indices.is_empty() {
                         if let Some(ref model) = task_ref.requested_model {
-                            warn!("No backend available for model '{}' for user {}. Request stuck in queue.", model, user_id);
+                            warn!(
+                                "No backend available for model '{}' for user {}. Request stuck in queue.",
+                                model, user_id
+                            );
                         } else {
-                            warn!("No backend available for API family {:?} for user {}. Request stuck in queue.", api_family, user_id);
+                            warn!(
+                                "No backend available for API family {:?} for user {}. Request stuck in queue.",
+                                api_family, user_id
+                            );
                         }
                         None
                     } else {
@@ -530,16 +484,30 @@ pub async fn run_worker(state: Arc<AppState>) {
                         *counter += 1;
 
                         // Round-Robin among eligible backends with min connections
-                        let min_conns = eligible_indices.iter().map(|&i| backends[i].active_requests).min().unwrap();
-                        let candidates: Vec<usize> = eligible_indices.iter().cloned().filter(|&i| backends[i].active_requests == min_conns).collect();
-                        let candidate_pos = candidates.iter().position(|&i| i > *last_idx).unwrap_or(0);
+                        let min_conns = eligible_indices
+                            .iter()
+                            .map(|&i| backends[i].active_requests)
+                            .min()
+                            .unwrap();
+                        let candidates: Vec<usize> = eligible_indices
+                            .iter()
+                            .cloned()
+                            .filter(|&i| backends[i].active_requests == min_conns)
+                            .collect();
+                        let candidate_pos =
+                            candidates.iter().position(|&i| i > *last_idx).unwrap_or(0);
                         let selected_backend_idx = candidates[candidate_pos];
 
                         *last_idx = selected_backend_idx;
                         backends[selected_backend_idx].active_requests += 1;
                         backends[selected_backend_idx].current_model = task.requested_model.clone();
 
-                        Some((user_id.clone(), task, selected_backend_idx, backends[selected_backend_idx].url.clone()))
+                        Some((
+                            user_id.clone(),
+                            task,
+                            selected_backend_idx,
+                            backends[selected_backend_idx].url.clone(),
+                        ))
                     }
                 } else {
                     None
@@ -558,7 +526,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let user_ips = state_clone.user_ips.lock().unwrap();
                         let blocked_ips = state_clone.blocked_ips.lock().unwrap();
                         let blocked_users = state_clone.blocked_users.lock().unwrap();
-                        blocked_users.contains(&user_id) || user_ips.get(&user_id).map(|ip| blocked_ips.contains(ip)).unwrap_or(false)
+                        blocked_users.contains(&user_id)
+                            || user_ips
+                                .get(&user_id)
+                                .map(|ip| blocked_ips.contains(ip))
+                                .unwrap_or(false)
                     };
 
                     if is_blocked || task.responder.is_closed() {
@@ -570,7 +542,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                             *processing.entry(user_id.clone()).or_insert(0) += 1;
                         }
 
-                        let res_fut = client_clone.request(task.method, &url)
+                        let res_fut = client_clone
+                            .request(task.method, &url)
                             .headers(task.headers)
                             .body(task.body)
                             .send();
@@ -582,13 +555,23 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 headers.remove(axum::http::header::TRANSFER_ENCODING);
                                 headers.remove(axum::http::header::CONTENT_LENGTH);
 
-                                if task.responder.send(ResponsePart::Status(status, headers)).await.is_ok() {
+                                if task
+                                    .responder
+                                    .send(ResponsePart::Status(status, headers))
+                                    .await
+                                    .is_ok()
+                                {
                                     let mut stream = response.bytes_stream();
                                     let mut client_disconnected = false;
                                     while let Some(chunk_res) = stream.next().await {
                                         match chunk_res {
                                             Ok(chunk) => {
-                                                if task.responder.send(ResponsePart::Chunk(chunk)).await.is_err() {
+                                                if task
+                                                    .responder
+                                                    .send(ResponsePart::Chunk(chunk))
+                                                    .await
+                                                    .is_err()
+                                                {
                                                     client_disconnected = true;
                                                     break;
                                                 }
@@ -598,10 +581,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     }
 
                                     if !client_disconnected {
-                                        let mut counts = state_clone.processed_counts.lock().unwrap();
+                                        let mut counts =
+                                            state_clone.processed_counts.lock().unwrap();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
                                     } else {
-                                        let mut dropped = state_clone.dropped_counts.lock().unwrap();
+                                        let mut dropped =
+                                            state_clone.dropped_counts.lock().unwrap();
                                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
                                     }
                                 }
@@ -615,13 +600,16 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                         {
                             let mut processing = state_clone.processing_counts.lock().unwrap();
-                            if let Some(count) = processing.get_mut(&user_id) { *count = count.saturating_sub(1); }
+                            if let Some(count) = processing.get_mut(&user_id) {
+                                *count = count.saturating_sub(1);
+                            }
                         }
                     }
 
                     {
                         let mut backends = state_clone.backends.lock().unwrap();
-                        backends[backend_idx].active_requests = backends[backend_idx].active_requests.saturating_sub(1);
+                        backends[backend_idx].active_requests =
+                            backends[backend_idx].active_requests.saturating_sub(1);
                         backends[backend_idx].processed_count += 1;
                     }
                     state_clone.backend_freed.notify_one();
@@ -673,7 +661,9 @@ pub async fn proxy_handler(
     task_headers.remove(axum::http::header::HOST);
 
     let requested_model = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-        json.get("model").and_then(|m| m.as_str()).map(|s| s.to_string())
+        json.get("model")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
     } else {
         None
     };
@@ -700,12 +690,10 @@ pub async fn proxy_handler(
     let mut rx = rx;
     match rx.recv().await {
         Some(ResponsePart::Status(status, headers)) => {
-            let stream = ReceiverStream::new(rx).map(|part| {
-                match part {
-                    ResponsePart::Chunk(chunk) => Ok(chunk),
-                    ResponsePart::Error(e) => Err(e),
-                    _ => Ok(Bytes::new()),
-                }
+            let stream = ReceiverStream::new(rx).map(|part| match part {
+                ResponsePart::Chunk(chunk) => Ok(chunk),
+                ResponsePart::Error(e) => Err(e),
+                _ => Ok(Bytes::new()),
             });
 
             let mut res = Body::from_stream(stream).into_response();
@@ -713,9 +701,15 @@ pub async fn proxy_handler(
             *res.headers_mut() = headers;
             res
         }
-        Some(ResponsePart::Error(e)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Backend error: {}", e)).into_response()
-        }
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "Worker failed to respond").into_response(),
+        Some(ResponsePart::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Backend error: {}", e),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Worker failed to respond",
+        )
+            .into_response(),
     }
 }

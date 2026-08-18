@@ -11,6 +11,7 @@
 - **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama or LM Studio instances using a **Least Connections + Round Robin** strategy. Automatically detects backend API type (Ollama `/api/*` vs OpenAI `/v1/*`) and routes each request to a compatible backend.
 - **Model-Aware Routing**: Automatically identifies the requested model from the request body and routes the request only to backends that have that specific model loaded. This prevents 404 errors when different models are distributed across multiple backends.
 - **Smart Model Matching**: Robust matching that handles common variations like `:latest` tags and case-insensitivity. For example, a request for `llama3` will correctly match `llama3:latest` on the backend.
+- **Model Control**: Load and unload models on connected backends (Ollama and LM Studio 0.3.6+) directly from the TUI (`L`/`U`) or the admin HTTP API — without touching the backend servers themselves.
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
 - **Backend Health Checks**: Automatically monitors backend status every 10 seconds. Probes for both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Offline instances are temporarily skipped and marked in the TUI.
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
@@ -87,6 +88,7 @@ docker run -d \
 - `-o, --backend-urls <URL1,URL2>`: Comma-separated list of backend server URLs (Ollama, LM Studio, etc.) (default: `http://localhost:11434`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI). In this mode, logs are written verbosely to **stderr** (default level `debug`) so they can be captured by a service manager's journal, Docker, or piped to a file.
+- `--load-keep-alive <SECONDS>`: How long a model stays loaded after a model-control "load" (sent as Ollama's `keep_alive`; LM Studio loads are unaffected beyond its own TTL). Ollama's own default is only 5 minutes, so the default here is `86400` (24 h).
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
@@ -147,6 +149,71 @@ curl -X POST http://localhost:11435/api/chat \
   }'
 ```
 
+### Model Control (Admin API)
+
+Models can be loaded and unloaded on connected backends without touching the backend servers. Supported backends:
+
+- **Ollama** — no dedicated endpoint exists; loading is a `POST /api/generate` with an empty prompt (the scheduler loads the model and returns immediately), unloading is the same call with `keep_alive: 0`.
+- **LM Studio 0.3.6+** — the native `POST /api/v1/models/load` / `POST /api/v1/models/unload` endpoints (unload targets a specific loaded instance). Older LM Studio versions are detected and a friendly error points at the `lms load`/`lms unload` CLI.
+- Plain OpenAI backends (vLLM, etc.) have no control API and are rejected with a clear error.
+
+All three endpoints are served by the proxy itself (they are never proxied to a backend) and are protected by the same optional `OLLAMA_MQ_API_KEY` auth as the proxy routes.
+
+#### `GET /admin/models`
+
+Per-backend inventory: index, URL, online status, detected API type, LM Studio flag, active request count, available models, currently loaded models, and any in-flight control operation.
+
+```bash
+curl -s http://localhost:11435/admin/models | python3 -m json.tool
+```
+
+#### `POST /admin/models/load` and `POST /admin/models/unload`
+
+Body:
+
+```json
+{ "backend": 0, "model": "llama3" }
+```
+
+`backend` accepts:
+
+- a **numeric index** (0-based, in the order of `--backend-urls`),
+- a **URL** (exact or substring match), or
+- `"any"` — the proxy picks a suitable online, idle backend (for load: the first backend where the model resolves; for unload: the first backend that actually has it loaded).
+
+`model` uses the same smart matching as request routing: exact match, then `:latest`/case-insensitive, then a *unique* substring. Ambiguous names are rejected — the proxy never guesses.
+
+Responses:
+
+| Status | Meaning |
+| ------ | ------- |
+| `202`  | Accepted — the operation started in the background (response body contains the canonical model name and the backend URL). |
+| `400`  | Bad request — empty model, backend offline, unsupported backend type, or unloading a model that is not loaded. |
+| `404`  | Unknown backend, model not found on the backend, or no suitable backend for `"any"`. |
+| `409`  | Conflict — another control operation is already in flight on that backend, or the backend is busy with active requests. |
+
+```bash
+# Load (llama3 resolves to llama3:latest)
+curl -s -X POST http://localhost:11435/admin/models/load \
+  -H "Content-Type: application/json" \
+  -d '{"backend": 0, "model": "llama3"}'
+
+# Unload by URL (frees GPU memory on Ollama)
+curl -s -X POST http://localhost:11435/admin/models/unload \
+  -H "Content-Type: application/json" \
+  -d '{"backend": "http://10.0.0.2:11434", "model": "qwen2.5:7b"}'
+
+# Let the proxy pick a backend
+curl -s -X POST http://localhost:11435/admin/models/load \
+  -H "Content-Type: application/json" \
+  -d '{"backend": "any", "model": "llama3:latest"}'
+
+# With API-key auth enabled
+curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecret"
+```
+
+**Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
+
 ### Dashboard Controls
 
 The interactive TUI dashboard provides a live view of the dispatcher's state:
@@ -154,6 +221,8 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 - **`j` / `k`** or **Arrows**: Navigate the selected list (Users, Backends, or Blocked Items).
 - **`Tab`** or **`h` / `l`**: Switch between the **Backends**, **Users**, and **Blocked** panels.
 - **`Space`** or **`Enter`**: Expand/collapse the available models list for the selected backend (in the Backends panel).
+- **`L`**: Load a model on the selected backend (Backends panel) — type the model name, confirm with `Enter`, cancel with `Esc`.
+- **`U`**: Unload a model from the selected backend (Backends panel).
 - **`p`**: Toggle **VIP** status for the selected user (absolute priority).
 - **`b`**: Toggle **Boost** status for the selected user (prioritizes every 2nd request).
 - **`x`**: Block the selected user.
@@ -170,6 +239,7 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 - `●` (Green): Backend is Online or User has requests waiting in the queue.
 - `○` (Gray): User is idle or Backend is Offline.
 - `✖` (Red): User or IP is blocked.
+- `⟳` (Cyan): A model load/unload control operation is in progress on that backend (recent results flash `✓`/`✖` for ~10 s).
 
 ### Logging
 
@@ -382,6 +452,7 @@ docker run -d \
 - **`src/main.rs`**: Entry point, HTTP server initialization, and TUI lifecycle management.
 - **`src/dispatcher.rs`**: Core logic for queuing, round-robin scheduling, and Ollama proxying.
 - **`src/tui.rs`**: Implementation of the terminal-based monitoring dashboard.
+- **`src/control.rs`**: Model load/unload control — backend probing, model-name resolution, Ollama/LM Studio executors, and the admin HTTP API.
 
 ### Request Flow
 
