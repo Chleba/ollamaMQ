@@ -150,11 +150,41 @@ pub struct AppState {
     pub control_history: Mutex<VecDeque<crate::control::ControlResult>>,
     /// `keep_alive` (seconds) sent with control "load" requests so explicitly
     /// loaded models stay resident (Ollama's own default is only 5 minutes).
-    pub load_keep_alive: u64,
+    pub load_keep_alive: i64,
+    /// Model configuration from `appconf.yaml` (models to load on backends,
+    /// with load settings). Re-read with the TUI 'r' key.
+    pub model_config: Mutex<Vec<crate::config::ModelConfig>>,
+    /// Path of the model config file.
+    pub model_config_path: String,
+    /// Ring buffer of recent request/control events for the TUI Logs panel.
+    pub logs: Mutex<VecDeque<LogEvent>>,
 }
 
+/// One line of the TUI Logs panel: a request entering ("IN") or leaving
+/// ("OUT") the proxy, or a model-control action ("CTL").
+#[derive(Clone, Debug)]
+pub struct LogEvent {
+    pub at: std::time::SystemTime,
+    /// "IN" | "OUT" | "CTL"
+    pub dir: &'static str,
+    pub user: String,
+    pub model: Option<String>,
+    pub backend: Option<String>,
+    /// Status code or short note ("queued", "dropped", …).
+    pub info: String,
+}
+
+/// How many log events to keep in the ring buffer.
+const MAX_LOG_EVENTS: usize = 300;
+
 impl AppState {
-    pub fn new(backend_urls: Vec<String>, timeout: u64, load_keep_alive: u64) -> Self {
+    pub fn new(
+        backend_urls: Vec<String>,
+        timeout: u64,
+        load_keep_alive: i64,
+        model_config_path: String,
+        model_config: Vec<crate::config::ModelConfig>,
+    ) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         let backends = backend_urls
             .into_iter()
@@ -197,6 +227,9 @@ impl AppState {
             control_ops: Mutex::new(HashMap::new()),
             control_history: Mutex::new(VecDeque::new()),
             load_keep_alive,
+            model_config: Mutex::new(model_config),
+            model_config_path,
+            logs: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -263,6 +296,15 @@ impl AppState {
 
     pub fn is_user_blocked(&self, user_id: &str) -> bool {
         self.blocked_users.lock().unwrap().contains(user_id)
+    }
+
+    /// Append an event to the logs ring buffer (bounded).
+    pub fn log_event(&self, ev: LogEvent) {
+        let mut logs = self.logs.lock().unwrap();
+        logs.push_back(ev);
+        while logs.len() > MAX_LOG_EVENTS {
+            logs.pop_front();
+        }
     }
 }
 
@@ -522,6 +564,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                 let url = format!("{}{}", backend_url, task.path);
 
                 tokio::spawn(async move {
+                    let log_model = task.requested_model.clone();
+                    let log_out = |info: String, backend: Option<String>| {
+                        state_clone.log_event(LogEvent {
+                            at: std::time::SystemTime::now(),
+                            dir: "OUT",
+                            user: user_id.clone(),
+                            model: log_model.clone(),
+                            backend,
+                            info,
+                        });
+                    };
+
                     let is_blocked = {
                         let user_ips = state_clone.user_ips.lock().unwrap();
                         let blocked_ips = state_clone.blocked_ips.lock().unwrap();
@@ -536,6 +590,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                     if is_blocked || task.responder.is_closed() {
                         let mut dropped = state_clone.dropped_counts.lock().unwrap();
                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                        log_out(
+                            "dropped (blocked)".into(),
+                            Some(backend_url.clone()),
+                        );
                     } else {
                         {
                             let mut processing = state_clone.processing_counts.lock().unwrap();
@@ -584,10 +642,22 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         let mut counts =
                                             state_clone.processed_counts.lock().unwrap();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
+                                        log_out(
+                                            format!(
+                                                "{} {}",
+                                                status.as_u16(),
+                                                status.canonical_reason().unwrap_or("")
+                                            ),
+                                            Some(backend_url.clone()),
+                                        );
                                     } else {
                                         let mut dropped =
                                             state_clone.dropped_counts.lock().unwrap();
                                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                                        log_out(
+                                            "dropped (client gone)".into(),
+                                            Some(backend_url.clone()),
+                                        );
                                     }
                                 }
                             }
@@ -595,6 +665,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
                                 let mut dropped = state_clone.dropped_counts.lock().unwrap();
                                 *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                                log_out(
+                                    "dropped (backend error)".into(),
+                                    Some(backend_url.clone()),
+                                );
                             }
                         }
 
@@ -669,12 +743,12 @@ pub async fn proxy_handler(
     };
 
     let task = Task {
-        path,
+        path: path.clone(),
         method,
         headers: task_headers,
         responder: tx,
         body,
-        requested_model,
+        requested_model: requested_model.clone(),
     };
 
     {
@@ -684,6 +758,15 @@ pub async fn proxy_handler(
             .or_insert_with(VecDeque::new)
             .push_back(task);
     }
+
+    state.log_event(crate::dispatcher::LogEvent {
+        at: std::time::SystemTime::now(),
+        dir: "IN",
+        user: user_id.clone(),
+        model: requested_model.clone(),
+        backend: None,
+        info: "queued".into(),
+    });
 
     state.notify.notify_one();
 

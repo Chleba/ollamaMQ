@@ -59,6 +59,20 @@ impl ControlAction {
     }
 }
 
+/// Extra options for a model-control "load" (from a profile or the admin
+/// API). All fields optional; `None` falls back to existing defaults.
+#[derive(Clone, Debug, Default)]
+pub struct LoadOptions {
+    /// Max context window: Ollama `options.num_ctx`, LM Studio
+    /// `context_length`.
+    pub num_ctx: Option<u64>,
+    /// `keep_alive` override (seconds) for Ollama loads. `-1` keeps the
+    /// model loaded indefinitely (Ollama semantics).
+    pub keep_alive: Option<i64>,
+    /// Free-form identifier/label shown with the op.
+    pub identifier: Option<String>,
+}
+
 /// A model control operation currently running on a backend.
 /// At most one operation per backend at a time.
 #[derive(Clone, Debug)]
@@ -69,6 +83,8 @@ pub struct ControlOp {
     pub requested: String,
     /// Resolved backend model name / key.
     pub canonical: String,
+    /// Optional identifier/label attached to the op (e.g. from a profile).
+    pub identifier: Option<String>,
     pub started: Instant,
 }
 
@@ -78,6 +94,7 @@ pub struct ControlResult {
     pub backend_idx: usize,
     pub action: ControlAction,
     pub model: String,
+    pub identifier: Option<String>,
     pub ok: bool,
     pub error: Option<String>,
     pub finished_at: Instant,
@@ -371,16 +388,109 @@ fn supports_control(b: &BackendStatus) -> bool {
     b.lmstudio || matches!(b.api_type, BackendApiType::Ollama | BackendApiType::Both)
 }
 
+/// Resolve which backend indices a `appconf.yaml` entry targets: the listed
+/// backend URLs (exact or substring match against configured backends), or
+/// every backend when the list is empty ("any suitable").
+fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usize> {
+    let backends = state.backends.lock().unwrap();
+    if cfg.backends.is_empty() {
+        (0..backends.len()).collect()
+    } else {
+        cfg.backends
+            .iter()
+            .filter_map(|u| {
+                let u_low = u.trim_end_matches('/').to_lowercase();
+                backends
+                    .iter()
+                    .position(|b| b.url.to_lowercase().contains(&u_low))
+            })
+            .collect()
+    }
+}
+
+/// Apply the current `appconf.yaml` contents: start loads for every model
+/// entry on its target backends. Loads for the same backend run
+/// sequentially (the backend rejects parallel control ops); different
+/// backends proceed in parallel. Returns the number of loads started.
+pub fn apply_model_config(state: &Arc<AppState>) -> usize {
+    let configs = state.model_config.lock().unwrap().clone();
+    if configs.is_empty() {
+        return 0;
+    }
+
+    // Group model entries by backend so each backend loads one model at a time.
+    let mut by_backend: std::collections::HashMap<usize, Vec<crate::config::ModelConfig>> =
+        std::collections::HashMap::new();
+    for cfg in configs {
+        for idx in config_targets(state, &cfg) {
+            by_backend.entry(idx).or_default().push(cfg.clone());
+        }
+    }
+
+    let mut started = 0;
+    for (backend_idx, cfgs) in by_backend {
+        let st = state.clone();
+        started += cfgs.len();
+        tokio::spawn(async move {
+            for cfg in cfgs {
+                // Wait for any earlier control op on this backend to finish.
+                while st.control_ops.lock().unwrap().contains_key(&backend_idx) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let options = LoadOptions {
+                    num_ctx: cfg.max_ctx,
+                    keep_alive: cfg.keep_alive,
+                    identifier: cfg.identifier.clone(),
+                };
+                let info = match start_model_control(
+                    &st,
+                    backend_idx,
+                    ControlAction::Load,
+                    cfg.name.clone(),
+                    options,
+                ) {
+                    Ok(canonical) => format!("load '{}' started", canonical),
+                    Err(e) => format!("load '{}' rejected: {}", cfg.name, e),
+                };
+                st.log_event(crate::dispatcher::LogEvent {
+                    at: std::time::SystemTime::now(),
+                    dir: "CTL",
+                    user: "-".into(),
+                    model: Some(cfg.name.clone()),
+                    backend: None,
+                    info,
+                });
+            }
+        });
+    }
+    started
+}
+
+/// Re-read the config file, swap in its `models` section, and apply it.
+/// Returns the number of model entries in the new config. (Backends and
+/// settings from the file are only read at startup.)
+pub fn reload_model_config(state: &Arc<AppState>) -> Result<usize, String> {
+    let configs = crate::config::load_config(&state.model_config_path)?.models;
+    let n = configs.len();
+    *state.model_config.lock().unwrap() = configs;
+    apply_model_config(state);
+    Ok(n)
+}
+
 async fn execute_load(
     client: &reqwest::Client,
     url: &str,
     lmstudio: bool,
     canonical: &str,
     control_timeout: Duration,
-    load_keep_alive: u64,
+    load_keep_alive: i64,
+    options: &LoadOptions,
 ) -> Result<(), String> {
     if lmstudio {
-        let body = json!({ "model": canonical });
+        let mut body = json!({ "model": canonical });
+        if let Some(num_ctx) = options.num_ctx {
+            body["context_length"] = json!(num_ctx);
+        }
         let res = client
             .post(format!("{}/api/v1/models/load", url))
             .timeout(control_timeout)
@@ -404,11 +514,14 @@ async fn execute_load(
         // Ollama: empty-prompt generate loads the model into memory.
         // An explicit long keep_alive makes the load "sticky" (Ollama's
         // default is only 5 minutes).
-        let body = json!({
+        let mut body = json!({
             "model": canonical,
             "stream": false,
-            "keep_alive": load_keep_alive,
+            "keep_alive": options.keep_alive.unwrap_or(load_keep_alive),
         });
+        if let Some(num_ctx) = options.num_ctx {
+            body["options"] = json!({ "num_ctx": num_ctx });
+        }
         let res = client
             .post(format!("{}/api/generate", url))
             .timeout(control_timeout)
@@ -573,6 +686,7 @@ pub fn start_model_control(
     backend_idx: usize,
     action: ControlAction,
     model: String,
+    options: LoadOptions,
 ) -> Result<String, String> {
     let canonical = {
         let ops = state.control_ops.lock().unwrap();
@@ -630,11 +744,16 @@ pub fn start_model_control(
         .map(|b| b.url.clone())
         .unwrap_or_default();
     info!(
-        "Model control: {} '{}' (requested: {}) on {}",
+        "Model control: {} '{}' (requested: {}) on {}{}",
         action.label(),
         canonical,
         model.trim(),
-        url
+        url,
+        options
+            .identifier
+            .as_deref()
+            .map(|id| format!(" [id: {}]", id))
+            .unwrap_or_default()
     );
 
     state.control_ops.lock().unwrap().insert(
@@ -644,12 +763,19 @@ pub fn start_model_control(
             action,
             requested: model.trim().to_string(),
             canonical: canonical.clone(),
+            identifier: options.identifier.clone(),
             started: Instant::now(),
         },
     );
 
     let state = state.clone();
     let op_model = canonical.clone();
+    let identifier = options.identifier.clone();
+    let load_options = LoadOptions {
+        num_ctx: options.num_ctx,
+        keep_alive: options.keep_alive,
+        identifier: options.identifier.clone(),
+    };
     tokio::spawn(async move {
         let canonical = op_model;
         let (backend_url, lmstudio, timeout, keep_alive, cached_native) = {
@@ -659,7 +785,7 @@ pub fn start_model_control(
                 b.url.clone(),
                 b.lmstudio,
                 state.timeout,
-                state.load_keep_alive,
+                load_options.keep_alive.unwrap_or(state.load_keep_alive),
                 b.native_models.clone(),
             )
         };
@@ -674,6 +800,7 @@ pub fn start_model_control(
                 &canonical,
                 control_timeout,
                 keep_alive,
+                &load_options,
             )
             .await
         } else {
@@ -715,6 +842,7 @@ pub fn start_model_control(
                 backend_idx,
                 action,
                 model: canonical.clone(),
+                identifier: identifier.clone(),
                 ok: result.is_ok(),
                 error: result.clone().err(),
                 finished_at: Instant::now(),
@@ -756,6 +884,13 @@ pub struct ControlRequest {
     pub backend: Value,
     /// Model name as the client knows it (resolved against the backend).
     pub model: String,
+    /// Optional max context window (Ollama `options.num_ctx` / LM Studio
+    /// `context_length`).
+    pub num_ctx: Option<u64>,
+    /// Optional `keep_alive` override (seconds) for Ollama loads.
+    pub keep_alive: Option<i64>,
+    /// Optional identifier/label attached to the operation.
+    pub identifier: Option<String>,
 }
 
 type AdminError = (StatusCode, Value);
@@ -850,7 +985,14 @@ async fn handle_control(
         .map(|b| b.url.clone())
         .unwrap_or_default();
 
-    match start_model_control(&state, idx, action, model) {
+    let options = LoadOptions {
+        num_ctx: req.num_ctx,
+        keep_alive: req.keep_alive,
+        identifier: req.identifier,
+    };
+    let echo_options = options.clone();
+
+    match start_model_control(&state, idx, action, model, options) {
         Ok(canonical) => (
             StatusCode::ACCEPTED,
             Json(json!({
@@ -858,6 +1000,9 @@ async fn handle_control(
                 "action": action.label(),
                 "backend": url,
                 "model": canonical,
+                "num_ctx": echo_options.num_ctx,
+                "keep_alive": echo_options.keep_alive,
+                "identifier": echo_options.identifier,
             })),
         )
             .into_response(),
@@ -1134,9 +1279,17 @@ mod tests {
         let to = Duration::from_secs(5);
 
         // Load: empty-prompt generate with long keep_alive
-        execute_load(&client, &url, false, "llama3:latest", to, 86400)
-            .await
-            .unwrap();
+        execute_load(
+            &client,
+            &url,
+            false,
+            "llama3:latest",
+            to,
+            86400,
+            &LoadOptions::default(),
+        )
+        .await
+        .unwrap();
         // Unload: empty-prompt generate with keep_alive 0
         execute_unload(&client, &url, false, "llama3:latest", to, &[])
             .await
@@ -1153,12 +1306,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ollama_load_options_num_ctx_and_keep_alive() {
+        let (url, calls) = start_mock_backend().await;
+        let client = reqwest::Client::new();
+        let to = Duration::from_secs(5);
+
+        let options = LoadOptions {
+            num_ctx: Some(16384),
+            keep_alive: Some(3600),
+            identifier: Some("big-ctx".into()),
+        };
+        execute_load(&client, &url, false, "llama3:latest", to, 86400, &options)
+            .await
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["keep_alive"], 3600); // override beats default
+        assert_eq!(calls[0].1["options"]["num_ctx"], 16384);
+        assert!(calls[0].1.get("prompt").is_none()); // empty prompt => load
+    }
+
+    #[tokio::test]
+    async fn lmstudio_load_options_context_length() {
+        let (url, calls) = start_mock_backend().await;
+        let client = reqwest::Client::new();
+        let to = Duration::from_secs(5);
+
+        let options = LoadOptions {
+            num_ctx: Some(8192),
+            ..LoadOptions::default()
+        };
+        execute_load(&client, &url, true, "mock/qwen2-7b", to, 86400, &options)
+            .await
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "/api/v1/models/load");
+        assert_eq!(calls[0].1["model"], "mock/qwen2-7b");
+        assert_eq!(calls[0].1["context_length"], 8192);
+    }
+
+    #[tokio::test]
     async fn lmstudio_load_unload_uses_instance_id() {
         let (url, calls) = start_mock_backend().await;
         let client = reqwest::Client::new();
         let to = Duration::from_secs(5);
 
-        execute_load(&client, &url, true, "mock/qwen2-7b", to, 86400)
+        execute_load(&client, &url, true, "mock/qwen2-7b", to, 86400, &LoadOptions::default())
             .await
             .unwrap();
         execute_unload(&client, &url, true, "mock/qwen2-7b", to, &[])

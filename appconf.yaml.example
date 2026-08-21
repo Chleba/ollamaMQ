@@ -1,0 +1,62 @@
+# ollamaMQ central configuration
+#
+# Three sections: backends (what to connect to), settings (runtime options)
+# and models (what to load where via the model-control load/unload logic).
+#
+# CLI flags always win when explicitly given:
+#   --backend-urls overrides `backends`
+#   --port / --host / --timeout / --load-keep-alive / --allow-all-routes
+#     override `settings`
+#
+# The models section is applied automatically at startup (once backends are
+# probed) and whenever you press 'r' in the TUI. Applying is additive: it
+# loads models that are missing from their target backends — it never
+# unloads anything.
+
+# --- Backends ollamaMQ connects to (same as --backend-urls) -----------------
+backends:
+  - http://10.137.1.1:11434    # Ollama
+  - http://10.137.1.2:11434    # Ollama
+  - http://10.137.1.5:1234     # LM Studio
+
+# --- Runtime settings -------------------------------------------------------
+settings:
+  port: 11435                  # proxy listen port          (default 11435)
+  host: 127.0.0.1              # bind interface             (default 127.0.0.1)
+  timeout: 300                 # request timeout, seconds   (default 300)
+  load_keep_alive: 86400       # model-control keep_alive   (default 86400 = 24 h)
+  allow_all_routes: false      # fallback proxy for unknown routes (default false)
+
+# --- Models to load onto backends -------------------------------------------
+# Fields per model:
+#   name                     model name as the backend knows it (smart-matched:
+#                            ':latest' / case-insensitive / unique substring)
+#   identifier               label attached to the load op (shown in TUI + admin API)
+#   max_ctx                  max context window (Ollama num_ctx / LM Studio context_length)
+#   keep_alive               seconds to stay resident after load (Ollama only;
+#                            default: settings.load_keep_alive; -1 = forever)
+#   max_concurrent_requests  reserved for the scheduler (stored, not enforced yet; default 1)
+#   backends                 URLs to load on (exact or substring match);
+#                            empty/omitted = any suitable backend
+models:
+  # Big MoE model pinned to two specific backends with a large context
+  - name: "gpt-oss:120b"
+    identifier: "my-gpt"
+    max_ctx: 128000
+    keep_alive: 86400
+    max_concurrent_requests: 3
+    backends:
+      - http://10.137.1.1:11434
+      - http://10.137.1.2:11434
+
+  # Small coding model available on every connected backend
+  - name: "qwen2.5-coder:7b"
+    identifier: "coder"
+    max_ctx: 32768
+
+  # LM Studio example: 'backends' matches by substring too
+  - name: "qwen/qwen3.8-27b"
+    identifier: "qwen3.8"
+    max_ctx: 130000
+    backends:
+      - 10.137.1.5:1234

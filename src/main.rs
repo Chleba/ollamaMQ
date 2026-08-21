@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod config;
 mod control;
 mod dispatcher;
 mod tui;
@@ -25,41 +26,48 @@ use std::io::IsTerminal;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value_t = 11435)]
-    port: u16,
+    /// Port to listen on (overrides appconf.yaml `settings.port`)
+    #[arg(short, long)]
+    port: Option<u16>,
 
-    /// Host/interface to bind to
-    #[arg(short = 'H', long, default_value = "127.0.0.1")]
-    host: String,
+    /// Host/interface to bind to (overrides appconf.yaml `settings.host`)
+    #[arg(short = 'H', long)]
+    host: Option<String>,
 
-    /// Backend server URLs (e.g., Ollama, LM Studio) (comma-separated list)
+    /// Backend server URLs (e.g., Ollama, LM Studio) — comma-separated list.
+    /// Overrides appconf.yaml `backends`.
     #[arg(
         short,
         long,
         value_delimiter = ',',
-        default_value = "http://localhost:11434",
         alias = "ollama-urls"
     )]
-    backend_urls: Vec<String>,
+    backend_urls: Option<Vec<String>>,
 
-    /// Request timeout in seconds
-    #[arg(short, long, default_value_t = 300)]
-    timeout: u64,
+    /// Request timeout in seconds (overrides appconf.yaml `settings.timeout`)
+    #[arg(short, long)]
+    timeout: Option<u64>,
 
     /// Disable TUI dashboard
     #[arg(long)]
     no_tui: bool,
 
-    /// Allow all routes (enable fallback proxy)
+    /// Allow all routes (enable fallback proxy; overrides
+    /// appconf.yaml `settings.allow_all_routes`)
     #[arg(long, default_value_t = false)]
     allow_all_routes: bool,
 
     /// How long (seconds) models stay loaded after a model-control "load"
     /// request (sent as Ollama `keep_alive`; LM Studio loads are unaffected
     /// beyond its own TTL). Ollama's own default is only 5 minutes.
-    #[arg(long, default_value_t = 86400)]
-    load_keep_alive: u64,
+    /// Overrides appconf.yaml `settings.load_keep_alive`.
+    #[arg(long)]
+    load_keep_alive: Option<i64>,
+
+    /// Path to the central configuration file: backends, settings and the
+    /// models to load onto them. Applied at startup; reload with 'r' in the TUI.
+    #[arg(short = 'c', long, default_value = config::DEFAULT_CONFIG_FILE)]
+    model_config: String,
 }
 
 struct TuiState {
@@ -135,8 +143,41 @@ async fn auth_middleware(
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // Central config file: backends, settings and models. CLI flags win
+    // whenever they are explicitly given; a missing file is fine (defaults).
+    let file_cfg = match config::load_config(&args.model_config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            if !e.contains("No such file") && std::path::Path::new(&args.model_config).exists() {
+                eprintln!("Warning: {}", e);
+            }
+            info!("No model config loaded from '{}': {}", args.model_config, e);
+            config::AppConfig::default()
+        }
+    };
+
+    let port = args.port.or(file_cfg.settings.port).unwrap_or(11435);
+    let host = args
+        .host
+        .or(file_cfg.settings.host)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let timeout = args.timeout.or(file_cfg.settings.timeout).unwrap_or(300);
+    let load_keep_alive = args
+        .load_keep_alive
+        .or(file_cfg.settings.load_keep_alive)
+        .unwrap_or(86400);
+    let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
+
     let backend_urls: Vec<String> = args
         .backend_urls
+        .unwrap_or_else(|| {
+            if file_cfg.backends.is_empty() {
+                vec!["http://localhost:11434".to_string()]
+            } else {
+                file_cfg.backends.clone()
+            }
+        })
         .iter()
         .map(|url| {
             let trimmed = url.trim_end_matches('/').to_string();
@@ -177,14 +218,41 @@ async fn main() {
 
     let state = Arc::new(AppState::new(
         backend_urls,
-        args.timeout,
-        args.load_keep_alive,
+        timeout,
+        load_keep_alive,
+        args.model_config.clone(),
+        file_cfg.models,
     ));
 
     let worker_state = state.clone();
     tokio::spawn(async move {
         run_worker(worker_state).await;
     });
+
+    // Apply appconf.yaml once backends have been probed by the health loop
+    // (first probe round runs immediately; wait up to 30 s for it).
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            if st.model_config.lock().unwrap().is_empty() {
+                return;
+            }
+            for _ in 0..60 {
+                let probed = {
+                    let backends = st.backends.lock().unwrap();
+                    backends
+                        .iter()
+                        .all(|b| b.api_type != dispatcher::BackendApiType::Unknown)
+                };
+                if probed {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let n = control::apply_model_config(&st);
+            info!("Applied model config: {} load(s) started", n);
+        });
+    }
 
     // Optional API-key auth: enabled only when OLLAMA_MQ_API_KEY is set (non-empty).
     let api_key = std::env::var("OLLAMA_MQ_API_KEY")
@@ -221,7 +289,7 @@ async fn main() {
         .route("/admin/models/unload", post(admin_model_unload));
 
     // Optional fallback
-    if args.allow_all_routes {
+    if allow_all_routes {
         app = app.fallback(proxy_handler);
     }
 
@@ -237,7 +305,7 @@ async fn main() {
         .merge(app)
         .with_state(state.clone());
 
-    let addr = format!("{}:{}", args.host, args.port);
+    let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Dispatcher running on http://{}", addr);
 

@@ -14,28 +14,51 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::control::{self, ControlAction, RESULT_VISIBLE};
-use crate::dispatcher::{AppState, BackendApiType, BackendStatus};
+use crate::control::{self, ControlAction, LoadOptions, RESULT_VISIBLE};
+use crate::dispatcher::{AppState, BackendApiType, BackendStatus, LogEvent};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Panel {
     Backends,
     Users,
     Blocked,
+    Logs,
+}
+
+impl Panel {
+    fn next(self) -> Self {
+        match self {
+            Panel::Backends => Panel::Users,
+            Panel::Users => Panel::Blocked,
+            Panel::Blocked => Panel::Logs,
+            Panel::Logs => Panel::Backends,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Panel::Backends => Panel::Logs,
+            Panel::Users => Panel::Backends,
+            Panel::Blocked => Panel::Users,
+            Panel::Logs => Panel::Blocked,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Panel::Backends => "BACKENDS",
+            Panel::Users => "USERS",
+            Panel::Blocked => "BLOCKED",
+            Panel::Logs => "LOGS",
+        }
+    }
 }
 
 /// Model-name entry for a load/unload control operation on a backend.
+#[derive(Clone)]
 enum InputMode {
     Load { backend_idx: usize },
     Unload { backend_idx: usize },
-}
-
-impl InputMode {
-    fn backend_idx(&self) -> usize {
-        match self {
-            InputMode::Load { backend_idx } | InputMode::Unload { backend_idx } => *backend_idx,
-        }
-    }
 }
 
 /// Transient feedback line (shown after a control op is started/rejected).
@@ -49,6 +72,7 @@ struct ActiveOpView {
     backend_idx: usize,
     verb: String,
     model: String,
+    identifier: Option<String>,
     elapsed_secs: u64,
 }
 
@@ -57,6 +81,7 @@ struct RecentResultView {
     ok: bool,
     verb: String,
     model: String,
+    identifier: Option<String>,
     error: Option<String>,
 }
 
@@ -72,6 +97,8 @@ struct StateSnapshot {
     boost_user: Option<String>,
     user_ids: Vec<String>,
     backends: Vec<BackendStatus>,
+    /// Recent request/control events (newest first) for the Logs panel.
+    logs: Vec<LogEvent>,
     active_ops: Vec<ActiveOpView>,
     recent_results: Vec<RecentResultView>,
 }
@@ -83,6 +110,9 @@ pub struct TuiDashboard {
     active_panel: Panel,
     expanded_backends: HashSet<String>,
     show_all_backends: HashSet<String>,
+    /// Per-backend (keyed by URL) cursor into the expanded model list,
+    /// cycled with Tab/Shift+Tab.
+    model_cursor: HashMap<String, usize>,
     show_help: bool,
     input_mode: Option<InputMode>,
     input_buf: String,
@@ -98,6 +128,7 @@ impl TuiDashboard {
             active_panel: Panel::Users,
             expanded_backends: HashSet::new(),
             show_all_backends: HashSet::new(),
+            model_cursor: HashMap::new(),
             show_help: false,
             input_mode: None,
             input_buf: String::new(),
@@ -119,6 +150,15 @@ impl TuiDashboard {
         let vip_user = state.vip_user.lock().unwrap().clone();
         let boost_user = state.boost_user.lock().unwrap().clone();
         let backends = state.backends.lock().unwrap().clone();
+        let logs: Vec<LogEvent> = state
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(50)
+            .cloned()
+            .collect();
         let active_ops: Vec<ActiveOpView> = state
             .control_ops
             .lock()
@@ -128,6 +168,7 @@ impl TuiDashboard {
                 backend_idx: op.backend_idx,
                 verb: op.action.verb().to_string(),
                 model: op.canonical.clone(),
+                identifier: op.identifier.clone(),
                 elapsed_secs: op.started.elapsed().as_secs(),
             })
             .collect();
@@ -142,6 +183,7 @@ impl TuiDashboard {
                 ok: r.ok,
                 verb: r.action.verb().to_string(),
                 model: r.model.clone(),
+                identifier: r.identifier.clone(),
                 error: r.error.clone(),
             })
             .collect();
@@ -172,6 +214,7 @@ impl TuiDashboard {
             boost_user,
             user_ids,
             backends,
+            logs,
             active_ops,
             recent_results,
         }
@@ -193,56 +236,34 @@ impl TuiDashboard {
                         continue;
                     }
 
-                    // Model-name input mode (L/U in the Backends panel):
-                    // consume the keystroke and skip the normal key handling.
-                    if self.input_mode.is_some() {
+                    // Input mode (L/U model name): consume the keystroke and
+                    // skip the normal key handling.
+                    if let Some(mode) = self.input_mode.clone() {
                         match key.code {
                             KeyCode::Esc => {
                                 self.input_mode = None;
                                 self.input_buf.clear();
                             }
                             KeyCode::Enter => {
-                                if let Some(mode) = self.input_mode.take() {
-                                    let model = self.input_buf.trim().to_string();
-                                    self.input_buf.clear();
-                                    if !model.is_empty() {
-                                        let (idx, action) = match mode {
-                                            InputMode::Load { backend_idx } => {
-                                                (backend_idx, ControlAction::Load)
-                                            }
-                                            InputMode::Unload { backend_idx } => {
-                                                (backend_idx, ControlAction::Unload)
-                                            }
-                                        };
-                                        let action_verb = action.verb();
-                                        match control::start_model_control(
-                                            state,
-                                            idx,
-                                            action,
-                                            model.clone(),
-                                        ) {
-                                            Ok(canonical) => {
-                                                self.flash = Some(FlashMsg {
-                                                    text: format!(
-                                                        "{} {} started",
-                                                        action_verb, canonical
-                                                    ),
-                                                    ok: true,
-                                                    at: Instant::now(),
-                                                })
-                                            }
-                                            Err(e) => {
-                                                self.flash = Some(FlashMsg {
-                                                    text: format!(
-                                                        "{} '{}' rejected: {}",
-                                                        action_verb, model, e
-                                                    ),
-                                                    ok: false,
-                                                    at: Instant::now(),
-                                                })
-                                            }
+                                self.input_mode = None;
+                                let model = self.input_buf.trim().to_string();
+                                self.input_buf.clear();
+                                if !model.is_empty() {
+                                    let (backend_idx, action) = match mode {
+                                        InputMode::Load { backend_idx } => {
+                                            (backend_idx, ControlAction::Load)
                                         }
-                                    }
+                                        InputMode::Unload { backend_idx } => {
+                                            (backend_idx, ControlAction::Unload)
+                                        }
+                                    };
+                                    self.submit_control(
+                                        state,
+                                        backend_idx,
+                                        action,
+                                        model,
+                                        LoadOptions::default(),
+                                    );
                                 }
                             }
                             KeyCode::Backspace => {
@@ -264,19 +285,26 @@ impl TuiDashboard {
                             return Ok(false);
                         }
                         KeyCode::Char('?') => self.show_help = !self.show_help,
-                        KeyCode::Tab | KeyCode::Char('l') => {
-                            self.active_panel = match self.active_panel {
-                                Panel::Backends => Panel::Users,
-                                Panel::Users => Panel::Blocked,
-                                Panel::Blocked => Panel::Backends,
-                            };
+                        KeyCode::Tab | KeyCode::BackTab => {
+                            let forward = key.code == KeyCode::Tab;
+                            // Context-sensitive: when the selected backend is
+                            // expanded, Tab cycles its model list instead of
+                            // the panels.
+                            if self.active_panel == Panel::Backends
+                                && self.cycle_model_cursor(&snapshot, forward)
+                            {
+                                // model cursor moved
+                            } else if forward {
+                                self.active_panel = self.active_panel.next();
+                            } else {
+                                self.active_panel = self.active_panel.prev();
+                            }
+                        }
+                        KeyCode::Char('l') => {
+                            self.active_panel = self.active_panel.next();
                         }
                         KeyCode::Char('h') => {
-                            self.active_panel = match self.active_panel {
-                                Panel::Backends => Panel::Blocked,
-                                Panel::Users => Panel::Backends,
-                                Panel::Blocked => Panel::Users,
-                            };
+                            self.active_panel = self.active_panel.prev();
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
                             if self.active_panel == Panel::Backends {
@@ -292,6 +320,28 @@ impl TuiDashboard {
                                 }
                             }
                         }
+                        KeyCode::Char('r') => {
+                            // Re-read appconf.yaml and re-apply it.
+                            match control::reload_model_config(state) {
+                                Ok(n) => {
+                                    self.flash = Some(FlashMsg {
+                                        text: format!(
+                                            "model config reloaded: {} model(s), applying",
+                                            n
+                                        ),
+                                        ok: true,
+                                        at: Instant::now(),
+                                    });
+                                }
+                                Err(e) => {
+                                    self.flash = Some(FlashMsg {
+                                        text: format!("config reload failed: {}", e),
+                                        ok: false,
+                                        at: Instant::now(),
+                                    });
+                                }
+                            }
+                        }
                         KeyCode::Char('L') | KeyCode::Char('U') => {
                             if self.active_panel == Panel::Backends
                                 && let Some(i) = self
@@ -299,8 +349,36 @@ impl TuiDashboard {
                                     .selected()
                                     .filter(|&i| i < snapshot.backends.len())
                             {
+                                let action = if key.code == KeyCode::Char('L') {
+                                    ControlAction::Load
+                                } else {
+                                    ControlAction::Unload
+                                };
+                                // When the backend is expanded and a model is
+                                // under the cursor, act on it directly.
+                                let b = &snapshot.backends[i];
+                                if self.expanded_backends.contains(&b.url) {
+                                    let mut models: Vec<String> =
+                                        b.available_models.iter().cloned().collect();
+                                    models.sort();
+                                    if let Some(model) = self
+                                        .model_cursor
+                                        .get(&b.url)
+                                        .filter(|&c| *c < models.len())
+                                        .map(|&c| models[c].clone())
+                                    {
+                                        self.submit_control(
+                                            state,
+                                            i,
+                                            action,
+                                            model,
+                                            LoadOptions::default(),
+                                        );
+                                        continue;
+                                    }
+                                }
                                 self.input_buf.clear();
-                                self.input_mode = Some(if key.code == KeyCode::Char('L') {
+                                self.input_mode = Some(if action == ControlAction::Load {
                                     InputMode::Load { backend_idx: i }
                                 } else {
                                     InputMode::Unload { backend_idx: i }
@@ -446,7 +524,7 @@ impl TuiDashboard {
                             } else if self.active_panel == Panel::Users {
                                 let i = self.table_state.selected().unwrap_or(0).saturating_sub(1);
                                 self.table_state.select(Some(i));
-                            } else {
+                            } else if self.active_panel != Panel::Logs {
                                 let i = self
                                     .blocked_table_state
                                     .selected()
@@ -476,7 +554,7 @@ impl TuiDashboard {
                                         .unwrap_or(0);
                                     self.table_state.select(Some(i));
                                 }
-                            } else {
+                            } else if self.active_panel != Panel::Logs {
                                 let len = snapshot.blocked_ips.len() + snapshot.blocked_users.len();
                                 if len > 0 {
                                     let i = self
@@ -495,25 +573,92 @@ impl TuiDashboard {
         }
     }
 
+    /// Start a control op and flash the outcome.
+    fn submit_control(
+        &mut self,
+        state: &Arc<AppState>,
+        backend_idx: usize,
+        action: ControlAction,
+        model: String,
+        options: LoadOptions,
+    ) {
+        let action_verb = action.verb();
+        match control::start_model_control(state, backend_idx, action, model.clone(), options) {
+            Ok(canonical) => {
+                self.flash = Some(FlashMsg {
+                    text: format!("{} {} started", action_verb, canonical),
+                    ok: true,
+                    at: Instant::now(),
+                });
+            }
+            Err(e) => {
+                self.flash = Some(FlashMsg {
+                    text: format!("{} '{}' rejected: {}", action_verb, model, e),
+                    ok: false,
+                    at: Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Advance the model cursor of the selected (expanded) backend.
+    /// Returns false when the Backends panel has no expanded backend with
+    /// models (so Tab should fall through to panel cycling).
+    fn cycle_model_cursor(&mut self, snapshot: &StateSnapshot, forward: bool) -> bool {
+        let Some(i) = self
+            .backend_table_state
+            .selected()
+            .filter(|&i| i < snapshot.backends.len())
+        else {
+            return false;
+        };
+        let b = &snapshot.backends[i];
+        if !self.expanded_backends.contains(&b.url) {
+            return false;
+        }
+        let mut models: Vec<String> = b.available_models.iter().cloned().collect();
+        models.sort();
+        if models.is_empty() {
+            return false;
+        }
+        let len = models.len();
+        let next = match self.model_cursor.get(&b.url).copied() {
+            None => 0,
+            Some(cur) if forward => (cur + 1) % len,
+            Some(cur) => (cur + len - 1) % len,
+        };
+        self.model_cursor.insert(b.url.clone(), next);
+        // Keep the cursor model visible when the list is folded to 5.
+        if next >= 5 && !self.show_all_backends.contains(&b.url) {
+            self.show_all_backends.insert(b.url.clone());
+        }
+        true
+    }
+
     fn render(&mut self, f: &mut Frame, snapshot: &StateSnapshot) {
-        if self.active_panel == Panel::Backends {
-            if snapshot.backends.is_empty() {
-                self.backend_table_state.select(None);
-            } else if self.backend_table_state.selected().is_none() {
-                self.backend_table_state.select(Some(0));
+        match self.active_panel {
+            Panel::Backends => {
+                if snapshot.backends.is_empty() {
+                    self.backend_table_state.select(None);
+                } else if self.backend_table_state.selected().is_none() {
+                    self.backend_table_state.select(Some(0));
+                }
             }
-        } else if self.active_panel == Panel::Users {
-            if snapshot.user_ids.is_empty() {
-                self.table_state.select(None);
-            } else if self.table_state.selected().is_none() {
-                self.table_state.select(Some(0));
+            Panel::Users => {
+                if snapshot.user_ids.is_empty() {
+                    self.table_state.select(None);
+                } else if self.table_state.selected().is_none() {
+                    self.table_state.select(Some(0));
+                }
             }
-        } else {
-            let blocked_total = snapshot.blocked_ips.len() + snapshot.blocked_users.len();
-            if blocked_total == 0 {
-                self.blocked_table_state.select(None);
-            } else if self.blocked_table_state.selected().is_none() {
-                self.blocked_table_state.select(Some(0));
+            Panel::Logs => {}
+            Panel::Blocked => {
+                let blocked_total = snapshot.blocked_ips.len() + snapshot.blocked_users.len();
+                if blocked_total == 0 {
+                    self.blocked_table_state.select(None);
+                } else if self.blocked_table_state.selected().is_none() {
+                    self.blocked_table_state.select(Some(0));
+                }
             }
         }
 
@@ -523,6 +668,7 @@ impl TuiDashboard {
             .constraints([
                 Constraint::Length(3), // Stats
                 Constraint::Min(0),    // Content
+                Constraint::Length(9), // Request logs (in/out)
                 Constraint::Length(3), // Help bar
                 if self.show_help {
                     Constraint::Length(12)
@@ -570,9 +716,11 @@ impl TuiDashboard {
             &mut self.blocked_table_state,
         );
 
-        f.render_widget(self.render_help(snapshot), main_chunks[2]);
+        f.render_widget(self.render_logs(snapshot), main_chunks[2]);
+
+        f.render_widget(self.render_help(snapshot), main_chunks[3]);
         if self.show_help {
-            f.render_widget(self.render_detailed_help(), main_chunks[3]);
+            f.render_widget(self.render_detailed_help(), main_chunks[4]);
         }
     }
 
@@ -587,11 +735,7 @@ impl TuiDashboard {
             Span::raw(" | "),
             Span::styled("Panel: ", Style::default().fg(Color::White)),
             Span::styled(
-                match self.active_panel {
-                    Panel::Backends => "BACKENDS",
-                    Panel::Users => "USERS",
-                    Panel::Blocked => "BLOCKED",
-                },
+                self.active_panel.label(),
                 Style::default().fg(Color::Yellow).bold(),
             ),
             Span::raw(" | "),
@@ -708,6 +852,11 @@ impl TuiDashboard {
                             format!("{}: {}", op.verb, op.model),
                             Style::default().fg(Color::Cyan),
                         ),
+                        if let Some(id) = &op.identifier {
+                            Span::styled(format!(" [{}]", id), Style::default().fg(Color::Cyan))
+                        } else {
+                            Span::raw("")
+                        },
                         Span::styled(
                             format!(" ({}s…)", op.elapsed_secs),
                             Style::default().fg(Color::DarkGray),
@@ -728,6 +877,11 @@ impl TuiDashboard {
                                 format!("{}: {}", r.verb, r.model),
                                 Style::default().fg(Color::Green),
                             ),
+                            if let Some(id) = &r.identifier {
+                                Span::styled(format!(" [{}]", id), Style::default().fg(Color::Green))
+                            } else {
+                                Span::raw("")
+                            },
                         ]));
                     } else {
                         name_lines.push(Line::from(vec![
@@ -764,17 +918,26 @@ impl TuiDashboard {
                         } else {
                             5.min(total_models)
                         };
-                        for m in models.into_iter().take(limit) {
+                        let cursor = self.model_cursor.get(&b.url).copied();
+                        for (mi, m) in models.into_iter().enumerate().take(limit) {
+                            let is_cursor = cursor == Some(mi);
                             let is_loaded = b.loaded_models.contains(&m);
-                            let m_style = if is_loaded {
+                            let m_style = if is_cursor {
+                                Style::default().fg(Color::Yellow).bold()
+                            } else if is_loaded {
                                 Style::default().fg(Color::Green).bold()
                             } else {
                                 Style::default().fg(Color::DarkGray)
                             };
+                            let (sym, sym_style) = if is_cursor {
+                                ("▶ ", Style::default().fg(Color::Yellow).bold())
+                            } else {
+                                ("└ ", Style::default().fg(Color::DarkGray))
+                            };
 
                             name_lines.push(Line::from(vec![
                                 Span::raw("  "),
-                                Span::styled("└ ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(sym, sym_style),
                                 Span::styled(m, m_style),
                                 if is_loaded {
                                     Span::styled(
@@ -1075,13 +1238,89 @@ impl TuiDashboard {
         )
     }
 
+    /// HH:MM:SS (UTC) from a SystemTime, without a chrono dependency.
+    fn fmt_event_time(t: std::time::SystemTime) -> String {
+        let secs = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() % 86400)
+            .unwrap_or(0);
+        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
+
+    fn render_logs(&self, snapshot: &StateSnapshot) -> Table<'static> {
+        let rows: Vec<Row> = snapshot
+            .logs
+            .iter()
+            .map(|ev| {
+                let (dir_sym, dir_style) = match ev.dir {
+                    "IN" => ("→", Style::default().fg(Color::Cyan)),
+                    "OUT" => ("←", Style::default().fg(Color::Green)),
+                    _ => ("⟳", Style::default().fg(Color::Yellow)),
+                };
+                let backend = ev
+                    .backend
+                    .as_deref()
+                    .map(|u| u.replace("http://", "").replace("https://", ""))
+                    .unwrap_or_else(|| "-".into());
+                let info_style = if ev.info.starts_with("dropped") {
+                    Style::default().fg(Color::Red)
+                } else if ev.info.contains("rejected") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                Row::new(vec![
+                    Cell::from(Self::fmt_event_time(ev.at))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(dir_sym).style(dir_style),
+                    Cell::from(ev.user.clone()).style(Style::default().fg(Color::White)),
+                    Cell::from(ev.model.clone().unwrap_or_else(|| "-".into()))
+                        .style(Style::default().fg(Color::Cyan)),
+                    Cell::from(backend).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(ev.info.clone()).style(info_style),
+                ])
+            })
+            .collect();
+
+        Table::new(
+            rows,
+            [
+                Constraint::Length(10),
+                Constraint::Length(3),
+                Constraint::Percentage(18),
+                Constraint::Percentage(28),
+                Constraint::Percentage(19),
+                Constraint::Percentage(22),
+            ],
+        )
+        .header(
+            Row::new(vec!["Time", " ", "User", "Model", "Backend", "Info"])
+                .style(Style::default().fg(Color::Yellow).bold())
+                .bottom_margin(1),
+        )
+        .block(
+            Block::default()
+                .title(" Requests (newest first) ")
+                .borders(Borders::ALL)
+                .border_style(if self.active_panel == Panel::Logs {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }),
+        )
+    }
+
     fn render_help(&self, snapshot: &StateSnapshot) -> Paragraph<'static> {
-        let base = " h/l/Tab: Panel | j/k: Nav | Space: Expand | a: All | L: Load Model | U: Unload Model | p: VIP | b: Boost | q: Quit";
+        let base = " h/l/Tab: Panel (Tab: model when expanded) | j/k: Nav | Space: Expand | L/U: Load/Unload | r: Reload appconf.yaml | ?: Help | q: Quit";
 
         let line = if let Some(mode) = &self.input_mode {
             let url = snapshot
                 .backends
-                .get(mode.backend_idx())
+                .get(match mode {
+                    InputMode::Load { backend_idx } | InputMode::Unload { backend_idx } => {
+                        *backend_idx
+                    }
+                })
                 .map(|b| b.url.replace("http://", "").replace("https://", ""))
                 .unwrap_or_default();
             let verb = match mode {
@@ -1126,7 +1365,7 @@ impl TuiDashboard {
     }
 
     fn render_detailed_help(&self) -> Paragraph<'static> {
-        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  SHOW ALL MODELS: 'a' (in Backends panel)\n  MODEL CONTROL: 'L' load / 'U' unload a model on the selected backend (Backends panel)\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued | ⟳ Control op in progress")
+        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  CYCLE MODELS: 'Tab' / 'Shift+Tab' on an expanded backend (▶ cursor); 'L'/'U' then act on the cursor model directly\n  SHOW ALL MODELS: 'a' (in Backends panel)\n  MODEL CONTROL: 'L' load / 'U' unload (Backends panel)\n  CONFIG: 'r' re-reads appconf.yaml and re-applies it (loads listed models on their backends)\n  LOGS: bottom panel shows requests in (→) / out (←) and control ops (⟳), newest first\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing / cursor | ● Queued | ⟳ Control op in progress")
             .block(Block::default().title(" Help ").borders(Borders::ALL))
             .style(Style::default().fg(Color::Gray))
     }

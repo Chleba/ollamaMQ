@@ -88,7 +88,8 @@ docker run -d \
 - `-o, --backend-urls <URL1,URL2>`: Comma-separated list of backend server URLs (Ollama, LM Studio, etc.) (default: `http://localhost:11434`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI). In this mode, logs are written verbosely to **stderr** (default level `debug`) so they can be captured by a service manager's journal, Docker, or piped to a file.
-- `--load-keep-alive <SECONDS>`: How long a model stays loaded after a model-control "load" (sent as Ollama's `keep_alive`; LM Studio loads are unaffected beyond its own TTL). Ollama's own default is only 5 minutes, so the default here is `86400` (24 h).
+- `--load-keep-alive <SECONDS>`: How long a model stays loaded after a model-control "load" (sent as Ollama's `keep_alive`; LM Studio loads are unaffected beyond its own TTL). Ollama's own default is only 5 minutes, so the default here is `86400` (24 h). `-1` keeps the model loaded indefinitely.
+- `-c/--model-config <PATH>`: Path to the central configuration file (`appconf.yaml`): backends, settings and models to load. Applied at startup; reload with `r` in the TUI. Default: `appconf.yaml`.
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
@@ -172,7 +173,7 @@ curl -s http://localhost:11435/admin/models | python3 -m json.tool
 Body:
 
 ```json
-{ "backend": 0, "model": "llama3" }
+{ "backend": 0, "model": "llama3", "num_ctx": 16384, "keep_alive": 3600, "identifier": "big-ctx" }
 ```
 
 `backend` accepts:
@@ -182,6 +183,12 @@ Body:
 - `"any"` — the proxy picks a suitable online, idle backend (for load: the first backend where the model resolves; for unload: the first backend that actually has it loaded).
 
 `model` uses the same smart matching as request routing: exact match, then `:latest`/case-insensitive, then a *unique* substring. Ambiguous names are rejected — the proxy never guesses.
+
+Optional fields (load only):
+
+- `num_ctx` — max context window, sent as Ollama `options.num_ctx` or LM Studio `context_length` (omitted = backend default).
+- `keep_alive` — overrides `--load-keep-alive` (seconds) for this load. `-1` = keep forever.
+- `identifier` — free-form label shown with the operation in the TUI and API responses.
 
 Responses:
 
@@ -214,15 +221,48 @@ curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecre
 
 **Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
 
+### Configuration file (`appconf.yaml`)
+
+A central config file with three sections: **backends** (what to connect to), **settings** (runtime options) and **models** (what to load where via the model-control load/unload logic). Path defaults to `appconf.yaml` in the working directory; override with `-c/--model-config`. A missing file is fine — defaults apply.
+
+```yaml
+# Backends ollamaMQ connects to (same as --backend-urls)
+backends:
+  - http://10.137.1.1:11434
+  - http://10.137.1.2:11434
+
+settings:
+  port: 11435                  # default 11435
+  host: 127.0.0.1              # default 127.0.0.1
+  timeout: 300                 # request timeout, seconds (default 300)
+  load_keep_alive: 86400       # model-control keep_alive (default 24 h; -1 = forever)
+  allow_all_routes: false      # fallback proxy (default false)
+
+models:
+  - name: "gpt-oss:120b"        # model name as the backend knows it
+    identifier: "my-gpt"        # label attached to the load op (TUI / admin API)
+    max_ctx: 128000             # max context window (Ollama num_ctx / LM Studio context_length)
+    keep_alive: 86400           # seconds to stay resident after load (Ollama; -1 = forever)
+    max_concurrent_requests: 3  # reserved for the scheduler (stored, not enforced yet; default 1)
+    backends:                   # URLs to load on (exact or substring match); empty = any suitable backend
+      - http://10.137.1.1:11434
+      - http://10.137.1.2:11434
+```
+
+**Precedence:** CLI flags always win when explicitly given (`--backend-urls` over `backends`, `--port`/`--host`/`--timeout`/`--load-keep-alive`/`--allow-all-routes` over `settings`). See `appconf.yaml.example` for a fully commented template.
+
+The `models` section is applied automatically at startup (once backend probes have run) and can be re-read and re-applied at any time with **`r`** in the TUI (backends/settings are only read at startup). Applying is additive: it loads models that are missing from their target backends — it never unloads anything else. Loads for the same backend run one at a time (backends reject parallel control ops). Every load attempt is reported in the TUI Logs panel (`⟳ CTL` lines) and in the log output.
+
 ### Dashboard Controls
 
 The interactive TUI dashboard provides a live view of the dispatcher's state:
 
 - **`j` / `k`** or **Arrows**: Navigate the selected list (Users, Backends, or Blocked Items).
-- **`Tab`** or **`h` / `l`**: Switch between the **Backends**, **Users**, and **Blocked** panels.
+- **`Tab`** / **`Shift+Tab`** or **`h` / `l`**: Switch between the **Backends**, **Users**, **Blocked**, and **Logs** panels. Context-sensitive: when the selected backend is *expanded*, `Tab`/`Shift+Tab` cycle through that backend's model list instead (the cursor model is shown as `▶` in yellow, wrapping around; cycling past the first 5 models auto-expands the list).
 - **`Space`** or **`Enter`**: Expand/collapse the available models list for the selected backend (in the Backends panel).
-- **`L`**: Load a model on the selected backend (Backends panel) — type the model name, confirm with `Enter`, cancel with `Esc`.
-- **`U`**: Unload a model from the selected backend (Backends panel).
+- **`L`**: Load a model on the selected backend (Backends panel). If the backend is expanded and a model is under the `Tab` cursor, that model is loaded **directly** (no typing); otherwise you type the model name, confirm with `Enter`, cancel with `Esc`.
+- **`U`**: Unload a model from the selected backend (Backends panel) — same cursor behavior as `L`.
+- **`r`**: Re-read `appconf.yaml` and re-apply it (loads listed models onto their configured backends).
 - **`p`**: Toggle **VIP** status for the selected user (absolute priority).
 - **`b`**: Toggle **Boost** status for the selected user (prioritizes every 2nd request).
 - **`x`**: Block the selected user.
@@ -233,6 +273,7 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 
 **Visual Indicators:**
 - `▶` / `▼`: Indicates if a backend's model list is collapsed or expanded.
+- `▶` (Yellow, in model lists): The `Tab` cursor model — `L`/`U` act on it directly.
 - `★` (Magenta): **VIP User** (absolute priority).
 - `⚡` (Yellow): **Boosted User** (every 2nd request priority).
 - `▶` (Cyan): Request is currently being processed/streamed.
@@ -240,6 +281,11 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 - `○` (Gray): User is idle or Backend is Offline.
 - `✖` (Red): User or IP is blocked.
 - `⟳` (Cyan): A model load/unload control operation is in progress on that backend (recent results flash `✓`/`✖` for ~10 s).
+
+**Logs Panel (bottom strip):** live feed of what is passing through the proxy, newest first:
+- `→` (Cyan) **IN**: a request was queued (user, model).
+- `←` (Green) **OUT**: the request was dispatched to a backend, with response status (`dropped` in red when blocked/client gone/backend error).
+- `⟳` (Yellow) **CTL**: model-control actions from `appconf.yaml` application/reload.
 
 ### Logging
 
