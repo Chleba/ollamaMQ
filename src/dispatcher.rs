@@ -40,6 +40,9 @@ pub struct Task {
     /// Set once a "no backend available" warning has been logged for this
     /// task, so stuck requests are visible without spamming the log.
     pub stuck_warned: bool,
+    /// When the request was queued; used to fail fast (503) when no backend
+    /// can ever serve it instead of letting the client hang forever.
+    pub queued_at: std::time::Instant,
 }
 
 /// Which API flavours this backend speaks.
@@ -83,11 +86,21 @@ impl BackendApiType {
 }
 
 /// Which API family a request path belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ApiFamily {
     Ollama,
     OpenAi,
     Unknown,
+}
+
+impl ApiFamily {
+    pub fn display(&self) -> &'static str {
+        match self {
+            ApiFamily::Ollama => "Ollama",
+            ApiFamily::OpenAi => "OpenAI",
+            ApiFamily::Unknown => "unknown",
+        }
+    }
 }
 
 pub fn detect_api_family(path: &str) -> ApiFamily {
@@ -119,12 +132,28 @@ pub struct BackendStatus {
     pub api_type: BackendApiType,
     pub available_models: HashSet<String>,
     pub loaded_models: HashSet<String>,
+    /// Actual context window of each resident model, keyed by model name/key
+    /// (Ollama `/api/ps` `context_length`; LM Studio loaded instance
+    /// `config.context_length`). Used to detect resident models whose
+    /// context doesn't match the configured `max_ctx`.
+    pub loaded_ctx: HashMap<String, u64>,
     pub current_model: Option<String>,
     /// True when the backend speaks the LM Studio native REST API
     /// (`/api/v1/models*`), which enables model load/unload control.
     pub lmstudio: bool,
     /// LM Studio native model list (empty for other backend types).
     pub native_models: Vec<LmModelInfo>,
+    /// Endpoints this backend is known to reject (remembered from probes);
+    /// the health loop skips them until a full re-probe.
+    pub known_bad_endpoints: HashSet<String>,
+    /// API families learned (from real traffic) to be rejected by this
+    /// backend, e.g. Ollama-family requests answered with an endpoint error
+    /// by an LM Studio server. The scheduler excludes such backends for that
+    /// family until a request of the family succeeds or the backend restarts.
+    pub rejected_families: HashSet<ApiFamily>,
+    /// Consecutive endpoint-rejection responses per API family; at 2 the
+    /// family moves into `rejected_families`. Cleared on any success.
+    pub family_fail_counts: HashMap<ApiFamily, u8>,
 }
 
 pub struct AppState {
@@ -143,6 +172,11 @@ pub struct AppState {
     pub backends: Mutex<Vec<BackendStatus>>,
     pub last_backend_idx: Mutex<usize>,
     pub timeout: u64,
+    /// How long a request may wait when no backend can *ever* serve it
+    /// (all offline / wrong API family / model absent everywhere) before the
+    /// proxy answers 503 instead of letting the client hang. Requests that
+    /// are merely waiting for a busy or loading backend are exempt.
+    pub stuck_timeout: std::time::Duration,
     /// Shared HTTP client for proxying and backend control probes.
     pub client: reqwest::Client,
     /// In-flight model control operations, keyed by backend index
@@ -185,6 +219,7 @@ impl AppState {
         backend_urls: Vec<String>,
         timeout: u64,
         load_keep_alive: i64,
+        stuck_timeout_secs: u64,
         model_config_path: String,
         model_config: Vec<crate::config::ModelConfig>,
     ) -> Self {
@@ -199,9 +234,13 @@ impl AppState {
                 api_type: BackendApiType::Unknown,
                 available_models: HashSet::new(),
                 loaded_models: HashSet::new(),
+                loaded_ctx: HashMap::new(),
                 current_model: None,
                 lmstudio: false,
                 native_models: Vec::new(),
+                known_bad_endpoints: HashSet::new(),
+                rejected_families: HashSet::new(),
+                family_fail_counts: HashMap::new(),
             })
             .collect();
 
@@ -226,6 +265,7 @@ impl AppState {
             backends: Mutex::new(backends),
             last_backend_idx: Mutex::new(0),
             timeout,
+            stuck_timeout: std::time::Duration::from_secs(stuck_timeout_secs),
             client,
             control_ops: Mutex::new(HashMap::new()),
             control_history: Mutex::new(VecDeque::new()),
@@ -364,48 +404,80 @@ pub async fn run_worker(state: Arc<AppState>) {
     let health_state = state.clone();
     let health_client = client.clone();
     tokio::spawn(async move {
+        let mut cycle: u32 = 0;
         loop {
-            let backends_to_check: Vec<(usize, String)> = {
+            // Every ~1 min do a full re-probe of all endpoints so remembered
+            // "bad" ones are re-verified (the backend may have been upgraded).
+            let full_reprobe = cycle % 6 == 0;
+            cycle += 1;
+
+            let backends_to_check: Vec<(usize, String, bool)> = {
                 let backends = health_state.backends.lock().unwrap();
                 backends
                     .iter()
                     .enumerate()
-                    .map(|(i, b)| (i, b.url.clone()))
+                    .map(|(i, b)| (i, b.url.clone(), b.is_online))
                     .collect()
             };
 
-            for (idx, url) in backends_to_check {
-                let probe = crate::control::probe_backend(&health_client, &url).await;
+            for (idx, url, was_online) in backends_to_check {
+                // Skip endpoints this backend is known to reject — except on a
+                // full re-probe or right after recovery from offline (memory
+                // may be stale after a restart). Never skip both primary API
+                // probes: online status must stay re-establishable.
+                let skip = {
+                    let backends = health_state.backends.lock().unwrap();
+                    if full_reprobe || !was_online {
+                        HashSet::new()
+                    } else {
+                        let mut s = backends[idx].known_bad_endpoints.clone();
+                        if s.contains("/api/tags") && s.contains("/v1/models") {
+                            s.clear();
+                        }
+                        s
+                    }
+                };
+
+                let probe = crate::control::probe_backend(&health_client, &url, &skip).await;
 
                 let mut backends = health_state.backends.lock().unwrap();
-                let mut changed = false;
-                if backends[idx].is_online != probe.is_online {
+                let b = &mut backends[idx];
+
+                // A backend that just recovered from offline may have been
+                // restarted: clear learned endpoint/family memory so it is
+                // re-learned from scratch.
+                if !was_online && probe.is_online {
+                    b.known_bad_endpoints.clear();
+                    b.rejected_families.clear();
+                    b.family_fail_counts.clear();
+                }
+
+                let newly_bad: Vec<String> = probe
+                    .bad_endpoints
+                    .iter()
+                    .filter(|e| !b.known_bad_endpoints.contains(*e))
+                    .cloned()
+                    .collect();
+
+                let changed = b.is_online != probe.is_online
+                    || b.api_type != probe.api_type
+                    || b.available_models != probe.available_models
+                    || b.loaded_models != probe.loaded_models;
+
+                let now_online = probe.is_online;
+                crate::control::apply_probe(b, probe);
+
+                if !was_online && now_online {
+                    info!("Backend {} status changed to: ONLINE", url);
+                } else if was_online && !now_online {
+                    info!("Backend {} status changed to: OFFLINE", url);
+                }
+                for e in &newly_bad {
                     info!(
-                        "Backend {} status changed to: {}",
-                        url,
-                        if probe.is_online { "ONLINE" } else { "OFFLINE" }
+                        "Backend {} does not serve {} — remembered, will skip it until re-check",
+                        url, e
                     );
-                    backends[idx].is_online = probe.is_online;
-                    changed = true;
                 }
-                if backends[idx].api_type != probe.api_type {
-                    info!(
-                        "Backend {} API type detected: {}",
-                        url,
-                        probe.api_type.display()
-                    );
-                    backends[idx].api_type = probe.api_type;
-                    changed = true;
-                }
-                if backends[idx].available_models != probe.available_models
-                    || backends[idx].loaded_models != probe.loaded_models
-                {
-                    changed = true;
-                }
-                backends[idx].available_models = probe.available_models;
-                backends[idx].loaded_models = probe.loaded_models;
-                backends[idx].lmstudio = probe.lmstudio;
-                backends[idx].native_models = probe.native_models;
 
                 // Wake the dispatcher if anything relevant to scheduling
                 // changed (model finished loading, backend came online, etc.)
@@ -818,6 +890,7 @@ pub async fn proxy_handler(
         body,
         requested_model: requested_model.clone(),
         stuck_warned: false,
+        queued_at: std::time::Instant::now(),
     };
 
     {

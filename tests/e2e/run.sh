@@ -27,7 +27,14 @@ MQ_E2E_CALLS="$SCRATCH/calls.jsonl" python3 tests/e2e/mock_backends.py > "$SCRAT
 MOCK_PID=$!
 sleep 1
 
-./target/debug/ollamaMQ --no-tui --port 11999 --backend-urls http://127.0.0.1:11990,http://127.0.0.1:11991 > "$SCRATCH/proxy.log" 2>&1 &
+# Isolate from any appconf.yaml in the repo (its backends/load_keep_alive
+# would override the test's expectations).
+cat > "$SCRATCH/appconf.yaml" <<'YAML'
+backends: []
+models: []
+YAML
+
+./target/debug/ollamaMQ --no-tui --port 11999 --model-config "$SCRATCH/appconf.yaml" --backend-urls http://127.0.0.1:11990,http://127.0.0.1:11991 > "$SCRATCH/proxy.log" 2>&1 &
 PROXY_PID=$!
 sleep 2.5
 

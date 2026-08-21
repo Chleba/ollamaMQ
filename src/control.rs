@@ -25,7 +25,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -107,53 +107,75 @@ pub struct BackendProbe {
     pub api_type: BackendApiType,
     pub available_models: HashSet<String>,
     pub loaded_models: HashSet<String>,
+    /// Actual context window per resident model (see
+    /// `BackendStatus::loaded_ctx`). Empty when the backend doesn't report it.
+    pub loaded_ctx: HashMap<String, u64>,
     /// True when the backend speaks the LM Studio native REST API.
     pub lmstudio: bool,
     /// LM Studio native model list (keys, display names, loaded instance ids).
     pub native_models: Vec<LmModelInfo>,
+    /// Endpoints probed this round that the backend rejected (HTTP error, or
+    /// 2xx with an error body instead of the expected payload). The caller
+    /// should remember these and skip them on subsequent probes.
+    pub bad_endpoints: HashSet<String>,
+    /// Endpoints probed this round that answered successfully — any previous
+    /// "bad" memory for these is stale and can be dropped.
+    pub good_endpoints: HashSet<String>,
 }
 
 /// Probe one backend: online status, API type, available models, loaded
 /// models, and (for LM Studio) the native model list.
-pub async fn probe_backend(client: &reqwest::Client, url: &str) -> BackendProbe {
+pub async fn probe_backend(
+    client: &reqwest::Client,
+    url: &str,
+    skip: &HashSet<String>,
+) -> BackendProbe {
     let mut is_online = false;
     let mut detected_type = BackendApiType::Unknown;
     let mut models = HashSet::new();
     let mut loaded = HashSet::new();
+    let mut loaded_ctx: HashMap<String, u64> = HashMap::new();
     let mut lmstudio = false;
     let mut native_models: Vec<LmModelInfo> = Vec::new();
+    let mut bad_endpoints: HashSet<String> = HashSet::new();
+    let mut good_endpoints: HashSet<String> = HashSet::new();
 
     // Probe Ollama API: /api/tags → expects {"models": [...]}
-    {
+    if !skip.contains("/api/tags") {
         let check_url = format!("{}/api/tags", url);
         match client.get(&check_url).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
-                if let Ok(body) = res.text().await {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(models_json) = json.get("models").and_then(|m| m.as_array()) {
-                            detected_type = detected_type.merge(BackendApiType::Ollama);
-                            debug!("Backend {} confirmed Ollama API via /api/tags", url);
-                            for m in models_json {
-                                if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                                    models.insert(name.to_string());
-                                }
+                let body = res.text().await.unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|j| j.get("models").and_then(|m| m.as_array()).cloned())
+                {
+                    Some(models_json) => {
+                        detected_type = detected_type.merge(BackendApiType::Ollama);
+                        good_endpoints.insert("/api/tags".to_string());
+                        debug!("Backend {} confirmed Ollama API via /api/tags", url);
+                        for m in models_json {
+                            if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                                models.insert(name.to_string());
                             }
-                        } else {
-                            warn!(
-                                "Backend {} responded 200 to /api/tags but 'models' array not found or invalid. Body: {}",
-                                url, body
-                            );
                         }
-                    } else {
-                        warn!(
-                            "Backend {} responded 200 to /api/tags but body is not valid JSON",
-                            url
+                    }
+                    // 2xx but no models array: e.g. LM Studio answers unknown
+                    // endpoints with a 200 + {"error": ...} body. Remember the
+                    // endpoint instead of warning on every cycle.
+                    None => {
+                        bad_endpoints.insert("/api/tags".to_string());
+                        debug!(
+                            "Backend {} /api/tags has no 'models' array (not an Ollama endpoint). Body: {}",
+                            url,
+                            body.chars().take(200).collect::<String>()
                         );
                     }
                 }
             }
             Ok(res) => {
+                bad_endpoints.insert("/api/tags".to_string());
                 debug!(
                     "Backend {} /api/tags returned status: {}",
                     url,
@@ -161,59 +183,91 @@ pub async fn probe_backend(client: &reqwest::Client, url: &str) -> BackendProbe 
                 );
             }
             Err(e) => {
+                // Connection-level failure: backend may be down; don't remember.
                 debug!("Backend {} /api/tags error: {}", url, e);
             }
         }
 
         // Also check for loaded models via /api/ps if it was an Ollama-like response
-        if is_online {
+        if is_online && !skip.contains("/api/ps") {
             let ps_url = format!("{}/api/ps", url);
-            if let Ok(res) = client.get(&ps_url).send().await
-                && res.status().is_success()
-                && let Ok(body) = res.text().await
-                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(models_json) = json.get("models").and_then(|m| m.as_array())
-            {
-                for m in models_json {
-                    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                        loaded.insert(name.to_string());
+            match client.get(&ps_url).send().await {
+                Ok(res) if res.status().is_success() => {
+                    let body = res.text().await.unwrap_or_default();
+                    match serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|j| j.get("models").and_then(|m| m.as_array()).cloned())
+                    {
+                        Some(models_json) => {
+                            good_endpoints.insert("/api/ps".to_string());
+                            for m in models_json {
+                                if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                                    loaded.insert(name.to_string());
+                                }
+                                // Newer Ollama versions report the runner's
+                                // actual context window here.
+                                if let (Some(name), Some(ctx)) = (
+                                    m.get("name").and_then(|n| n.as_str()),
+                                    m.get("context_length").and_then(|c| c.as_u64()),
+                                ) {
+                                    loaded_ctx.insert(name.to_string(), ctx);
+                                }
+                            }
+                        }
+                        None => {
+                            bad_endpoints.insert("/api/ps".to_string());
+                            debug!("Backend {} /api/ps has no 'models' array", url);
+                        }
                     }
+                }
+                Ok(res) => {
+                    bad_endpoints.insert("/api/ps".to_string());
+                    debug!(
+                        "Backend {} /api/ps returned status: {}",
+                        url,
+                        res.status()
+                    );
+                }
+                Err(e) => {
+                    debug!("Backend {} /api/ps error: {}", url, e);
                 }
             }
         }
     }
 
-    // Probe OpenAI API: /v1/models → expects {"data": [...]}
-    {
+// Probe OpenAI API: /v1/models → expects {"data": [...]}
+    if !skip.contains("/v1/models") {
         let check_url = format!("{}/v1/models", url);
         match client.get(&check_url).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
-                if let Ok(body) = res.text().await {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(data_json) = json.get("data").and_then(|d| d.as_array()) {
-                            detected_type = detected_type.merge(BackendApiType::OpenAi);
-                            debug!("Backend {} confirmed OpenAI API via /v1/models", url);
-                            for m in data_json {
-                                if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
-                                    models.insert(id.to_string());
-                                }
+                let body = res.text().await.unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|j| j.get("data").and_then(|d| d.as_array()).cloned())
+                {
+                    Some(data_json) => {
+                        detected_type = detected_type.merge(BackendApiType::OpenAi);
+                        good_endpoints.insert("/v1/models".to_string());
+                        debug!("Backend {} confirmed OpenAI API via /v1/models", url);
+                        for m in data_json {
+                            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                                models.insert(id.to_string());
                             }
-                        } else {
-                            warn!(
-                                "Backend {} responded 200 to /v1/models but 'data' array not found or invalid. Body: {}",
-                                url, body
-                            );
                         }
-                    } else {
-                        warn!(
-                            "Backend {} responded 200 to /v1/models but body is not valid JSON",
-                            url
+                    }
+                    None => {
+                        bad_endpoints.insert("/v1/models".to_string());
+                        debug!(
+                            "Backend {} /v1/models has no 'data' array (not an OpenAI endpoint). Body: {}",
+                            url,
+                            body.chars().take(200).collect::<String>()
                         );
                     }
                 }
             }
             Ok(res) => {
+                bad_endpoints.insert("/v1/models".to_string());
                 debug!(
                     "Backend {} /v1/models returned status: {}",
                     url,
@@ -228,20 +282,41 @@ pub async fn probe_backend(client: &reqwest::Client, url: &str) -> BackendProbe 
 
     // Probe LM Studio native API for loaded models + model metadata
     // (loaded_instances non-empty). LM-Studio-specific endpoint; Ollama and
-    // generic OpenAI servers 404 it (handled gracefully inside the helper).
-    if let Some((ls_loaded, ls_native)) = probe_lmstudio_native(client, url).await {
-        lmstudio = true;
-        native_models = ls_native;
-        loaded.extend(ls_loaded);
+    // generic OpenAI servers 404 it. The outcome is remembered so we stop
+    // re-probing backends that don't have the endpoint.
+        if !skip.contains("/api/v1/models") {
+            match probe_lmstudio_native(client, url).await {
+                NativeProbeOutcome::Found(ls_loaded, ls_native, ls_ctx) => {
+                    lmstudio = true;
+                    native_models = ls_native;
+                    loaded.extend(ls_loaded);
+                    for (k, v) in ls_ctx {
+                        loaded_ctx.insert(k, v);
+                    }
+                    good_endpoints.insert("/api/v1/models".to_string());
+                }
+            NativeProbeOutcome::Rejected => {
+                bad_endpoints.insert("/api/v1/models".to_string());
+            }
+            NativeProbeOutcome::Unknown => {}
+        }
     }
 
     // Fallback: just check root if both specific probes failed
-    if !is_online {
+    if !is_online && !skip.contains("/") {
         let check_url = format!("{}/", url);
-        if let Ok(res) = client.get(&check_url).send().await
-            && res.status().is_success()
-        {
-            is_online = true;
+        match client.get(&check_url).send().await {
+            Ok(res) if res.status().is_success() => {
+                is_online = true;
+                good_endpoints.insert("/".to_string());
+            }
+            Ok(res) => {
+                bad_endpoints.insert("/".to_string());
+                debug!("Backend {} / returned status: {}", url, res.status());
+            }
+            Err(e) => {
+                debug!("Backend {} / error: {}", url, e);
+            }
         }
     }
 
@@ -250,31 +325,75 @@ pub async fn probe_backend(client: &reqwest::Client, url: &str) -> BackendProbe 
         api_type: detected_type,
         available_models: models,
         loaded_models: loaded,
+        loaded_ctx,
         lmstudio,
         native_models,
+        bad_endpoints,
+        good_endpoints,
     }
 }
 
+/// Merge a fresh probe result into backend state, including endpoint memory:
+/// endpoints that answered successfully clear their "bad" flag; rejected ones
+/// are remembered so future probes skip them. Shared by the periodic health
+/// loop and the one-shot re-probes after control ops / config apply.
+pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
+    b.is_online = probe.is_online;
+    b.api_type = probe.api_type;
+    b.available_models = probe.available_models;
+    b.loaded_models = probe.loaded_models;
+    b.loaded_ctx = probe.loaded_ctx;
+    b.lmstudio = probe.lmstudio;
+    b.native_models = probe.native_models;
+    for e in &probe.good_endpoints {
+        b.known_bad_endpoints.remove(e);
+    }
+    b.known_bad_endpoints.extend(probe.bad_endpoints.iter().cloned());
+}
+
+/// Outcome of probing the LM Studio native model list. Distinguishes a real
+/// "endpoint exists and answered" from "backend rejected it" (remember as bad)
+/// from "couldn't tell" (connection error / unparseable — remember nothing).
+enum NativeProbeOutcome {
+    /// Endpoint exists; `(loaded_names, native_model_list, loaded_ctx)`.
+    Found(
+        HashSet<String>,
+        Vec<LmModelInfo>,
+        HashMap<String, u64>,
+    ),
+    /// Backend answered with an HTTP error — the endpoint doesn't exist here.
+    Rejected,
+    /// Connection-level failure or unparseable body — say nothing.
+    Unknown,
+}
+
 /// Probe LM Studio's native `/api/v1/models` endpoint.
-/// Returns `Some((loaded_names, native_model_list))` when the backend speaks
-/// the LM Studio native REST API, otherwise `None` (404 / non-LM Studio).
 async fn probe_lmstudio_native(
     client: &reqwest::Client,
     url: &str,
-) -> Option<(HashSet<String>, Vec<LmModelInfo>)> {
-    let res = client
-        .get(format!("{}/api/v1/models", url))
-        .send()
-        .await
-        .ok()?;
+) -> NativeProbeOutcome {
+    let res = match client.get(format!("{}/api/v1/models", url)).send().await {
+        Ok(r) => r,
+        Err(_) => return NativeProbeOutcome::Unknown,
+    };
     if !res.status().is_success() {
-        return None;
+        return NativeProbeOutcome::Rejected;
     }
-    let body = res.text().await.ok()?;
-    let json = serde_json::from_str::<serde_json::Value>(&body).ok()?;
-    let models_json = json.get("models").and_then(|m| m.as_array())?;
+    let body = match res.text().await.ok() {
+        Some(b) => b,
+        None => return NativeProbeOutcome::Unknown,
+    };
+    let json = match serde_json::from_str::<serde_json::Value>(&body).ok() {
+        Some(j) => j,
+        None => return NativeProbeOutcome::Unknown,
+    };
+    let models_json = match json.get("models").and_then(|m| m.as_array()) {
+        Some(a) => a.clone(),
+        None => return NativeProbeOutcome::Unknown,
+    };
 
     let mut loaded = HashSet::new();
+    let mut loaded_ctx: HashMap<String, u64> = HashMap::new();
     let mut native = Vec::new();
     for m in models_json {
         let key = m
@@ -303,7 +422,20 @@ async fn probe_lmstudio_native(
                 loaded.insert(key.clone());
             }
             for id in &instance_ids {
-                loaded.insert(id.clone());
+                loaded.insert(id.to_string());
+            }
+            // First loaded instance's actual context window (all instances of
+            // a key share the load config in practice).
+            let ctx = instances
+                .iter()
+                .find_map(|i| i.get("config").and_then(|c| c.get("context_length")).and_then(|v| v.as_u64()));
+            if let Some(ctx) = ctx {
+                let ctx_key = if key.is_empty() {
+                    instance_ids[0].clone()
+                } else {
+                    key.clone()
+                };
+                loaded_ctx.insert(ctx_key, ctx);
             }
         }
         native.push(LmModelInfo {
@@ -312,15 +444,9 @@ async fn probe_lmstudio_native(
             loaded_instance_ids: instance_ids,
         });
     }
-    Some((loaded, native))
+    NativeProbeOutcome::Found(loaded, native, loaded_ctx)
 }
 
-/// Resolve a user-supplied model name to the backend's canonical name.
-///
-/// Order: exact match → smart match (`:latest` / case-insensitive) →
-/// case-insensitive substring (unique match only) → LM Studio native list
-/// (key or display name). Returns `None` when nothing or multiple candidates
-/// match.
 pub fn resolve_model_name(b: &BackendStatus, requested: &str) -> Option<String> {
     let req = requested.trim();
     if req.is_empty() {
@@ -396,6 +522,20 @@ fn is_already_loaded(b: &BackendStatus, name: &str) -> bool {
     }
 }
 
+/// The actual context window of the resident instance of `name` on backend
+/// `b`, when the backend reports one (Ollama `/api/ps` `context_length`;
+/// LM Studio loaded-instance `config.context_length`). `None` when the model
+/// isn't resident or the backend doesn't expose its context size.
+fn resident_ctx(b: &BackendStatus, name: &str) -> Option<u64> {
+    let canonical = resolve_model_name(b, name)?;
+    b.loaded_models
+        .iter()
+        .find(|m| smart_model_match_one(&canonical, m))
+        .and_then(|m| b.loaded_ctx.get(m))
+        .or_else(|| b.loaded_ctx.get(&canonical))
+        .copied()
+}
+
 /// Does this backend expose a model load/unload API?
 fn supports_control(b: &BackendStatus) -> bool {
     b.lmstudio || matches!(b.api_type, BackendApiType::Ollama | BackendApiType::Both)
@@ -425,7 +565,9 @@ fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usi
 /// entry on its target backends, except models that are already resident
 /// there — each endpoint is checked live first, so models still loaded from
 /// an earlier ollamaMQ run (long keep_alive) are skipped instead of being
-/// loaded twice. Loads for the same backend run sequentially (the backend
+/// loaded twice. A resident model whose context window differs from its
+/// configured `max_ctx` is unloaded and reloaded with the configured value.
+/// Loads for the same backend run sequentially (the backend
 /// rejects parallel control ops); different backends proceed in parallel.
 /// Returns the number of entries applied.
 pub fn apply_model_config(state: &Arc<AppState>) -> usize {
@@ -467,15 +609,90 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                     .map(|b| b.url.clone())
                     .unwrap_or_default();
                 if !url.is_empty() {
-                    let probe = probe_backend(&st.client, &url).await;
+                    let probe = probe_backend(&st.client, &url, &HashSet::new()).await;
                     let mut backends = st.backends.lock().unwrap();
                     if let Some(b) = backends.get_mut(backend_idx) {
-                        b.is_online = probe.is_online;
-                        b.api_type = probe.api_type;
-                        b.available_models = probe.available_models;
-                        b.loaded_models = probe.loaded_models;
-                        b.lmstudio = probe.lmstudio;
-                        b.native_models = probe.native_models;
+                        apply_probe(b, probe);
+                    }
+                }
+
+                let (resident, lmstudio, native_models, control_timeout) = {
+                    let backends = st.backends.lock().unwrap();
+                    let b = backends.get(backend_idx);
+                    let resident = b.is_some_and(|b| b.is_online && is_already_loaded(b, &cfg.name));
+                    (
+                        resident,
+                        b.map(|b| b.lmstudio).unwrap_or(false),
+                        b.map(|b| b.native_models.clone()).unwrap_or_default(),
+                        Duration::from_secs(st.timeout.max(600)),
+                    )
+                };
+
+                // A resident model is only "done" when it also runs with the
+                // configured max_ctx. Models loaded by an earlier ollamaMQ
+                // run, the backend's own UI, a JIT auto-load or a TUI load
+                // (which sends no context) may have the wrong context window;
+                // in that case unload and reload with the configured value
+                // instead of skipping.
+                if resident && cfg.max_ctx.is_some() {
+                    let want = cfg.max_ctx.unwrap();
+                    let actual = st
+                        .backends
+                        .lock()
+                        .unwrap()
+                        .get(backend_idx)
+                        .and_then(|b| resident_ctx(b, &cfg.name));
+                    match actual {
+                        Some(a) if a == want => {}
+                        Some(a) => {
+                            warn!(
+                                "load '{}': resident on {} with context {} != configured {}; reloading",
+                                cfg.name, url, a, want
+                            );
+                            st.log_event(crate::dispatcher::LogEvent {
+                                at: std::time::SystemTime::now(),
+                                dir: "CTL",
+                                user: "-".into(),
+                                model: Some(cfg.name.clone()),
+                                backend: None,
+                                info: format!(
+                                    "reloading '{}' on {}: context {} != configured {}",
+                                    cfg.name, url, a, want
+                                ),
+                            });
+                            let canonical = {
+                                let backends = st.backends.lock().unwrap();
+                                backends
+                                    .get(backend_idx)
+                                    .and_then(|b| resolve_model_name(b, &cfg.name))
+                            };
+                            if let Some(canonical) = canonical {
+                                if let Err(e) = execute_unload(
+                                    &st.client,
+                                    &url,
+                                    lmstudio,
+                                    &canonical,
+                                    control_timeout,
+                                    &native_models,
+                                )
+                                .await
+                                {
+                                    warn!("unload of '{}' failed: {}", canonical, e);
+                                }
+                                // Give the backend a moment to release the model.
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                let probe =
+                                    probe_backend(&st.client, &url, &HashSet::new()).await;
+                                let mut backends = st.backends.lock().unwrap();
+                                if let Some(b) = backends.get_mut(backend_idx) {
+                                    apply_probe(b, probe);
+                                }
+                            }
+                        }
+                        None => {
+                            // Backend doesn't report the resident context;
+                            // keep the old skip behavior rather than flapping.
+                        }
                     }
                 }
 
@@ -917,16 +1134,11 @@ pub fn start_model_control(
             }
         }
 
-        let probe = probe_backend(&state.client, &backend_url).await;
+        let probe = probe_backend(&state.client, &backend_url, &HashSet::new()).await;
         {
             let mut backends = state.backends.lock().unwrap();
             if let Some(b) = backends.get_mut(backend_idx) {
-                b.is_online = probe.is_online;
-                b.api_type = probe.api_type;
-                b.available_models = probe.available_models;
-                b.loaded_models = probe.loaded_models;
-                b.lmstudio = probe.lmstudio;
-                b.native_models = probe.native_models;
+                apply_probe(b, probe);
                 if result.is_ok() && action == ControlAction::Load {
                     b.current_model = Some(canonical.clone());
                 }
@@ -1160,9 +1372,13 @@ mod tests {
             api_type,
             available_models: available.iter().map(|s| s.to_string()).collect(),
             loaded_models: loaded.iter().map(|s| s.to_string()).collect(),
+            loaded_ctx: HashMap::new(),
             current_model: None,
             lmstudio,
             native_models: Vec::new(),
+            known_bad_endpoints: HashSet::new(),
+            rejected_families: HashSet::new(),
+            family_fail_counts: HashMap::new(),
         }
     }
 
@@ -1243,24 +1459,45 @@ mod tests {
     }
 
     /// Spin up an in-process backend mock speaking both Ollama and
-    /// LM Studio endpoints; records received control requests.
+    /// LM Studio endpoints; records received control requests. The mock
+    /// tracks resident Ollama models (name -> context_length): an unload
+    /// generate (`keep_alive: 0`) removes the model, any other generate
+    /// re-adds it with the requested `num_ctx`. `/api/ps` reports both.
     async fn start_mock_backend() -> (
         String,
         std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
     ) {
         let calls: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resident: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, u64>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(
+            [("qwen2.5:7b".to_string(), 2048u64)].into_iter().collect(),
+        ));
 
         let c = calls.clone();
+        let resident_gen = resident.clone();
         let generate = move |Json(body): Json<Value>| {
             let c = c.clone();
+            let resident = resident_gen.clone();
             async move {
                 c.lock()
                     .unwrap()
                     .push(("/api/generate".into(), body.clone()));
                 if body.get("keep_alive").and_then(|k| k.as_i64()) == Some(0) {
+                    if let Some(name) = body.get("model").and_then(|m| m.as_str()) {
+                        resident.lock().unwrap().remove(name);
+                    }
                     Json(json!({"model": body["model"], "done": true, "done_reason": "unload"}))
                 } else {
+                    if let Some(name) = body.get("model").and_then(|m| m.as_str()) {
+                        let ctx = body
+                            .get("options")
+                            .and_then(|o| o.get("num_ctx"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(2048);
+                        resident.lock().unwrap().insert(name.to_string(), ctx);
+                    }
                     Json(json!({"model": body["model"], "done": true}))
                 }
             }
@@ -1280,16 +1517,23 @@ mod tests {
         };
 
         let c = calls.clone();
+        let resident_ls_unload = resident.clone();
         let ls_unload = move |Json(body): Json<Value>| {
             let c = c.clone();
+            let resident = resident_ls_unload.clone();
             async move {
                 c.lock()
                     .unwrap()
                     .push(("/api/v1/models/unload".into(), body.clone()));
+                if let Some(id) = body.get("instance_id").and_then(|v| v.as_str()) {
+                    resident.lock().unwrap().remove(id);
+                }
                 Json(json!({"instance_id": body["instance_id"]}))
             }
         };
 
+        let resident_ps = resident.clone();
+        let resident_native = resident.clone();
         let app = Router::new()
             .route(
                 "/api/tags",
@@ -1299,18 +1543,38 @@ mod tests {
             )
             .route(
                 "/api/ps",
-                get(|| async { Json(json!({"models": [{"name": "qwen2.5:7b"}]})) }),
+                get(move || async move {
+                    let resident = resident_ps.lock().unwrap();
+                    let models: Vec<Value> = resident
+                        .iter()
+                        .map(|(name, ctx)| json!({"name": name, "context_length": ctx}))
+                        .collect();
+                    Json(json!({ "models": models }))
+                }),
             )
             .route("/api/generate", post(generate))
             .route(
                 "/api/v1/models",
-                get(|| async {
-                    Json(json!({"models": [{
+                get(move || async move {
+                    let resident = resident_native.lock().unwrap();
+                    let mut models = vec![json!({
                         "key": "mock/qwen2-7b",
                         "id": "mock/qwen2-7b",
                         "display_name": "Mock Qwen2 7B",
                         "loaded_instances": [{"id": "mock/qwen2-7b-instance"}]
-                    }]}))
+                    })];
+                    if let Some(ctx) = resident.get("qwen2.5:7b") {
+                        models.push(json!({
+                            "key": "qwen2.5:7b",
+                            "id": "qwen2.5:7b",
+                            "display_name": "Qwen 2.5 7B",
+                            "loaded_instances": [{
+                                "id": "qwen2.5:7b",
+                                "config": {"context_length": ctx}
+                            }]
+                        }));
+                    }
+                    Json(json!({ "models": models }))
                 }),
             )
             .route("/api/v1/models/load", post(ls_load))
@@ -1328,7 +1592,7 @@ mod tests {
     async fn probe_detects_ollama_and_lmstudio() {
         let (url, _calls) = start_mock_backend().await;
         let client = reqwest::Client::new();
-        let probe = probe_backend(&client, &url).await;
+        let probe = probe_backend(&client, &url, &HashSet::new()).await;
 
         assert!(probe.is_online);
         // This mock speaks both Ollama and LM Studio -> Both + lmstudio flag
@@ -1337,8 +1601,12 @@ mod tests {
         assert!(probe.available_models.contains("llama3:latest"));
         assert!(probe.loaded_models.contains("qwen2.5:7b")); // from /api/ps
         assert!(probe.loaded_models.contains("mock/qwen2-7b-instance")); // native
-        assert_eq!(probe.native_models.len(), 1);
-        assert_eq!(probe.native_models[0].key, "mock/qwen2-7b");
+        assert_eq!(probe.native_models.len(), 2);
+        assert!(probe.native_models.iter().any(|m| m.key == "mock/qwen2-7b"));
+        assert_eq!(
+            probe.loaded_ctx.get("qwen2.5:7b"),
+            Some(&2048)
+        );
     }
 
     #[tokio::test]
@@ -1490,6 +1758,7 @@ mod tests {
             vec![url.clone()],
             30,
             86400,
+            60,
             "appconf.yaml".into(),
             Vec::new(),
         ));
@@ -1531,12 +1800,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_model_config_reloads_resident_model_with_wrong_ctx() {
+        let (url, calls) = start_mock_backend().await;
+        let state = Arc::new(AppState::new(
+            vec![url.clone()],
+            30,
+            86400,
+            60,
+            "appconf.yaml".into(),
+            Vec::new(),
+        ));
+        // Simulate a probed backend: model resident with context 2048 (the
+        // mock's /api/ps reports context_length), config wants 16384.
+        {
+            let mut backends = state.backends.lock().unwrap();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::Ollama;
+            backends[0]
+                .available_models
+                .insert("qwen2.5:7b".into());
+            backends[0].loaded_models.insert("qwen2.5:7b".into());
+            backends[0].loaded_ctx.insert("qwen2.5:7b".into(), 2048);
+        }
+        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+            name: "qwen2.5:7b".into(),
+            identifier: None,
+            max_ctx: Some(16384),
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends: Vec::new(),
+        });
+
+        assert_eq!(apply_model_config(&state), 1);
+
+        // Wait for the load op to finish and be recorded in history.
+        let mut ok = false;
+        for _ in 0..200 {
+            if state.control_history.lock().unwrap().back().is_some_and(|r| r.ok) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ok, "reload should succeed");
+
+        // Unload + reload with the configured context_length must have been
+        // sent (the mock speaks LM Studio native, so the control path is
+        // /api/v1/models/unload + /api/v1/models/load).
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(ep, b)| ep == "/api/v1/models/unload"
+                && b["instance_id"] == "qwen2.5:7b"),
+            "expected an unload call, got {:?}",
+            *calls
+        );
+        assert!(
+            calls.iter().any(|(ep, b)| ep == "/api/v1/models/load"
+                && b["model"] == "qwen2.5:7b"
+                && b["context_length"] == 16384),
+            "expected a reload with context_length 16384, got {:?}",
+            *calls
+        );
+    }
+
+    #[tokio::test]
     async fn apply_model_config_loads_missing_models() {
         let (url, calls) = start_mock_backend().await;
         let state = Arc::new(AppState::new(
             vec![url.clone()],
             30,
             86400,
+            60,
             "appconf.yaml".into(),
             Vec::new(),
         ));

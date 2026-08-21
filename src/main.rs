@@ -167,6 +167,7 @@ async fn main() {
         .load_keep_alive
         .or(file_cfg.settings.load_keep_alive)
         .unwrap_or(86400);
+    let stuck_timeout = file_cfg.settings.stuck_timeout.unwrap_or(60);
     let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
 
     let backend_urls: Vec<String> = args
@@ -220,6 +221,7 @@ async fn main() {
         backend_urls,
         timeout,
         load_keep_alive,
+        stuck_timeout,
         args.model_config.clone(),
         file_cfg.models,
     ));
