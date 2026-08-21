@@ -383,6 +383,19 @@ pub fn resolve_model_name(b: &BackendStatus, requested: &str) -> Option<String> 
     None
 }
 
+/// True when `name` resolves to a model that is already resident on backend
+/// `b`, per its latest probe (`loaded_models`: Ollama `/api/ps`, LM Studio
+/// loaded instances). Used when applying the model config so models still
+/// loaded from an earlier ollamaMQ run (long keep_alive) are not loaded
+/// twice. Unresolvable names return false — `start_model_control` reports
+/// those as errors instead.
+fn is_already_loaded(b: &BackendStatus, name: &str) -> bool {
+    match resolve_model_name(b, name) {
+        Some(canonical) => b.loaded_models.iter().any(|m| smart_model_match_one(&canonical, m)),
+        None => false,
+    }
+}
+
 /// Does this backend expose a model load/unload API?
 fn supports_control(b: &BackendStatus) -> bool {
     b.lmstudio || matches!(b.api_type, BackendApiType::Ollama | BackendApiType::Both)
@@ -408,10 +421,13 @@ fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usi
     }
 }
 
-/// Apply the current `appconf.yaml` contents: start loads for every model
-/// entry on its target backends. Loads for the same backend run
-/// sequentially (the backend rejects parallel control ops); different
-/// backends proceed in parallel. Returns the number of loads started.
+/// Apply the current `appconf.yaml` contents: start a load for every model
+/// entry on its target backends, except models that are already resident
+/// there — each endpoint is checked live first, so models still loaded from
+/// an earlier ollamaMQ run (long keep_alive) are skipped instead of being
+/// loaded twice. Loads for the same backend run sequentially (the backend
+/// rejects parallel control ops); different backends proceed in parallel.
+/// Returns the number of entries applied.
 pub fn apply_model_config(state: &Arc<AppState>) -> usize {
     let configs = state.model_config.lock().unwrap().clone();
     if configs.is_empty() {
@@ -437,6 +453,55 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                 while st.control_ops.lock().unwrap().contains_key(&backend_idx) {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
+
+                // Check the endpoint live (the health loop only ticks every 10 s,
+                // and a just-finished op's re-probe may still be in flight): if
+                // the model is already resident — e.g. loaded by a previous
+                // ollamaMQ run with long keep_alive — skip it instead of loading
+                // it twice.
+                let url = st
+                    .backends
+                    .lock()
+                    .unwrap()
+                    .get(backend_idx)
+                    .map(|b| b.url.clone())
+                    .unwrap_or_default();
+                if !url.is_empty() {
+                    let probe = probe_backend(&st.client, &url).await;
+                    let mut backends = st.backends.lock().unwrap();
+                    if let Some(b) = backends.get_mut(backend_idx) {
+                        b.is_online = probe.is_online;
+                        b.api_type = probe.api_type;
+                        b.available_models = probe.available_models;
+                        b.loaded_models = probe.loaded_models;
+                        b.lmstudio = probe.lmstudio;
+                        b.native_models = probe.native_models;
+                    }
+                }
+
+                let skip = st
+                    .backends
+                    .lock()
+                    .unwrap()
+                    .get(backend_idx)
+                    .filter(|b| b.is_online)
+                    .is_some_and(|b| is_already_loaded(b, &cfg.name));
+                if skip {
+                    info!("load '{}' skipped: already loaded on {}", cfg.name, url);
+                    st.log_event(crate::dispatcher::LogEvent {
+                        at: std::time::SystemTime::now(),
+                        dir: "CTL",
+                        user: "-".into(),
+                        model: Some(cfg.name.clone()),
+                        backend: None,
+                        info: format!(
+                            "load '{}' skipped: already loaded on {}",
+                            cfg.name, url
+                        ),
+                    });
+                    continue;
+                }
+
                 let options = LoadOptions {
                     num_ctx: cfg.max_ctx,
                     keep_alive: cfg.keep_alive,
@@ -867,6 +932,10 @@ pub fn start_model_control(
                 }
             }
         }
+
+        // Wake the dispatcher: the backend is no longer control-busy and the
+        // requested model may now be loaded/available.
+        state.notify.notify_one();
     });
 
     Ok(canonical)
@@ -1386,5 +1455,126 @@ mod tests {
             assert_eq!(calls[2].0, "/api/v1/models/unload");
             assert_eq!(calls[2].1["instance_id"], "cached-instance");
         }
+    }
+
+    #[test]
+    fn already_loaded_resident_model() {
+        let b = test_backend(
+            BackendApiType::Ollama,
+            false,
+            &["llama3:latest", "qwen2.5:7b"],
+            &["qwen2.5:7b"],
+        );
+        assert!(is_already_loaded(&b, "qwen2.5:7b"));
+        // Smart match: tag/case variations of the resident model count too
+        assert!(is_already_loaded(&b, "QWEN2.5"));
+        assert!(!is_already_loaded(&b, "llama3")); // available but not resident
+        assert!(!is_already_loaded(&b, "nope"));  // unresolvable -> false (error path)
+    }
+
+    #[test]
+    fn already_loaded_lmstudio_instance() {
+        let b = test_backend(
+            BackendApiType::OpenAi,
+            true,
+            &["mock/qwen2-7b"],
+            &["mock/qwen2-7b", "mock/qwen2-7b-instance"],
+        );
+        assert!(is_already_loaded(&b, "mock/qwen2-7b"));
+    }
+
+    #[tokio::test]
+    async fn apply_model_config_skips_resident_models() {
+        let (url, calls) = start_mock_backend().await;
+        let state = Arc::new(AppState::new(
+            vec![url.clone()],
+            30,
+            86400,
+            "appconf.yaml".into(),
+            Vec::new(),
+        ));
+        // Simulate a probed backend: model available AND resident.
+        {
+            let mut backends = state.backends.lock().unwrap();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::Ollama;
+            backends[0]
+                .available_models
+                .insert("qwen2.5:7b".into());
+            backends[0].loaded_models.insert("qwen2.5:7b".into());
+        }
+        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+            name: "qwen2.5:7b".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends: Vec::new(),
+        });
+
+        assert_eq!(apply_model_config(&state), 1);
+
+        // Wait for the skip event to land in the log ring.
+        let mut info = String::new();
+        for _ in 0..200 {
+            if let Some(ev) = state.logs.lock().unwrap().iter().find(|e| e.dir == "CTL") {
+                info = ev.info.clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(info.contains("skipped"), "expected a skip event, got: {}", info);
+
+        // No load request may have hit the backend.
+        let calls = calls.lock().unwrap();
+        assert!(calls.is_empty(), "no control call expected, got {:?}", calls);
+    }
+
+    #[tokio::test]
+    async fn apply_model_config_loads_missing_models() {
+        let (url, calls) = start_mock_backend().await;
+        let state = Arc::new(AppState::new(
+            vec![url.clone()],
+            30,
+            86400,
+            "appconf.yaml".into(),
+            Vec::new(),
+        ));
+        // llama3 is available but NOT resident (mock /api/ps lists only qwen2.5:7b).
+        {
+            let mut backends = state.backends.lock().unwrap();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::Ollama;
+            backends[0]
+                .available_models
+                .insert("llama3:latest".into());
+        }
+        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+            name: "llama3".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends: Vec::new(),
+        });
+
+        apply_model_config(&state);
+
+        // Wait for the load op to finish and be recorded in history.
+        let mut ok = false;
+        for _ in 0..200 {
+            if state.control_history.lock().unwrap().back().is_some_and(|r| r.ok) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ok, "load should succeed");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // The mock speaks both Ollama and LM Studio, so the load may go out on
+        // either path — what matters is exactly one load for the canonical name.
+        assert_eq!(calls[0].1["model"], "llama3:latest"); // smart-matched canonical name
     }
 }

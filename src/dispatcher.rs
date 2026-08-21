@@ -37,6 +37,9 @@ pub struct Task {
     pub body: Bytes,
     pub responder: mpsc::Sender<ResponsePart>,
     pub requested_model: Option<String>,
+    /// Set once a "no backend available" warning has been logged for this
+    /// task, so stuck requests are visible without spamming the log.
+    pub stuck_warned: bool,
 }
 
 /// Which API flavours this backend speaks.
@@ -331,6 +334,28 @@ fn smart_model_match(requested: &str, available: &HashSet<String>) -> bool {
         .any(|m| smart_model_match_one(requested, m))
 }
 
+/// Relaxed routing match used by the scheduler as a fallback when no backend
+/// has an exact/tag-normalized id for the requested model. Clients often send
+/// short names (`qwen3.8-27b`) while servers list publisher-qualified or
+/// quantization-suffixed ids (`qwen/qwen3.8-27b`, `x@q8_0`). Mirrors the
+/// substring step of `control::resolve_model_name`.
+pub fn fuzzy_model_match(requested: &str, available: &HashSet<String>) -> bool {
+    let req_low = requested.to_lowercase();
+    let req_base = req_low.split(':').next().unwrap_or(&req_low);
+    available.iter().any(|m| {
+        let m_low = m.to_lowercase();
+        let m_base = m_low.split(':').next().unwrap_or(&m_low);
+        m_low.contains(&req_low)
+            || m_low.contains(req_base)
+            || req_base.contains(&m_base)
+    })
+}
+
+/// Scheduler-side routability check: strict first, fuzzy fallback.
+fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
+    smart_model_match(requested, available) || fuzzy_model_match(requested, available)
+}
+
 pub async fn run_worker(state: Arc<AppState>) {
     let client = state.client.clone();
     let mut current_idx = 0;
@@ -353,6 +378,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 let probe = crate::control::probe_backend(&health_client, &url).await;
 
                 let mut backends = health_state.backends.lock().unwrap();
+                let mut changed = false;
                 if backends[idx].is_online != probe.is_online {
                     info!(
                         "Backend {} status changed to: {}",
@@ -360,6 +386,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         if probe.is_online { "ONLINE" } else { "OFFLINE" }
                     );
                     backends[idx].is_online = probe.is_online;
+                    changed = true;
                 }
                 if backends[idx].api_type != probe.api_type {
                     info!(
@@ -368,11 +395,25 @@ pub async fn run_worker(state: Arc<AppState>) {
                         probe.api_type.display()
                     );
                     backends[idx].api_type = probe.api_type;
+                    changed = true;
+                }
+                if backends[idx].available_models != probe.available_models
+                    || backends[idx].loaded_models != probe.loaded_models
+                {
+                    changed = true;
                 }
                 backends[idx].available_models = probe.available_models;
                 backends[idx].loaded_models = probe.loaded_models;
                 backends[idx].lmstudio = probe.lmstudio;
                 backends[idx].native_models = probe.native_models;
+
+                // Wake the dispatcher if anything relevant to scheduling
+                // changed (model finished loading, backend came online, etc.)
+                // so queued requests are re-evaluated immediately.
+                if changed {
+                    drop(backends);
+                    health_state.notify.notify_one();
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
@@ -420,109 +461,132 @@ pub async fn run_worker(state: Arc<AppState>) {
                     a_total.cmp(&b_total).then_with(|| a.cmp(b))
                 });
 
-                let mut target_user = None;
+                // Build candidate order: VIP first, then boost on every other
+                // turn, then fair-share round-robin over the rest.
+                let mut candidates: Vec<String> = Vec::new();
                 if let Some(ref v) = vip {
                     if active_users.contains(v) {
-                        target_user = Some(v.clone());
+                        candidates.push(v.clone());
                     }
                 }
-                if target_user.is_none() {
+                if *counter % 2 == 0 {
                     if let Some(ref b) = boost {
-                        if active_users.contains(b) && *counter % 2 == 0 {
-                            target_user = Some(b.clone());
+                        if active_users.contains(b) && !candidates.contains(b) {
+                            candidates.push(b.clone());
                         }
                     }
                 }
-                if target_user.is_none() {
-                    if current_idx >= active_users.len() {
-                        current_idx = 0;
-                    }
-                    target_user = Some(active_users[current_idx].clone());
-                    current_idx += 1;
+                if current_idx >= active_users.len() {
+                    current_idx = 0;
+                }
+                let rest: Vec<String> = active_users
+                    .iter()
+                    .filter(|u| !candidates.contains(u))
+                    .cloned()
+                    .collect();
+                current_idx += 1;
+                if !rest.is_empty() {
+                    let start = current_idx % rest.len();
+                    candidates.extend(rest[start..].iter().cloned());
+                    candidates.extend(rest[..start].iter().cloned());
                 }
 
-                // Peek at front task to determine required API family
-                if let Some(ref user_id) = target_user {
-                    let task_ref = queues.get(user_id).unwrap().front().unwrap();
-                    let api_family = detect_api_family(&task_ref.path);
-                    debug!(
-                        "Request for user {}: path={} family={:?}",
-                        user_id, task_ref.path, api_family
-                    );
+                // Try users in candidate order. Within a user's queue, pick
+                // the FIRST routable task (not just the front) so an
+                // unroutable request — e.g. an Ollama-family call with every
+                // Ollama backend offline — can't starve everything behind it.
+                let mut selection: Option<(String, Task, usize, String)> = None;
+                'users: for user_id in &candidates {
+                    let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
+                    for pos in 0..queue_len {
+                        let task_ref = match queues.get(user_id).and_then(|q| q.get(pos)) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        let api_family = detect_api_family(&task_ref.path);
+                        debug!(
+                            "Request for user {}: pos={} path={} family={:?}",
+                            user_id, pos, task_ref.path, api_family
+                        );
 
-                    // Find eligible backends: online, not busy, and support the required API + Model
-                    let eligible_indices: Vec<usize> = backends.iter()
-                        .enumerate()
-                        .filter(|(i, b)| {
-                            let online = b.is_online;
-                            let free = b.active_requests < 1;
-                            let no_op = !control_busy.contains(i);
-                            if !online || !free || !no_op {
-                                debug!(
-                                    "Backend {} rejected: online={}, active={}, control_op={}",
-                                    b.url, online, b.active_requests, !no_op
-                                );
-                            }
-                            online && free && no_op
-                        })
-                        .filter(|(_, b)| {
-                            // If a specific model is requested, backend MUST have it.
-                            // If no model is requested, fall back to API family check.
-                            let supported = if let Some(ref model) = task_ref.requested_model {
-                                let has_model = smart_model_match(model, &b.available_models);
-                                if !has_model {
-                                    debug!("Backend {} rejected: model '{}' not found. Available: {:?}", b.url, model, b.available_models);
+                        // Find eligible backends: online, not busy, and support the required API + Model
+                        let eligible_indices: Vec<usize> = backends.iter()
+                            .enumerate()
+                            .filter(|(i, b)| {
+                                let online = b.is_online;
+                                let free = b.active_requests < 1;
+                                let no_op = !control_busy.contains(i);
+                                if !online || !free || !no_op {
+                                    debug!(
+                                        "Backend {} rejected: online={}, active={}, control_op={}",
+                                        b.url, online, b.active_requests, !no_op
+                                    );
                                 }
-                                has_model
-                            } else {
-                                // Unknown type backends are allowed (health check will classify them)
-                                let family_supported = matches!(b.api_type, BackendApiType::Unknown | BackendApiType::Both)
-                                    || b.api_type.supports(api_family);
-                                if !family_supported {
-                                    debug!("Backend {} rejected: api_family {:?} not supported by {:?}", b.url, api_family, b.api_type);
-                                }
-                                family_supported
-                            };
-                            supported
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-
-                    // Prefer backends where the requested model is already loaded in GPU memory
-                    // (LM Studio: loaded_instances; Ollama: /api/ps). available_models stays the
-                    // HARD requirement; loaded_models is only a PREFERENCE among eligible backends.
-                    // If no eligible backend has it loaded, fall back to the full available set
-                    // so on-demand loading still works.
-                    let eligible_indices = if let Some(ref model) = task_ref.requested_model {
-                        let loaded_eligible: Vec<usize> = eligible_indices
-                            .iter()
-                            .cloned()
-                            .filter(|&i| smart_model_match(model, &backends[i].loaded_models))
+                                online && free && no_op
+                            })
+                            .filter(|(_, b)| {
+                                // If a specific model is requested, backend MUST have it.
+                                // If no model is requested, fall back to API family check.
+                                let supported = if let Some(ref model) = task_ref.requested_model {
+                                    let has_model = model_routable(model, &b.available_models);
+                                    if !has_model {
+                                        debug!("Backend {} rejected: model '{}' not found. Available: {:?}", b.url, model, b.available_models);
+                                    }
+                                    has_model
+                                } else {
+                                    // Unknown type backends are allowed (health check will classify them)
+                                    let family_supported = matches!(b.api_type, BackendApiType::Unknown | BackendApiType::Both)
+                                        || b.api_type.supports(api_family);
+                                    if !family_supported {
+                                        debug!("Backend {} rejected: api_family {:?} not supported by {:?}", b.url, api_family, b.api_type);
+                                    }
+                                    family_supported
+                                };
+                                supported
+                            })
+                            .map(|(i, _)| i)
                             .collect();
-                        if loaded_eligible.is_empty() {
-                            eligible_indices
-                        } else {
-                            loaded_eligible
-                        }
-                    } else {
-                        eligible_indices
-                    };
 
-                    if eligible_indices.is_empty() {
-                        if let Some(ref model) = task_ref.requested_model {
-                            warn!(
-                                "No backend available for model '{}' for user {}. Request stuck in queue.",
-                                model, user_id
-                            );
+                        // Prefer backends where the requested model is already loaded in GPU memory
+                        // (LM Studio: loaded_instances; Ollama: /api/ps). available_models stays the
+                        // HARD requirement; loaded_models is only a PREFERENCE among eligible backends.
+                        // If no eligible backend has it loaded, fall back to the full available set
+                        // so on-demand loading still works.
+                        let eligible_indices = if let Some(ref model) = task_ref.requested_model {
+                            let loaded_eligible: Vec<usize> = eligible_indices
+                                .iter()
+                                .cloned()
+                                .filter(|&i| model_routable(model, &backends[i].loaded_models))
+                                .collect();
+                            if loaded_eligible.is_empty() {
+                                eligible_indices
+                            } else {
+                                loaded_eligible
+                            }
                         } else {
-                            warn!(
-                                "No backend available for API family {:?} for user {}. Request stuck in queue.",
-                                api_family, user_id
-                            );
+                            eligible_indices
+                        };
+
+                        if eligible_indices.is_empty() {
+                            if !task_ref.stuck_warned {
+                                warn!(
+                                    "No backend available for {} {} (model: {}, family: {:?}) for user {}; request parked in queue",
+                                    task_ref.method,
+                                    task_ref.path,
+                                    task_ref.requested_model.as_deref().unwrap_or("-"),
+                                    api_family,
+                                    user_id
+                                );
+                                if let Some(task_mut) =
+                                    queues.get_mut(user_id).and_then(|q| q.get_mut(pos))
+                                {
+                                    task_mut.stuck_warned = true;
+                                }
+                            }
+                            continue;
                         }
-                        None
-                    } else {
-                        let task = queues.get_mut(user_id).unwrap().pop_front().unwrap();
+
+                        let task = queues.get_mut(user_id).unwrap().remove(pos).unwrap();
                         *counter += 1;
 
                         // Round-Robin among eligible backends with min connections
@@ -531,29 +595,32 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .map(|&i| backends[i].active_requests)
                             .min()
                             .unwrap();
-                        let candidates: Vec<usize> = eligible_indices
+                        let candidates_backends: Vec<usize> = eligible_indices
                             .iter()
                             .cloned()
                             .filter(|&i| backends[i].active_requests == min_conns)
                             .collect();
-                        let candidate_pos =
-                            candidates.iter().position(|&i| i > *last_idx).unwrap_or(0);
-                        let selected_backend_idx = candidates[candidate_pos];
+                        let candidate_pos = candidates_backends
+                            .iter()
+                            .position(|&i| i > *last_idx)
+                            .unwrap_or(0);
+                        let selected_backend_idx = candidates_backends[candidate_pos];
 
                         *last_idx = selected_backend_idx;
                         backends[selected_backend_idx].active_requests += 1;
                         backends[selected_backend_idx].current_model = task.requested_model.clone();
 
-                        Some((
+                        selection = Some((
                             user_id.clone(),
                             task,
                             selected_backend_idx,
                             backends[selected_backend_idx].url.clone(),
-                        ))
+                        ));
+                        break 'users;
                     }
-                } else {
-                    None
                 }
+
+                selection
             }
         };
 
@@ -742,6 +809,7 @@ pub async fn proxy_handler(
         None
     };
 
+    let task_method = method.as_str().to_string();
     let task = Task {
         path: path.clone(),
         method,
@@ -749,6 +817,7 @@ pub async fn proxy_handler(
         responder: tx,
         body,
         requested_model: requested_model.clone(),
+        stuck_warned: false,
     };
 
     {
@@ -765,7 +834,7 @@ pub async fn proxy_handler(
         user: user_id.clone(),
         model: requested_model.clone(),
         backend: None,
-        info: "queued".into(),
+        info: format!("queued {} {}", task_method, path),
     });
 
     state.notify.notify_one();
@@ -794,5 +863,49 @@ pub async fn proxy_handler(
             "Worker failed to respond",
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn smart_match_exact_and_tag() {
+        let avail = set(&["qwen3.8-27b:latest", "llama3"]);
+        assert!(smart_model_match("qwen3.8-27b", &avail));
+        assert!(smart_model_match("llama3:latest", &avail));
+        assert!(!smart_model_match("mistral", &avail));
+    }
+
+    #[test]
+    fn fuzzy_matches_publisher_and_quant_suffixed_ids() {
+        // Client asks "qwen3.8-27b", server lists publisher/quant variants.
+        let avail = set(&[
+            "ovisocr2@q8_0",
+            "unsloth/qwen3.8-27b@q8_0",
+            "qwen/qwen3.8-27b",
+            "huihui-qwen3.8-27b-abliterated",
+        ]);
+        assert!(fuzzy_model_match("qwen3.8-27b", &avail));
+        assert!(model_routable("qwen3.8-27b", &avail));
+    }
+
+    #[test]
+    fn fuzzy_does_not_match_unrelated_models() {
+        let avail = set(&["llama3:latest", "mistral-7b", "text-embedding-nomic"]);
+        assert!(!fuzzy_model_match("qwen3.8-27b", &avail));
+        assert!(!model_routable("qwen3.8-27b", &avail));
+    }
+
+    #[test]
+    fn strict_match_preferred_over_fuzzy() {
+        // model_routable stays true for exact ids even when fuzzy also would
+        let avail = set(&["qwen/qwen3.8-27b", "unsloth/qwen3.8-27b@q8_0"]);
+        assert!(model_routable("unsloth/qwen3.8-27b@q8_0", &avail));
     }
 }

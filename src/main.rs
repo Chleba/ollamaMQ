@@ -250,7 +250,7 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             let n = control::apply_model_config(&st);
-            info!("Applied model config: {} load(s) started", n);
+            info!("Model config applied ({} entries)", n);
         });
     }
 

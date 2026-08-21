@@ -9,9 +9,11 @@
 #     override `settings`
 #
 # The models section is applied automatically at startup (once backends are
-# probed) and whenever you press 'r' in the TUI. Applying is additive: it
-# loads models that are missing from their target backends — it never
-# unloads anything.
+# probed) and whenever you press 'r' in the TUI. Applying is additive: each
+# endpoint is checked live first, so models that are already resident on a
+# target backend — e.g. still loaded from an earlier run because of long
+# keep_alive — are skipped instead of being loaded twice. It never unloads
+# anything.
 
 # --- Backends ollamaMQ connects to (same as --backend-urls) -----------------
 backends:

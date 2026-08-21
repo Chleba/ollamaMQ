@@ -251,7 +251,7 @@ models:
 
 **Precedence:** CLI flags always win when explicitly given (`--backend-urls` over `backends`, `--port`/`--host`/`--timeout`/`--load-keep-alive`/`--allow-all-routes` over `settings`). See `appconf.yaml.example` for a fully commented template.
 
-The `models` section is applied automatically at startup (once backend probes have run) and can be re-read and re-applied at any time with **`r`** in the TUI (backends/settings are only read at startup). Applying is additive: it loads models that are missing from their target backends — it never unloads anything else. Loads for the same backend run one at a time (backends reject parallel control ops). Every load attempt is reported in the TUI Logs panel (`⟳ CTL` lines) and in the log output.
+The `models` section is applied automatically at startup (once backend probes have run) and can be re-read and re-applied at any time with **`r`** in the TUI (backends/settings are only read at startup). Applying is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models that are already resident there — e.g. still loaded from an earlier ollamaMQ run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything. Loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL` lines) and in the log output.
 
 ### Dashboard Controls
 
