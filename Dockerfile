@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:alpine AS builder
+FROM rust:1.97-alpine AS builder
 
 # Add dependencies for building
 RUN apk add --no-cache musl-dev llvm-dev clang pkgconfig openssl-dev

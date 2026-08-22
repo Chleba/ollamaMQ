@@ -372,11 +372,21 @@ services:
     ports:
       - "11435:11435"
     environment:
-      - OLLAMA_URLS=http://host.docker.internal:11434
+      # URLs of backend servers (Ollama, LM Studio, etc.)
+      - BACKEND_URLS=http://host.docker.internal:11434,http://host.docker.internal:1234
       - PORT=11435
+      - TIMEOUT=300
+      - RUST_LOG=info
+    command: ["--no-tui"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:11435/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 ```
 
 **Note for Linux Users:**
@@ -390,14 +400,15 @@ When running in Docker on Linux to access a host-based Ollama:
 
 The Dockerfile uses a multi-stage build:
 
-- **Build stage**: Uses `rust:1.85-alpine` to compile the release binary
+- **Build stage**: Uses `rust:1.97-alpine` (pinned) to compile the release binary
 - **Runtime stage**: Uses `alpine:3.20` with only `ca-certificates` for a minimal footprint (~10MB)
 
 ### Environment Variables
 
-| Variable      | Description                    | Default                  |
-| ------------- | ------------------------------ | ------------------------ |
-| `OLLAMA_URLS` | URLs of the Ollama servers     | `http://localhost:11434` |
+| Variable       | Description                                        | Default                  |
+| -------------- | -------------------------------------------------- | ------------------------ |
+| `BACKEND_URLS` | URLs of the backend servers (Ollama, LM Studio, …) | `http://localhost:11434` |
+| `OLLAMA_URLS`  | Legacy alias for `BACKEND_URLS` (used only when `BACKEND_URLS` is unset) | — |
 | `PORT`        | Port for ollamaMQ to listen on | `11435`                  |
 | `HOST`        | Host/interface to bind to      | `0.0.0.0`                |
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
@@ -439,7 +450,7 @@ docker run -d --name ollamamq -p 11435:11435 \
   chlebon/ollamamq
 ```
 
-### Connecting to Different Ollama Servers
+### Connecting to Different Backend Servers
 
 #### Local Ollama (on host machine)
 
@@ -447,7 +458,7 @@ docker run -d --name ollamamq -p 11435:11435 \
 docker run -d \
   --name ollamamq \
   -p 11435:11435 \
-  -e OLLAMA_URLS=http://host.docker.internal:11434 \
+  -e BACKEND_URLS=http://host.docker.internal:11434 \
   chlebon/ollamamq
 ```
 
@@ -457,7 +468,7 @@ docker run -d \
 docker run -d \
   --name ollamamq \
   -p 11435:11435 \
-  -e OLLAMA_URLS=https://ollama.example.com:11434 \
+  -e BACKEND_URLS=https://ollama.example.com:11434 \
   chlebon/ollamamq
 ```
 
@@ -467,7 +478,7 @@ docker run -d \
 docker run -d \
   --name ollamamq \
   -p 8080:8080 \
-  -e OLLAMA_URLS=http://host.docker.internal:11436 \
+  -e BACKEND_URLS=http://host.docker.internal:11436 \
   -e PORT=8080 \
   chlebon/ollamamq
 ```
@@ -479,7 +490,7 @@ docker run -d \
   --name ollamamq \
   --network ollama-network \
   -p 11435:11435 \
-  -e OLLAMA_URLS=http://ollama:11434 \
+  -e BACKEND_URLS=http://ollama:11434 \
   chlebon/ollamamq
 ```
 
