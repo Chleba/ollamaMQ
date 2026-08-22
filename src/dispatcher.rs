@@ -362,38 +362,43 @@ pub fn smart_model_match_one(requested: &str, model: &str) -> bool {
     requested_no_tag == model_no_tag
 }
 
-fn smart_model_match(requested: &str, available: &HashSet<String>) -> bool {
-    // 1. Exact match
-    if available.contains(requested) {
-        return true;
+/// Bounded normalization for model-name comparison: lowercase, drop the
+/// `:tag` suffix and any LM Studio-style `@quant` suffix.
+fn normalize_model_id(id: &str) -> String {
+    let low = id.to_lowercase();
+    let no_tag = low.split(':').next().unwrap_or(&low);
+    no_tag.split('@').next().unwrap_or(no_tag).to_string()
+}
+
+/// Publisher-agnostic part of a normalized id (`owner/model` -> `model`).
+fn model_base(id: &str) -> String {
+    let n = normalize_model_id(id);
+    match n.rsplit_once('/') {
+        Some((_, m)) => m.to_string(),
+        None => n,
     }
-
-    // 2. Normalized match (handle :latest and case sensitivity)
-    available
-        .iter()
-        .any(|m| smart_model_match_one(requested, m))
 }
 
-/// Relaxed routing match used by the scheduler as a fallback when no backend
-/// has an exact/tag-normalized id for the requested model. Clients often send
-/// short names (`qwen3.8-27b`) while servers list publisher-qualified or
-/// quantization-suffixed ids (`qwen/qwen3.8-27b`, `x@q8_0`). Mirrors the
-/// substring step of `control::resolve_model_name`.
-pub fn fuzzy_model_match(requested: &str, available: &HashSet<String>) -> bool {
-    let req_low = requested.to_lowercase();
-    let req_base = req_low.split(':').next().unwrap_or(&req_low);
-    available.iter().any(|m| {
-        let m_low = m.to_lowercase();
-        let m_base = m_low.split(':').next().unwrap_or(&m_low);
-        m_low.contains(&req_low)
-            || m_low.contains(req_base)
-            || req_base.contains(&m_base)
-    })
-}
-
-/// Scheduler-side routability check: strict first, fuzzy fallback.
+/// Scheduler-side routability check. Deterministic and bounded — no arbitrary
+/// substring matching (which could route `qwen3.8-27b` to an unrelated
+/// `huihui-qwen3.8-27b-abliterated`). A backend is eligible when any listed id:
+/// - equals the request after tag/case normalization (`smart_model_match_one`), or
+/// - equals it after full normalization (handles `@quant` suffixes on either side), or,
+/// - for bare requested names only — equals its publisher-stripped base, so a
+///   client asking `llama3` can reach `meta-llama/llama3:latest`.
+///
+/// Owner-prefixed requests are strict: the backend must list that exact id up to
+/// tag/quant normalization.
 fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
-    smart_model_match(requested, available) || fuzzy_model_match(requested, available)
+    let req_norm = normalize_model_id(requested);
+    // Bare names may match across publishers; owner-prefixed ones are strict.
+    let req_base = if requested.contains('/') { None } else { Some(model_base(requested)) };
+    available.iter().any(|m| {
+        if smart_model_match_one(requested, m) || normalize_model_id(m) == req_norm {
+            return true;
+        }
+        matches!(req_base.as_deref(), Some(rb) if rb == model_base(m))
+    })
 }
 
 /// True when the backend can speak the request's API dialect. Unknown-type
@@ -1145,38 +1150,58 @@ mod tests {
     }
 
     #[test]
-    fn smart_match_exact_and_tag() {
-        let avail = set(&["qwen3.8-27b:latest", "llama3"]);
-        assert!(smart_model_match("qwen3.8-27b", &avail));
-        assert!(smart_model_match("llama3:latest", &avail));
-        assert!(!smart_model_match("mistral", &avail));
+    fn pair_matching_handles_tags_and_case() {
+        // Case-insensitive, tag-stripped — but publisher-strict at pair level;
+        // cross-publisher matching happens in model_routable via base compare.
+        assert!(smart_model_match_one("qwen3.8-27b", "QWEN3.8-27B"));
+        assert!(smart_model_match_one("llama3:latest", "llama3"));
+        assert!(!smart_model_match_one("mistral", "llama3:latest"));
     }
 
     #[test]
-    fn fuzzy_matches_publisher_and_quant_suffixed_ids() {
-        // Client asks "qwen3.8-27b", server lists publisher/quant variants.
-        let avail = set(&[
-            "ovisocr2@q8_0",
+    fn normalized_matching_strips_owner_and_quant() {
+        // Client asks "qwen3.8-27b"; server lists publisher/quant variants of it.
+        assert!(model_routable("qwen3.8-27b", &set(&["unsloth/qwen3.8-27b@q8_0"])));
+        assert!(model_routable("qwen3.8-27b", &set(&["qwen/qwen3.8-27b"])));
+        // Quant suffixes on either side are normalized away (same model family).
+        assert!(model_routable(
             "unsloth/qwen3.8-27b@q8_0",
-            "qwen/qwen3.8-27b",
+            &set(&["unsloth/qwen3.8-27b@q4_k_m"])
+        ));
+    }
+
+    #[test]
+    fn matching_rejects_substring_lookalikes() {
+        // No arbitrary substring matching: these share name fragments but are
+        // different models and must NOT be routable for "qwen3.8-27b".
+        let lookalikes = set(&[
             "huihui-qwen3.8-27b-abliterated",
+            "ovisocr2@q8_0",
+            "llama3:latest",
+            "mistral-7b",
+            "text-embedding-nomic",
         ]);
-        assert!(fuzzy_model_match("qwen3.8-27b", &avail));
-        assert!(model_routable("qwen3.8-27b", &avail));
+        assert!(!model_routable("qwen3.8-27b", &lookalikes));
     }
 
     #[test]
-    fn fuzzy_does_not_match_unrelated_models() {
-        let avail = set(&["llama3:latest", "mistral-7b", "text-embedding-nomic"]);
-        assert!(!fuzzy_model_match("qwen3.8-27b", &avail));
-        assert!(!model_routable("qwen3.8-27b", &avail));
-    }
-
-    #[test]
-    fn strict_match_preferred_over_fuzzy() {
-        // model_routable stays true for exact ids even when fuzzy also would
+    fn owner_prefixed_requests_are_strict() {
+        // A request that names a publisher must reach a backend listing that
+        // exact id (up to tag/quant normalization), not just the same base name.
         let avail = set(&["qwen/qwen3.8-27b", "unsloth/qwen3.8-27b@q8_0"]);
         assert!(model_routable("unsloth/qwen3.8-27b@q8_0", &avail));
+        assert!(!model_routable(
+            "unsloth/qwen3.8-27b@q4_k_m",
+            &set(&["qwen/qwen3.8-27b"])
+        ));
+    }
+
+    #[test]
+    fn bare_names_match_across_publishers() {
+        // "llama3" reaches meta-llama/llama3:latest (publisher stripped), but a
+        // different base name does not match on prefix alone.
+        assert!(model_routable("llama3", &set(&["meta-llama/llama3:latest"])));
+        assert!(!model_routable("llama3", &set(&["meta-llama/llama3.1:latest"])));
     }
 
     fn backend_with(api_type: BackendApiType, rejected: &[ApiFamily]) -> BackendStatus {

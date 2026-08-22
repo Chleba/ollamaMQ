@@ -9,7 +9,7 @@
 ## 🚀 Features
 
 - **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama or LM Studio instances using a **Least Connections + Round Robin** strategy. Automatically detects backend API type (Ollama `/api/*` vs OpenAI `/v1/*`) and routes each request only to a compatible backend — even when a specific model is requested, so an Ollama-family call never reaches an LM Studio server that merely lists the same model.
-- **Model-Aware Routing**: Automatically identifies the requested model from the request body and routes the request only to backends that have that specific model loaded. This prevents 404 errors when different models are distributed across multiple backends.
+- **Model-Aware Routing**: Automatically identifies the requested model from the request body and routes the request only to backends that have that specific model loaded. This prevents 404 errors when different models are distributed across multiple backends. Name matching is deterministic and bounded — exact, `:tag`/case-insensitive, or publisher-/quant-suffixed variants of the same id (`qwen3.8-27b` reaches `unsloth/qwen3.8-27b@q8_0`) — but never arbitrary substrings (so it will not be routed to an unrelated `...-abliterated` build).
 - **Smart Model Matching**: Robust matching that handles common variations like `:latest` tags and case-insensitivity. For example, a request for `llama3` will correctly match `llama3:latest` on the backend.
 - **Model Control**: Load and unload models on connected backends (Ollama and LM Studio 0.3.6+) directly from the TUI (`L`/`U`) or the admin HTTP API — without touching the backend servers themselves.
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
@@ -183,7 +183,7 @@ Body:
 - a **URL** (exact or substring match), or
 - `"any"` — the proxy picks a suitable online, idle backend (for load: the first backend where the model resolves; for unload: the first backend that actually has it loaded).
 
-`model` uses the same smart matching as request routing: exact match, then `:latest`/case-insensitive, then a *unique* substring. Ambiguous names are rejected — the proxy never guesses.
+`model` is resolved against each backend's model list: exact match, then `:latest`/case-insensitive, then a *unique* substring (admin ops only). Ambiguous names are rejected — the proxy never guesses.
 
 Optional fields (load only):
 
