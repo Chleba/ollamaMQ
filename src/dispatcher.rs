@@ -396,6 +396,87 @@ fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
     smart_model_match(requested, available) || fuzzy_model_match(requested, available)
 }
 
+/// True when the backend can speak the request's API dialect. Unknown-type
+/// backends are allowed until the health check classifies them; families this
+/// backend has been observed rejecting in real traffic (see
+/// `apply_family_learning`) are excluded until a request of that family
+/// succeeds or the backend restarts.
+fn family_compatible(b: &BackendStatus, family: ApiFamily) -> bool {
+    if b.rejected_families.contains(&family) {
+        return false;
+    }
+    matches!(b.api_type, BackendApiType::Unknown | BackendApiType::Both)
+        || b.api_type.supports(family)
+}
+
+/// Heuristic: did this response reject the request's API *dialect* (as opposed
+/// to a normal application error like model-not-found)? Conservative on purpose
+/// — only structural endpoint/method rejections count, so ordinary errors never
+/// poison the scheduler.
+fn is_endpoint_rejection(status: StatusCode, body_prefix: &str) -> bool {
+    // 405 Method Not Allowed is always structural.
+    if status.as_u16() == 405 {
+        return true;
+    }
+    let text = body_prefix.trim();
+    if !text.starts_with('{') {
+        return false;
+    }
+    // Prefer a full JSON parse (error bodies are small); fall back to a raw
+    // substring scan when the prefix is truncated mid-JSON.
+    let error_text = match serde_json::from_str::<serde_json::Value>(text).ok() {
+        Some(v) => v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_lowercase)
+            .unwrap_or_default(),
+        None => text.to_lowercase(),
+    };
+    if error_text.is_empty() {
+        return false;
+    }
+    error_text.contains("endpoint") || error_text.contains("method")
+}
+
+/// Record a traffic observation for one backend + API family. Two consecutive
+/// endpoint rejections mark the family as rejected (the scheduler then excludes
+/// this backend for that family); any non-rejection response clears the memory.
+fn apply_family_learning(
+    state: &AppState,
+    backend_idx: usize,
+    family: ApiFamily,
+    rejected: bool,
+) {
+    if family == ApiFamily::Unknown {
+        return; // nothing to learn from unrecognized paths
+    }
+    let mut backends = state.backends.lock().unwrap();
+    let Some(b) = backends.get_mut(backend_idx) else {
+        return;
+    };
+    if rejected {
+        let count = b.family_fail_counts.entry(family).or_insert(0);
+        *count += 1;
+        if *count >= 2 && !b.rejected_families.contains(&family) {
+            b.rejected_families.insert(family);
+            info!(
+                "Backend {} learned: rejecting {}-family requests ({} consecutive endpoint errors)",
+                b.url,
+                family.display(),
+                count
+            );
+        }
+    } else if b.family_fail_counts.remove(&family).is_some()
+        || b.rejected_families.remove(&family)
+    {
+        debug!(
+            "Backend {} serves {}-family requests again; cleared rejection memory",
+            b.url,
+            family.display()
+        );
+    }
+}
+
 pub async fn run_worker(state: Arc<AppState>) {
     let client = state.client.clone();
     let mut current_idx = 0;
@@ -408,7 +489,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         loop {
             // Every ~1 min do a full re-probe of all endpoints so remembered
             // "bad" ones are re-verified (the backend may have been upgraded).
-            let full_reprobe = cycle % 6 == 0;
+            let full_reprobe = cycle.is_multiple_of(6);
             cycle += 1;
 
             let backends_to_check: Vec<(usize, String, bool)> = {
@@ -464,6 +545,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     || b.available_models != probe.available_models
                     || b.loaded_models != probe.loaded_models;
 
+                let was_api_type = b.api_type;
                 let now_online = probe.is_online;
                 crate::control::apply_probe(b, probe);
 
@@ -471,6 +553,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                     info!("Backend {} status changed to: ONLINE", url);
                 } else if was_online && !now_online {
                     info!("Backend {} status changed to: OFFLINE", url);
+                }
+                if b.api_type != was_api_type {
+                    info!(
+                        "Backend {} API type detected: {}",
+                        url,
+                        b.api_type.display()
+                    );
                 }
                 for e in &newly_bad {
                     info!(
@@ -597,24 +686,35 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 online && free && no_op
                             })
                             .filter(|(_, b)| {
-                                // If a specific model is requested, backend MUST have it.
-                                // If no model is requested, fall back to API family check.
-                                let supported = if let Some(ref model) = task_ref.requested_model {
-                                    let has_model = model_routable(model, &b.available_models);
-                                    if !has_model {
-                                        debug!("Backend {} rejected: model '{}' not found. Available: {:?}", b.url, model, b.available_models);
+                                // The backend must speak the request's API dialect — ALWAYS,
+                                // even when a specific model is requested. (Previously this was
+                                // only checked in the no-model case, which let Ollama-family
+                                // requests reach LM Studio backends that merely listed a
+                                // matching model.) Unknown-type backends are allowed until the
+                                // health check classifies them; families observed rejecting
+                                // real traffic are excluded (see apply_family_learning).
+                                if !family_compatible(b, api_family) {
+                                    debug!(
+                                        "Backend {} rejected: api_family {:?} not supported by {:?}",
+                                        b.url, api_family, b.api_type
+                                    );
+                                    return false;
+                                }
+
+                                // If a specific model is requested, backend MUST also have it.
+                                match &task_ref.requested_model {
+                                    Some(model) => {
+                                        let has_model = model_routable(model, &b.available_models);
+                                        if !has_model {
+                                            debug!(
+                                                "Backend {} rejected: model '{}' not found. Available: {:?}",
+                                                b.url, model, b.available_models
+                                            );
+                                        }
+                                        has_model
                                     }
-                                    has_model
-                                } else {
-                                    // Unknown type backends are allowed (health check will classify them)
-                                    let family_supported = matches!(b.api_type, BackendApiType::Unknown | BackendApiType::Both)
-                                        || b.api_type.supports(api_family);
-                                    if !family_supported {
-                                        debug!("Backend {} rejected: api_family {:?} not supported by {:?}", b.url, api_family, b.api_type);
-                                    }
-                                    family_supported
-                                };
-                                supported
+                                    None => true,
+                                }
                             })
                             .map(|(i, _)| i)
                             .collect();
@@ -640,9 +740,79 @@ pub async fn run_worker(state: Arc<AppState>) {
                         };
 
                         if eligible_indices.is_empty() {
+                            // Can this request EVER be served in the current known state? If
+                            // some backend is family-compatible and (has the model / needs no
+                            // model), it may just be busy or loading — keep waiting. Otherwise
+                            // nothing will ever pick it up: warn once, then fail fast with 503
+                            // after stuck_timeout instead of letting the client hang forever.
+                            let satisfiable = backends.iter().any(|b| {
+                                family_compatible(b, api_family)
+                                    && match &task_ref.requested_model {
+                                        Some(model) => model_routable(model, &b.available_models),
+                                        None => true,
+                                    }
+                            });
+
+                            if !satisfiable
+                                && task_ref.queued_at.elapsed() >= state.stuck_timeout
+                            {
+                                let dropped = queues
+                                    .get_mut(user_id)
+                                    .unwrap()
+                                    .remove(pos)
+                                    .unwrap();
+                                *counter += 1;
+                                let waited = dropped.queued_at.elapsed().as_secs();
+                                let mut dropped_counts = state.dropped_counts.lock().unwrap();
+                                *dropped_counts.entry(user_id.clone()).or_insert(0) += 1;
+                                drop(dropped_counts);
+                                state.log_event(LogEvent {
+                                    at: std::time::SystemTime::now(),
+                                    dir: "OUT",
+                                    user: user_id.clone(),
+                                    model: dropped.requested_model.clone(),
+                                    backend: None,
+                                    info: format!(
+                                        "503 no backend can serve (waited {}s)",
+                                        waited
+                                    ),
+                                });
+                                let responder = dropped.responder;
+                                tokio::spawn(async move {
+                                    let body = serde_json::json!({
+                                        "error": "no backend available to serve this request"
+                                    })
+                                    .to_string();
+                                    let mut headers = HeaderMap::new();
+                                    headers.insert(
+                                        axum::http::header::CONTENT_TYPE,
+                                        axum::http::HeaderValue::from_static("application/json"),
+                                    );
+                                    let _ = responder
+                                        .send(ResponsePart::Status(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            headers,
+                                        ))
+                                        .await;
+                                    let _ = responder
+                                        .send(ResponsePart::Chunk(Bytes::from(body)))
+                                        .await;
+                                });
+                                continue 'users;
+                            }
+
                             if !task_ref.stuck_warned {
+                                let msg_prefix = if satisfiable {
+                                    "No backend free".to_string()
+                                } else {
+                                    format!(
+                                        "No backend can serve; will fail with 503 after {}s",
+                                        state.stuck_timeout.as_secs()
+                                    )
+                                };
                                 warn!(
-                                    "No backend available for {} {} (model: {}, family: {:?}) for user {}; request parked in queue",
+                                    "{} for {} {} (model: {}, family: {:?}) for user {}",
+                                    msg_prefix,
                                     task_ref.method,
                                     task_ref.path,
                                     task_ref.requested_model.as_deref().unwrap_or("-"),
@@ -704,6 +874,7 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                 tokio::spawn(async move {
                     let log_model = task.requested_model.clone();
+                    let api_family = detect_api_family(&task.path);
                     let log_out = |info: String, backend: Option<String>| {
                         state_clone.log_event(LogEvent {
                             at: std::time::SystemTime::now(),
@@ -760,9 +931,20 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 {
                                     let mut stream = response.bytes_stream();
                                     let mut client_disconnected = false;
+                                    // Keep a short prefix of the first body chunk so we can
+                                    // tell "endpoint rejected" error bodies apart from normal
+                                    // application errors (learning hook below).
+                                    let mut first_prefix: Option<String> = None;
                                     while let Some(chunk_res) = stream.next().await {
                                         match chunk_res {
                                             Ok(chunk) => {
+                                                if first_prefix.is_none() {
+                                                    let n = chunk.len().min(512);
+                                                    first_prefix = Some(
+                                                        String::from_utf8_lossy(&chunk[..n])
+                                                            .into_owned(),
+                                                    );
+                                                }
                                                 if task
                                                     .responder
                                                     .send(ResponsePart::Chunk(chunk))
@@ -776,6 +958,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             Err(_) => break,
                                         }
                                     }
+
+                                    // Learn from the response: endpoint rejections (405 /
+                                    // "Unexpected endpoint or method") mark this backend as
+                                    // incompatible with the request's API family after two
+                                    // strikes; any other response clears that memory.
+                                    let prefix = first_prefix.unwrap_or_default();
+                                    apply_family_learning(
+                                        &state_clone,
+                                        backend_idx,
+                                        api_family,
+                                        is_endpoint_rejection(status, &prefix),
+                                    );
 
                                     if !client_disconnected {
                                         let mut counts =
@@ -829,9 +1023,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                 });
             }
             None => {
+                // Tick at least once per second so stuck-timeout drops are
+                // enforced even when no new events arrive.
                 tokio::select! {
                     _ = state.notify.notified() => {},
                     _ = state.backend_freed.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
                 }
             }
         }
@@ -980,5 +1177,118 @@ mod tests {
         // model_routable stays true for exact ids even when fuzzy also would
         let avail = set(&["qwen/qwen3.8-27b", "unsloth/qwen3.8-27b@q8_0"]);
         assert!(model_routable("unsloth/qwen3.8-27b@q8_0", &avail));
+    }
+
+    fn backend_with(api_type: BackendApiType, rejected: &[ApiFamily]) -> BackendStatus {
+        BackendStatus {
+            url: "http://test".into(),
+            active_requests: 0,
+            processed_count: 0,
+            is_online: true,
+            api_type,
+            available_models: HashSet::new(),
+            loaded_models: HashSet::new(),
+            loaded_ctx: HashMap::new(),
+            current_model: None,
+            lmstudio: false,
+            native_models: Vec::new(),
+            known_bad_endpoints: HashSet::new(),
+            rejected_families: rejected.iter().copied().collect(),
+            family_fail_counts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn endpoint_rejection_heuristic() {
+        // 405 is always structural, regardless of the body.
+        assert!(is_endpoint_rejection(StatusCode::METHOD_NOT_ALLOWED, ""));
+        assert!(is_endpoint_rejection(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "whatever"
+        ));
+        // LM Studio's signature: 200 + error JSON mentioning endpoint/method.
+        let lm = r#"{"error":"Unexpected endpoint or method. (GET /api/tags)"}"#;
+        assert!(is_endpoint_rejection(StatusCode::OK, lm));
+        // Normal application errors are not dialect rejections.
+        assert!(!is_endpoint_rejection(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"model 'x' not found"}"#
+        ));
+        assert!(!is_endpoint_rejection(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "boom"
+        ));
+        assert!(!is_endpoint_rejection(StatusCode::OK, r#"{"message":"ok"}"#));
+    }
+
+    #[test]
+    fn family_compatibility_rules() {
+        // Unknown type is allowed until the health check classifies it.
+        assert!(family_compatible(
+            &backend_with(BackendApiType::Unknown, &[]),
+            ApiFamily::Ollama
+        ));
+        // Ollama-only backend cannot serve OpenAI-family requests (and vice versa).
+        assert!(!family_compatible(
+            &backend_with(BackendApiType::Ollama, &[]),
+            ApiFamily::OpenAi
+        ));
+        assert!(family_compatible(
+            &backend_with(BackendApiType::Ollama, &[]),
+            ApiFamily::Ollama
+        ));
+        // Both serves everything.
+        assert!(family_compatible(
+            &backend_with(BackendApiType::Both, &[]),
+            ApiFamily::OpenAi
+        ));
+        // Learned rejections override the detected type.
+        let b = backend_with(BackendApiType::Both, &[ApiFamily::Ollama]);
+        assert!(!family_compatible(&b, ApiFamily::Ollama));
+        assert!(family_compatible(&b, ApiFamily::OpenAi));
+    }
+
+    #[tokio::test]
+    async fn stuck_request_fails_fast_with_503() {
+        // Backend that can never serve the requested model (nothing listens).
+        let state = Arc::new(AppState::new(
+            vec!["http://127.0.0.1:9".to_string()],
+            5,     // request timeout
+            86400, // load keep alive
+            1,     // stuck_timeout: fail fast after 1s
+            "appconf.yaml".into(),
+            Vec::new(),
+        ));
+
+        let (tx, mut rx) = mpsc::channel(32);
+        {
+            let mut queues = state.queues.lock().unwrap();
+            queues.entry("tester".to_string()).or_default().push_back(Task {
+                method: Method::POST,
+                path: "/api/chat".into(),
+                headers: HeaderMap::new(),
+                body: Bytes::from(r#"{"model":"no-such-model-xyz","messages":[]}"#),
+                responder: tx,
+                requested_model: Some("no-such-model-xyz".to_string()),
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+            });
+        }
+
+        // Enqueued before the worker starts: its first scan pass sees it.
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let part = tokio::time::timeout(std::time::Duration::from_secs(6), rx.recv())
+            .await
+            .expect("no response within 6s")
+            .expect("responder closed");
+        match part {
+            ResponsePart::Status(status, _) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE)
+            }
+            _ => panic!("expected Status(503), got another part"),
+        }
+
+        worker.abort();
     }
 }

@@ -1610,6 +1610,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_classifies_and_skips_bad_endpoints() {
+        // Mock mimics LM Studio for the Ollama endpoints: /api/tags works, but
+        // /api/ps answers 200 with an error body and /v1/models is a 404.
+        let extra_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h1 = extra_hits.clone();
+        let h2 = extra_hits.clone();
+        let app = Router::new()
+            .route(
+                "/api/tags",
+                get(|| async {
+                    Json(json!({"models": [{"name": "llama3:latest"}]}))
+                }),
+            )
+            .route("/api/ps", get(move || async move {
+                h1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(json!({"error": "Unexpected endpoint or method. (GET /api/ps)"})),
+                )
+                    .into_response()
+            }))
+            .route("/v1/models", get(move || async move {
+                h2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "Unexpected endpoint or method. (GET /v1/models)"})),
+                )
+                    .into_response()
+            }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let client = reqwest::Client::new();
+        // Full probe: both rejection styles are remembered as bad.
+        let probe = probe_backend(&client, &url, &HashSet::new()).await;
+        assert!(probe.is_online);
+        assert!(probe.good_endpoints.contains("/api/tags"));
+        assert!(probe.bad_endpoints.contains("/api/ps"), "200+error body must be bad");
+        assert!(probe.bad_endpoints.contains("/v1/models"), "404 must be bad");
+
+        // Second probe skipping the bad endpoints: they are not hit again,
+        // while good endpoints stay fresh.
+        let skip = probe.bad_endpoints.clone();
+        let probe2 = probe_backend(&client, &url, &skip).await;
+        assert_eq!(extra_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(probe2.good_endpoints.contains("/api/tags"));
+    }
+
+    #[test]
+    fn apply_probe_merges_endpoint_memory() {
+        let mut b = test_backend(BackendApiType::Ollama, false, &[], &[]);
+        b.known_bad_endpoints.insert("/v1/models".to_string());
+
+        // A probe where the endpoint now works clears the bad memory.
+        apply_probe(
+            &mut b,
+            BackendProbe {
+                is_online: true,
+                api_type: BackendApiType::Ollama,
+                available_models: HashSet::new(),
+                loaded_models: HashSet::new(),
+                loaded_ctx: HashMap::new(),
+                lmstudio: false,
+                native_models: Vec::new(),
+                bad_endpoints: HashSet::new(),
+                good_endpoints: ["/v1/models".to_string()].into_iter().collect(),
+            },
+        );
+        assert!(!b.known_bad_endpoints.contains("/v1/models"));
+
+        // A probe where another endpoint is rejected extends the memory.
+        apply_probe(
+            &mut b,
+            BackendProbe {
+                is_online: true,
+                api_type: BackendApiType::Ollama,
+                available_models: HashSet::new(),
+                loaded_models: HashSet::new(),
+                loaded_ctx: HashMap::new(),
+                lmstudio: false,
+                native_models: Vec::new(),
+                bad_endpoints: ["/api/ps".to_string()].into_iter().collect(),
+                good_endpoints: HashSet::new(),
+            },
+        );
+        assert!(b.known_bad_endpoints.contains("/api/ps"));
+    }
+
+    #[tokio::test]
     async fn ollama_load_and_unload_bodies() {
         let (url, calls) = start_mock_backend().await;
         let client = reqwest::Client::new();

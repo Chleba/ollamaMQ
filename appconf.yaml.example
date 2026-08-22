@@ -28,6 +28,9 @@ settings:
   timeout: 300                 # request timeout, seconds   (default 300)
   load_keep_alive: 86400       # model-control keep_alive   (default 86400 = 24 h)
   allow_all_routes: false      # fallback proxy for unknown routes (default false)
+  stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever
+                               # serve a queued request (default 60; requests merely
+                               # waiting for a busy/loading backend are exempt)
 
 # --- Models to load onto backends -------------------------------------------
 # Fields per model:

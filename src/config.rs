@@ -112,7 +112,7 @@ pub fn load_config(path: &str) -> Result<AppConfig, String> {
     let cfg: AppConfig =
         serde_yaml::from_str(&content).map_err(|e| format!("invalid YAML in '{}': {}", path, e))?;
 
-    let mut check = |v: i64, what: &str| -> Result<(), String> {
+    let check = |v: i64, what: &str| -> Result<(), String> {
         if v < -1 {
             Err(format!(
                 "invalid {} in '{}': {} (use -1 to keep the model loaded indefinitely)",
