@@ -15,6 +15,7 @@
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
 - **Backend Health Checks**: Automatically monitors backend status every 10 seconds. Probes for both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Endpoints a backend rejects are remembered and skipped until re-checked, so incompatible backends don't spam warnings. Offline instances are temporarily skipped and marked in the TUI.
 - **Fail-Fast for Unsatisfiable Requests**: If no online backend can ever serve a queued request (wrong API family or model absent everywhere), it is answered with `503` after `stuck_timeout` seconds instead of hanging forever. Requests merely waiting for a busy or loading backend are unaffected.
+- **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once).
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
@@ -240,13 +241,14 @@ settings:
   allow_all_routes: false      # fallback proxy (default false)
   stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever
                                # serve a queued request (default 60)
+  max_concurrent_per_backend: 1  # global cap of in-flight requests per backend (default 1)
 
 models:
   - name: "gpt-oss:120b"        # model name as the backend knows it
     identifier: "my-gpt"        # label attached to the load op (TUI / admin API)
     max_ctx: 128000             # max context window (Ollama num_ctx / LM Studio context_length)
     keep_alive: 86400           # seconds to stay resident after load (Ollama; -1 = forever)
-    max_concurrent_requests: 3  # reserved for the scheduler (stored, not enforced yet; default 1)
+    max_concurrent_requests: 3  # max in-flight requests for this model on one backend (default 1)
     backends:                   # URLs to load on (exact or substring match); empty = any suitable backend
       - http://10.137.1.1:11434
       - http://10.137.1.2:11434

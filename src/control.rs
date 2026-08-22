@@ -754,6 +754,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
 pub fn reload_model_config(state: &Arc<AppState>) -> Result<usize, String> {
     let configs = crate::config::load_config(&state.model_config_path)?.models;
     let n = configs.len();
+    *state.model_limits.lock().unwrap() = crate::dispatcher::build_model_limits(&configs);
     *state.model_config.lock().unwrap() = configs;
     apply_model_config(state);
     Ok(n)
@@ -1374,6 +1375,7 @@ mod tests {
             loaded_models: loaded.iter().map(|s| s.to_string()).collect(),
             loaded_ctx: HashMap::new(),
             current_model: None,
+            active_by_model: HashMap::new(),
             lmstudio,
             native_models: Vec::new(),
             known_bad_endpoints: HashSet::new(),
@@ -1853,6 +1855,7 @@ mod tests {
             30,
             86400,
             60,
+            1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
         ));
@@ -1901,6 +1904,7 @@ mod tests {
             30,
             86400,
             60,
+            1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
         ));
@@ -1965,6 +1969,7 @@ mod tests {
             30,
             86400,
             60,
+            1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
         ));

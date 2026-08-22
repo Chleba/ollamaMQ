@@ -31,6 +31,11 @@ settings:
   stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever
                                # serve a queued request (default 60; requests merely
                                # waiting for a busy/loading backend are exempt)
+  max_concurrent_per_backend: 1  # global cap of in-flight requests per backend
+                                 # (default 1 = one at a time, the historical behavior;
+                                 # raise it to let one backend serve several requests
+                                 # concurrently, bounded per model by
+                                 # models[].max_concurrent_requests)
 
 # --- Models to load onto backends -------------------------------------------
 # Fields per model:
@@ -40,7 +45,8 @@ settings:
 #   max_ctx                  max context window (Ollama num_ctx / LM Studio context_length)
 #   keep_alive               seconds to stay resident after load (Ollama only;
 #                            default: settings.load_keep_alive; -1 = forever)
-#   max_concurrent_requests  reserved for the scheduler (stored, not enforced yet; default 1)
+#   max_concurrent_requests  max in-flight requests for this model on one backend
+#                            (default 1; also bounded by settings.max_concurrent_per_backend)
 #   backends                 URLs to load on (exact or substring match);
 #                            empty/omitted = any suitable backend
 models:

@@ -55,6 +55,11 @@ pub struct Settings {
     /// it before answering 503 (default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_timeout: Option<u64>,
+    /// Max simultaneous in-flight requests per backend (default 1 — the
+    /// historical one-request-per-backend behavior). Per-model sub-limits come
+    /// from each model entry's `max_concurrent_requests`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_per_backend: Option<u32>,
 }
 
 /// Top-level config file structure.
@@ -86,8 +91,9 @@ pub struct ModelConfig {
     /// model loaded indefinitely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<i64>,
-    /// Reserved: max simultaneous requests per backend (default 1). Stored
-    /// but not enforced by the scheduler yet.
+    /// Max simultaneous in-flight requests for this model on one backend
+    /// (default 1). Enforced by the scheduler; also bounded by the global
+    /// `settings.max_concurrent_per_backend` cap.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub max_concurrent_requests: u32,
     /// Backend URLs to load this model on. Empty = any suitable backend.

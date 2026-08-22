@@ -168,6 +168,8 @@ async fn main() {
         .or(file_cfg.settings.load_keep_alive)
         .unwrap_or(86400);
     let stuck_timeout = file_cfg.settings.stuck_timeout.unwrap_or(60);
+    let max_concurrent_per_backend =
+        file_cfg.settings.max_concurrent_per_backend.unwrap_or(1);
     let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
 
     let backend_urls: Vec<String> = args
@@ -222,6 +224,7 @@ async fn main() {
         timeout,
         load_keep_alive,
         stuck_timeout,
+        max_concurrent_per_backend,
         args.model_config.clone(),
         file_cfg.models,
     ));

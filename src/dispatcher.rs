@@ -138,6 +138,10 @@ pub struct BackendStatus {
     /// context doesn't match the configured `max_ctx`.
     pub loaded_ctx: HashMap<String, u64>,
     pub current_model: Option<String>,
+    /// In-flight request count per normalized model name. Only populated for
+    /// requests that carry a model; enforces the per-model
+    /// `max_concurrent_requests` limits from appconf.yaml (Plan D).
+    pub active_by_model: HashMap<String, u32>,
     /// True when the backend speaks the LM Studio native REST API
     /// (`/api/v1/models*`), which enables model load/unload control.
     pub lmstudio: bool,
@@ -188,6 +192,12 @@ pub struct AppState {
     /// `keep_alive` (seconds) sent with control "load" requests so explicitly
     /// loaded models stay resident (Ollama's own default is only 5 minutes).
     pub load_keep_alive: i64,
+    /// Max simultaneous in-flight requests per backend (default 1 — the
+    /// historical behavior). Per-model sub-limits come from `model_limits`.
+    pub max_concurrent_per_backend: u32,
+    /// Per-model concurrency limits keyed by normalized model name; rebuilt
+    /// whenever the model config changes. Unlisted models default to 1.
+    pub model_limits: Mutex<HashMap<String, u32>>,
     /// Model configuration from `appconf.yaml` (models to load on backends,
     /// with load settings). Re-read with the TUI 'r' key.
     pub model_config: Mutex<Vec<crate::config::ModelConfig>>,
@@ -220,6 +230,7 @@ impl AppState {
         timeout: u64,
         load_keep_alive: i64,
         stuck_timeout_secs: u64,
+        max_concurrent_per_backend: u32,
         model_config_path: String,
         model_config: Vec<crate::config::ModelConfig>,
     ) -> Self {
@@ -236,6 +247,7 @@ impl AppState {
                 loaded_models: HashSet::new(),
                 loaded_ctx: HashMap::new(),
                 current_model: None,
+                active_by_model: HashMap::new(),
                 lmstudio: false,
                 native_models: Vec::new(),
                 known_bad_endpoints: HashSet::new(),
@@ -270,6 +282,8 @@ impl AppState {
             control_ops: Mutex::new(HashMap::new()),
             control_history: Mutex::new(VecDeque::new()),
             load_keep_alive,
+            max_concurrent_per_backend,
+            model_limits: Mutex::new(build_model_limits(&model_config)),
             model_config: Mutex::new(model_config),
             model_config_path,
             logs: Mutex::new(VecDeque::new()),
@@ -399,6 +413,32 @@ fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
         }
         matches!(req_base.as_deref(), Some(rb) if rb == model_base(m))
     })
+}
+
+/// Per-model concurrency limits keyed by normalized model name, from the
+/// `models:` section of appconf.yaml. Unlisted models default to 1 at lookup.
+pub fn build_model_limits(configs: &[crate::config::ModelConfig]) -> HashMap<String, u32> {
+    configs
+        .iter()
+        .map(|c| (normalize_model_id(&c.name), c.max_concurrent_requests))
+        .collect()
+}
+
+/// True when the backend has room for one more in-flight request: under the
+/// global per-backend cap, and — for model requests — under that model's limit.
+fn backend_has_capacity(
+    b: &BackendStatus,
+    model_key: Option<&str>,
+    model_limit: u32,
+    cap: u32,
+) -> bool {
+    if b.active_requests >= cap as usize {
+        return false;
+    }
+    match model_key {
+        Some(k) => *b.active_by_model.get(k).unwrap_or(&0) < model_limit,
+        None => true,
+    }
 }
 
 /// True when the backend can speak the request's API dialect. Unknown-type
@@ -675,17 +715,34 @@ pub async fn run_worker(state: Arc<AppState>) {
                             user_id, pos, task_ref.path, api_family
                         );
 
-                        // Find eligible backends: online, not busy, and support the required API + Model
+                        // Find eligible backends: online, has capacity (global per-backend
+                        // cap + per-model limit), and support the required API + Model.
+                        let limits = state.model_limits.lock().unwrap();
+                        let model_key = task_ref.requested_model.as_deref().map(normalize_model_id);
+                        let model_limit = match &model_key {
+                            Some(k) => limits.get(k).copied().unwrap_or(1),
+                            None => 0, // unused for model-less requests
+                        };
+                        drop(limits);
                         let eligible_indices: Vec<usize> = backends.iter()
                             .enumerate()
                             .filter(|(i, b)| {
                                 let online = b.is_online;
-                                let free = b.active_requests < 1;
+                                let free = backend_has_capacity(
+                                    b,
+                                    model_key.as_deref(),
+                                    model_limit,
+                                    state.max_concurrent_per_backend,
+                                );
                                 let no_op = !control_busy.contains(i);
                                 if !online || !free || !no_op {
                                     debug!(
-                                        "Backend {} rejected: online={}, active={}, control_op={}",
-                                        b.url, online, b.active_requests, !no_op
+                                        "Backend {} rejected: online={}, active={}/{}, control_op={}",
+                                        b.url,
+                                        online,
+                                        b.active_requests,
+                                        state.max_concurrent_per_backend,
+                                        !no_op
                                     );
                                 }
                                 online && free && no_op
@@ -855,6 +912,13 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                         *last_idx = selected_backend_idx;
                         backends[selected_backend_idx].active_requests += 1;
+                        if let Some(ref m) = task.requested_model {
+                            let k = normalize_model_id(m);
+                            *backends[selected_backend_idx]
+                                .active_by_model
+                                .entry(k)
+                                .or_insert(0) += 1;
+                        }
                         backends[selected_backend_idx].current_model = task.requested_model.clone();
 
                         selection = Some((
@@ -1020,9 +1084,18 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                     {
                         let mut backends = state_clone.backends.lock().unwrap();
-                        backends[backend_idx].active_requests =
-                            backends[backend_idx].active_requests.saturating_sub(1);
-                        backends[backend_idx].processed_count += 1;
+                        let b = &mut backends[backend_idx];
+                        b.active_requests = b.active_requests.saturating_sub(1);
+                        if let Some(ref m) = task.requested_model {
+                            let k = normalize_model_id(m);
+                            if let Some(c) = b.active_by_model.get_mut(&k) {
+                                *c = c.saturating_sub(1);
+                                if *c == 0 {
+                                    b.active_by_model.remove(&k);
+                                }
+                            }
+                        }
+                        b.processed_count += 1;
                     }
                     state_clone.backend_freed.notify_one();
                 });
@@ -1215,6 +1288,7 @@ mod tests {
             loaded_models: HashSet::new(),
             loaded_ctx: HashMap::new(),
             current_model: None,
+            active_by_model: HashMap::new(),
             lmstudio: false,
             native_models: Vec::new(),
             known_bad_endpoints: HashSet::new(),
@@ -1273,6 +1347,54 @@ mod tests {
         assert!(family_compatible(&b, ApiFamily::OpenAi));
     }
 
+    #[test]
+    fn model_limits_are_normalized_and_lookup_defaults() {
+        let configs = vec![crate::config::ModelConfig {
+            name: "gpt-oss:120b".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 3,
+            backends: Vec::new(),
+        }];
+        let limits = build_model_limits(&configs);
+        // ':tag' is stripped when keying.
+        assert_eq!(limits.get("gpt-oss"), Some(&3));
+        // Lookup happens on the normalized (lowercased) key; unlisted models
+        // fall back to 1 at lookup time in the scheduler.
+        assert_eq!(limits.get("GPT-OSS"), None);
+        assert_eq!(limits.get("qwen2.5-coder"), None);
+    }
+
+    #[test]
+    fn backend_capacity_enforces_global_and_per_model() {
+        let mut b = backend_with(BackendApiType::Ollama, &[]);
+        let cap: u32 = 3;
+        assert!(backend_has_capacity(&b, Some("a"), 2, cap));
+
+        // Two in-flight for "a" (at its limit) and one for "b": global cap hit.
+        b.active_requests = 3;
+        b.active_by_model.insert("a".into(), 2);
+        b.active_by_model.insert("b".into(), 1);
+        assert!(!backend_has_capacity(&b, Some("c"), 5, cap)); // cap reached
+
+        // One slot frees up: "a" is at its per-model limit, others still fit.
+        b.active_requests = 2;
+        assert!(!backend_has_capacity(&b, Some("a"), 2, cap));
+        assert!(backend_has_capacity(&b, Some("b"), 3, cap));
+        // Model-less requests are bounded by the global cap only.
+        assert!(backend_has_capacity(&b, None, 0, cap));
+    }
+
+    #[test]
+    fn backend_capacity_defaults_to_single_slot() {
+        let mut b = backend_with(BackendApiType::Ollama, &[]);
+        // Historical behavior: one in-flight request per backend.
+        assert!(backend_has_capacity(&b, Some("m"), 1, 1));
+        b.active_requests = 1;
+        assert!(!backend_has_capacity(&b, Some("m"), 5, 1)); // global cap binds first
+    }
+
     #[tokio::test]
     async fn stuck_request_fails_fast_with_503() {
         // Backend that can never serve the requested model (nothing listens).
@@ -1281,6 +1403,7 @@ mod tests {
             5,     // request timeout
             86400, // load keep alive
             1,     // stuck_timeout: fail fast after 1s
+            1,     // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
         ));
