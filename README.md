@@ -81,36 +81,6 @@ docker run -d \
   chlebon/ollamamq
 ```
 
-### Command Line Arguments
-
-`ollamaMQ` supports several options to configure the proxy:
-
-- `-p, --port <PORT>`: Port to listen on (default: `11435`)
-- `-H, --host <HOST>`: Host/interface to bind to (default: `127.0.0.1`, loopback only). Set `--host 0.0.0.0` to allow LAN/Docker access.
-- `-o, --backend-urls <URL1,URL2>`: Comma-separated list of backend server URLs (Ollama, LM Studio, etc.) (default: `http://localhost:11434`)
-- `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
-- `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI). In this mode, logs are written verbosely to **stderr** (default level `debug`) so they can be captured by a service manager's journal, Docker, or piped to a file.
-- `--load-keep-alive <SECONDS>`: How long a model stays loaded after a model-control "load" (sent as Ollama's `keep_alive`; LM Studio loads are unaffected beyond its own TTL). Ollama's own default is only 5 minutes, so the default here is `86400` (24 h). `-1` keeps the model loaded indefinitely.
-- `-c/--model-config <PATH>`: Path to the central configuration file (`appconf.yaml`): backends, settings and models to load. Applied at startup; reload with `r` in the TUI. Default: `appconf.yaml`.
-- `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
-- `-h, --help`: Print help message
-- `-V, --version`: Print version information
-
-**Example:**
-
-```bash
-ollamaMQ --port 8080 --ollama-urls http://10.0.0.1:11434,http://10.0.0.2:11434 --timeout 600
-```
-
-**Docker Example:**
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 8080:8080 \
-  chlebon/ollamamq --port 8080 --ollama-urls http://192.168.1.5:11434 --timeout 600
-```
-
 ### API Proxying
 
 Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-ID` header.
@@ -223,75 +193,6 @@ curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecre
 
 **Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
 
-### Configuration file (`appconf.yaml`)
-
-A central config file with three sections: **backends** (what to connect to), **settings** (runtime options) and **models** (what to load where via the model-control load/unload logic). Path defaults to `appconf.yaml` in the working directory; override with `-c/--model-config`. A missing file is fine — defaults apply.
-
-```yaml
-# Backends ollamaMQ connects to (same as --backend-urls)
-backends:
-  - http://10.137.1.1:11434
-  - http://10.137.1.2:11434
-
-settings:
-  port: 11435                  # default 11435
-  host: 127.0.0.1              # default 127.0.0.1
-  timeout: 300                 # request timeout, seconds (default 300)
-  load_keep_alive: 86400       # model-control keep_alive (default 24 h; -1 = forever)
-  allow_all_routes: false      # fallback proxy (default false)
-  stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever
-                               # serve a queued request (default 60)
-  max_concurrent_per_backend: 1  # global cap of in-flight requests per backend (default 1)
-
-models:
-  - name: "gpt-oss:120b"        # model name as the backend knows it
-    identifier: "my-gpt"        # label attached to the load op (TUI / admin API)
-    max_ctx: 128000             # max context window (Ollama num_ctx / LM Studio context_length)
-    keep_alive: 86400           # seconds to stay resident after load (Ollama; -1 = forever)
-    max_concurrent_requests: 3  # max in-flight requests for this model on one backend (default 1)
-    backends:                   # URLs to load on (exact or substring match); empty = any suitable backend
-      - http://10.137.1.1:11434
-      - http://10.137.1.2:11434
-```
-
-**Precedence:** CLI flags always win when explicitly given (`--backend-urls` over `backends`, `--port`/`--host`/`--timeout`/`--load-keep-alive`/`--allow-all-routes` over `settings`). See `appconf.yaml.example` for a fully commented template.
-
-The `models` section is applied automatically at startup (once backend probes have run) and can be re-read and re-applied at any time with **`r`** in the TUI (backends/settings are only read at startup). Applying is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models that are already resident there — e.g. still loaded from an earlier ollamaMQ run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything. Loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL` lines) and in the log output.
-
-### Dashboard Controls
-
-The interactive TUI dashboard provides a live view of the dispatcher's state:
-
-- **`j` / `k`** or **Arrows**: Navigate the selected list (Users, Backends, or Blocked Items).
-- **`Tab`** / **`Shift+Tab`** or **`h` / `l`**: Switch between the **Backends**, **Users**, **Blocked**, and **Logs** panels. Context-sensitive: when the selected backend is *expanded*, `Tab`/`Shift+Tab` cycle through that backend's model list instead (the cursor model is shown as `▶` in yellow, wrapping around; cycling past the first 5 models auto-expands the list).
-- **`Space`** or **`Enter`**: Expand/collapse the available models list for the selected backend (in the Backends panel).
-- **`L`**: Load a model on the selected backend (Backends panel). If the backend is expanded and a model is under the `Tab` cursor, that model is loaded **directly** (no typing); otherwise you type the model name, confirm with `Enter`, cancel with `Esc`.
-- **`U`**: Unload a model from the selected backend (Backends panel) — same cursor behavior as `L`.
-- **`r`**: Re-read `appconf.yaml` and re-apply it (loads listed models onto their configured backends).
-- **`p`**: Toggle **VIP** status for the selected user (absolute priority).
-- **`b`**: Toggle **Boost** status for the selected user (prioritizes every 2nd request).
-- **`x`**: Block the selected user.
-- **`X`**: Block the selected user's IP address.
-- **`u`**: Unblock the selected user or IP (works in both panels).
-- **`q`** or **Esc**: Exit the dashboard and stop the application.
-- **`?`**: Toggle detailed help overlay.
-
-**Visual Indicators:**
-- `▶` / `▼`: Indicates if a backend's model list is collapsed or expanded.
-- `▶` (Yellow, in model lists): The `Tab` cursor model — `L`/`U` act on it directly.
-- `★` (Magenta): **VIP User** (absolute priority).
-- `⚡` (Yellow): **Boosted User** (every 2nd request priority).
-- `▶` (Cyan): Request is currently being processed/streamed.
-- `●` (Green): Backend is Online or User has requests waiting in the queue.
-- `○` (Gray): User is idle or Backend is Offline.
-- `✖` (Red): User or IP is blocked.
-- `⟳` (Cyan): A model load/unload control operation is in progress on that backend (recent results flash `✓`/`✖` for ~10 s).
-
-**Logs Panel (bottom strip):** live feed of what is passing through the proxy, newest first:
-- `→` (Cyan) **IN**: a request was queued (user, model).
-- `←` (Green) **OUT**: the request was dispatched to a backend, with response status (`dropped` in red when blocked/client gone/backend error).
-- `⟳` (Yellow) **CTL**: model-control actions from `appconf.yaml` application/reload.
-
 ### Logging
 
 `ollamaMQ` uses [`tracing`](https://docs.rs/tracing) and behaves differently depending on the mode:
@@ -356,6 +257,45 @@ To run `ollamaMQ` as a background service with full log visibility in the journa
    ```
 
 Because `--no-tui` defaults to `debug` logging on stderr, **all** dispatcher events (backend health, request routing, errors) are captured in the journal — no separate log file needed.
+
+## ⚙️ Configuration (`appconf.yaml`)
+
+Everything about your `ollamaMQ` instance lives in one YAML file with three sections: **backends** (what to connect to), **settings** (runtime options) and **models** (which models to load where). The default path is `appconf.yaml` in the working directory; override it with `-c/--model-config`. A missing file is fine — defaults apply.
+
+```yaml
+# --- Backends: every Ollama / LM Studio / OpenAI-compatible server you want to use
+backends:
+  - http://10.137.1.1:11434      # e.g. Ollama
+  - http://10.137.1.2:1234       # e.g. LM Studio
+
+# --- Runtime settings (all optional — defaults shown)
+settings:
+  port: 11435                  # proxy listen port (default 11435)
+  host: 127.0.0.1              # bind interface; use 0.0.0.0 for LAN/Docker access (default 127.0.0.1)
+  timeout: 300                 # per-request timeout in seconds (default 300)
+  load_keep_alive: 86400       # how long model-control loads stay resident; -1 = forever (default 86400)
+  allow_all_routes: false      # also proxy non-standard endpoints as fallback (default false)
+  stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever serve a queued request (default 60)
+  max_concurrent_per_backend: 1  # global cap of in-flight requests per backend; raise to let one backend handle several at once (default 1)
+
+# --- Models to load on startup / reload, via the model-control logic
+models:
+  - name: "gpt-oss:120b"        # model name as the backend knows it
+    identifier: "my-gpt"        # label attached to this entry's load op (TUI / admin API)
+    max_ctx: 128000             # context window — Ollama num_ctx / LM Studio context_length
+    keep_alive: 86400           # seconds the model stays resident after load (Ollama; -1 = forever)
+    max_concurrent_requests: 3  # in-flight requests allowed for this model on one backend (default 1)
+    backends:                   # which backends to load it on (exact or substring URL match); omitted/empty = any suitable backend
+      - http://10.137.1.1:11434
+```
+
+**How it's applied:**
+
+- `backends` and `settings` are read at **startup only** — restart to change them.
+- `models` is applied automatically at startup (once backend probes have run) and re-applied any time you press **`r`** in the TUI. Application is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models already resident there — e.g. still loaded from an earlier run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything, and loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL`) and in the log output.
+- Explicit CLI flags override file values when given (e.g. `--backend-urls` over `backends`, `--port`/`--host`/`--timeout` over `settings`).
+
+See [`appconf.yaml.example`](appconf.yaml.example) for a fully commented template.
 
 ## 🐳 Docker
 
@@ -450,50 +390,6 @@ docker run -d --name ollamamq -p 11435:11435 \
   chlebon/ollamamq
 ```
 
-### Connecting to Different Backend Servers
-
-#### Local Ollama (on host machine)
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 11435:11435 \
-  -e BACKEND_URLS=http://host.docker.internal:11434 \
-  chlebon/ollamamq
-```
-
-#### Remote Ollama Server
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 11435:11435 \
-  -e BACKEND_URLS=https://ollama.example.com:11434 \
-  chlebon/ollamamq
-```
-
-#### Custom Port on Same Server
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 8080:8080 \
-  -e BACKEND_URLS=http://host.docker.internal:11436 \
-  -e PORT=8080 \
-  chlebon/ollamamq
-```
-
-#### Ollama in Docker (different container)
-
-```bash
-docker run -d \
-  --name ollamamq \
-  --network ollama-network \
-  -p 11435:11435 \
-  -e BACKEND_URLS=http://ollama:11434 \
-  chlebon/ollamamq
-```
-
 ### Port Configuration
 
 - **11435**: The proxy port that clients connect to (exposed by default)
@@ -508,22 +404,6 @@ docker run -d \
   -e PORT=8080 \
   chlebon/ollamamq
 ```
-
-## 🏗️ Architecture
-
-- **`src/main.rs`**: Entry point, HTTP server initialization, and TUI lifecycle management.
-- **`src/dispatcher.rs`**: Core logic for queuing, round-robin scheduling, and Ollama proxying.
-- **`src/tui.rs`**: Implementation of the terminal-based monitoring dashboard.
-- **`src/control.rs`**: Model load/unload control — backend probing, model-name resolution, Ollama/LM Studio executors, and the admin HTTP API.
-
-### Request Flow
-
-1. Client sends a request with `X-User-ID`.
-2. `ollamaMQ` pushes the request into a user-specific queue.
-3. The background worker checks for available backends (Online & not busy).
-4. If a backend is free, the worker pops the next task (fair-share rotation) and **spawns a parallel task**.
-5. The request is proxied to the selected Ollama backend.
-6. The response is streamed back to the client in real-time, while the worker can immediately start another task on a different backend.
 
 ## 📦 Publishing to Docker Hub
 
