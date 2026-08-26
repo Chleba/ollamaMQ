@@ -68,6 +68,17 @@ struct FlashMsg {
     at: Instant,
 }
 
+/// Full-content detail overlay for one log event. The event is a clone, so
+/// events arriving while the view is open don't shift what's displayed.
+struct LogDetail {
+    event: LogEvent,
+    /// Scroll offset in wrapped (visual) lines.
+    offset: usize,
+}
+
+/// Lines scrolled per PageUp/PageDown in the log detail view.
+const DETAIL_PAGE: usize = 10;
+
 struct ActiveOpView {
     backend_idx: usize,
     verb: String,
@@ -90,6 +101,8 @@ struct StateSnapshot {
     processing_counts: HashMap<String, usize>,
     processed_counts: HashMap<String, usize>,
     dropped_counts: HashMap<String, usize>,
+    /// Request-log records dropped because the log channel was full.
+    reqlog_dropped: u64,
     user_ips: HashMap<String, IpAddr>,
     blocked_ips: HashSet<IpAddr>,
     blocked_users: HashSet<String>,
@@ -107,6 +120,7 @@ pub struct TuiDashboard {
     table_state: TableState,
     backend_table_state: TableState,
     blocked_table_state: TableState,
+    log_table_state: TableState,
     active_panel: Panel,
     expanded_backends: HashSet<String>,
     show_all_backends: HashSet<String>,
@@ -117,6 +131,7 @@ pub struct TuiDashboard {
     input_mode: Option<InputMode>,
     input_buf: String,
     flash: Option<FlashMsg>,
+    log_detail: Option<LogDetail>,
 }
 
 impl TuiDashboard {
@@ -125,6 +140,7 @@ impl TuiDashboard {
             table_state: TableState::default(),
             backend_table_state: TableState::default(),
             blocked_table_state: TableState::default(),
+            log_table_state: TableState::default(),
             active_panel: Panel::Users,
             expanded_backends: HashSet::new(),
             show_all_backends: HashSet::new(),
@@ -133,6 +149,7 @@ impl TuiDashboard {
             input_mode: None,
             input_buf: String::new(),
             flash: None,
+            log_detail: None,
         }
     }
 
@@ -144,6 +161,7 @@ impl TuiDashboard {
         let processing_counts = state.processing_counts.lock().unwrap().clone();
         let processed_counts = state.processed_counts.lock().unwrap().clone();
         let dropped_counts = state.dropped_counts.lock().unwrap().clone();
+        let reqlog_dropped = state.reqlog.dropped_count();
         let user_ips = state.user_ips.lock().unwrap().clone();
         let blocked_ips = state.blocked_ips.lock().unwrap().clone();
         let blocked_users = state.blocked_users.lock().unwrap().clone();
@@ -207,6 +225,7 @@ impl TuiDashboard {
             processing_counts,
             processed_counts,
             dropped_counts,
+            reqlog_dropped,
             user_ips,
             blocked_ips,
             blocked_users,
@@ -233,6 +252,39 @@ impl TuiDashboard {
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    // Log detail view (opened with Enter from the Logs panel):
+                    // its keys take priority over all other handling, including
+                    // input mode.
+                    if self.log_detail.is_some() {
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if let Some(d) = self.log_detail.as_mut() {
+                                    d.offset += 1;
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if let Some(d) = self.log_detail.as_mut() {
+                                    d.offset += DETAIL_PAGE;
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                if let Some(d) = self.log_detail.as_mut() {
+                                    d.offset = d.offset.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if let Some(d) = self.log_detail.as_mut() {
+                                    d.offset = d.offset.saturating_sub(DETAIL_PAGE);
+                                }
+                            }
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                                self.log_detail = None;
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
 
@@ -316,6 +368,35 @@ impl TuiDashboard {
                                         } else {
                                             self.expanded_backends.insert(url);
                                         }
+                                    }
+                                }
+                            } else if self.active_panel == Panel::Logs
+                                && key.code == KeyCode::Enter
+                            {
+                                // Enter on a logs row opens the full-content
+                                // detail view; rows without captured content
+                                // just flash a note.
+                                if let Some(i) = self
+                                    .log_table_state
+                                    .selected()
+                                    .filter(|&i| i < snapshot.logs.len())
+                                {
+                                    let ev = &snapshot.logs[i];
+                                    if ev
+                                        .content
+                                        .as_deref()
+                                        .is_some_and(|c| !c.is_empty())
+                                    {
+                                        self.log_detail = Some(LogDetail {
+                                            event: ev.clone(),
+                                            offset: 0,
+                                        });
+                                    } else {
+                                        self.flash = Some(FlashMsg {
+                                            text: "no content captured for this event".to_string(),
+                                            ok: false,
+                                            at: Instant::now(),
+                                        });
                                     }
                                 }
                             }
@@ -524,7 +605,14 @@ impl TuiDashboard {
                             } else if self.active_panel == Panel::Users {
                                 let i = self.table_state.selected().unwrap_or(0).saturating_sub(1);
                                 self.table_state.select(Some(i));
-                            } else if self.active_panel != Panel::Logs {
+                            } else if self.active_panel == Panel::Logs {
+                                let i = self
+                                    .log_table_state
+                                    .selected()
+                                    .unwrap_or(0)
+                                    .saturating_sub(1);
+                                self.log_table_state.select(Some(i));
+                            } else {
                                 let i = self
                                     .blocked_table_state
                                     .selected()
@@ -554,7 +642,17 @@ impl TuiDashboard {
                                         .unwrap_or(0);
                                     self.table_state.select(Some(i));
                                 }
-                            } else if self.active_panel != Panel::Logs {
+                            } else if self.active_panel == Panel::Logs {
+                                let len = snapshot.logs.len();
+                                if len > 0 {
+                                    let i = self
+                                        .log_table_state
+                                        .selected()
+                                        .map(|s| (s + 1).min(len.saturating_sub(1)))
+                                        .unwrap_or(0);
+                                    self.log_table_state.select(Some(i));
+                                }
+                            } else {
                                 let len = snapshot.blocked_ips.len() + snapshot.blocked_users.len();
                                 if len > 0 {
                                     let i = self
@@ -636,6 +734,15 @@ impl TuiDashboard {
     }
 
     fn render(&mut self, f: &mut Frame, snapshot: &StateSnapshot) {
+        // Log detail overlay takes over the screen while open. Take/restore
+        // keeps the borrow of `log_detail` from overlapping the `&mut self`
+        // receiver of `render_log_detail`.
+        if let Some(mut detail) = self.log_detail.take() {
+            self.render_log_detail(f, &mut detail);
+            self.log_detail = Some(detail);
+            return;
+        }
+
         match self.active_panel {
             Panel::Backends => {
                 if snapshot.backends.is_empty() {
@@ -651,7 +758,13 @@ impl TuiDashboard {
                     self.table_state.select(Some(0));
                 }
             }
-            Panel::Logs => {}
+            Panel::Logs => {
+                if snapshot.logs.is_empty() {
+                    self.log_table_state.select(None);
+                } else if self.log_table_state.selected().is_none() {
+                    self.log_table_state.select(Some(0));
+                }
+            }
             Panel::Blocked => {
                 let blocked_total = snapshot.blocked_ips.len() + snapshot.blocked_users.len();
                 if blocked_total == 0 {
@@ -724,6 +837,117 @@ impl TuiDashboard {
         }
     }
 
+    /// Full-content detail overlay for one log event: a centered 80% x 80%
+    /// block with a header (time/direction/user/model/backend/info) on top,
+    /// a manually pre-wrapped, scrollable content area, and a key footer.
+    fn render_log_detail(&mut self, f: &mut Frame, detail: &mut LogDetail) {
+        let area = f.area();
+
+        // Tiny terminal: a centered 80x80 overlay has no room; draw a
+        // minimal placeholder instead.
+        if area.width < 20 || area.height < 10 {
+            f.render_widget(
+                Block::default()
+                    .title(" Log detail (terminal too small) ")
+                    .borders(Borders::ALL),
+                area,
+            );
+            return;
+        }
+
+        let width = area.width * 4 / 5;
+        let height = area.height * 4 / 5;
+        let block_area = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let block = Block::default()
+            .title(format!(" Log detail — {} ", detail.event.dir))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(block_area);
+        f.render_widget(block, block_area);
+
+        // Manually pre-wrap the content: split it into lines, then split each
+        // line into chunks of `inner.width` chars, collecting the visual
+        // lines. (No ratatui `Wrap`: it can't be scrolled by visual line.)
+        let raw = detail
+            .event
+            .content
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .unwrap_or("(no content captured)");
+        let mut visual: Vec<String> = Vec::new();
+        if inner.width > 0 {
+            for line in raw.lines() {
+                let mut rest = line;
+                loop {
+                    if rest.len() <= inner.width as usize {
+                        visual.push(rest.to_string());
+                        break;
+                    }
+                    let cut = rest
+                        .char_indices()
+                        .nth(inner.width as usize)
+                        .map(|(i, _)| i)
+                        .unwrap_or(rest.len());
+                    visual.push(rest[..cut].to_string());
+                    rest = &rest[cut..];
+                }
+            }
+        }
+        let total_visual = visual.len();
+
+        // Fixed 6-line header on top, 1-line footer at the bottom; the
+        // content area gets whatever remains. Clamp the scroll offset to it.
+        let header_len = 6;
+        let footer_len = 1;
+        let visible =
+            inner.height.saturating_sub((header_len + footer_len) as u16) as usize;
+        detail.offset = detail.offset.min(total_visual.saturating_sub(visible));
+
+        let header = Paragraph::new(Text::from(vec![
+            Line::from(format!("Time: {}", Self::fmt_event_time(detail.event.at))),
+            Line::from(format!("Direction: {}", detail.event.dir)),
+            Line::from(format!("User: {}", detail.event.user)),
+            Line::from(format!(
+                "Model: {}",
+                detail.event.model.as_deref().unwrap_or("-")
+            )),
+            Line::from(format!(
+                "Backend: {}",
+                detail.event.backend.as_deref().unwrap_or("-")
+            )),
+            Line::from(format!("Info: {}", detail.event.info)),
+        ]));
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_len),
+                Constraint::Min(0),
+                Constraint::Length(footer_len),
+            ])
+            .split(inner);
+
+        f.render_widget(header, chunks[0]);
+
+        let content: Vec<Line> = visual
+            .iter()
+            .skip(detail.offset)
+            .take(visible)
+            .map(|l| Line::from(l.as_str()))
+            .collect();
+        f.render_widget(Paragraph::new(content), chunks[1]);
+
+        let footer =
+            Paragraph::new("j/k: scroll  PgUp/PgDn: page  q/Esc: close")
+                .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(footer, chunks[2]);
+    }
+
     fn render_stats(&self, snapshot: &StateSnapshot) -> Paragraph<'static> {
         let total_queued: usize = snapshot.queues_len.values().sum();
         let total_processing: usize = snapshot.processing_counts.values().sum();
@@ -772,6 +996,12 @@ impl TuiDashboard {
             Span::styled("Drop: ", Style::default().fg(Color::Red)),
             Span::styled(
                 total_dropped.to_string(),
+                Style::default().fg(Color::Red).bold(),
+            ),
+            Span::raw(" | "),
+            Span::styled("LogDrop: ", Style::default().fg(Color::Red)),
+            Span::styled(
+                snapshot.reqlog_dropped.to_string(),
                 Style::default().fg(Color::Red).bold(),
             ),
         ];
@@ -1269,6 +1499,20 @@ impl TuiDashboard {
                 } else {
                     Style::default().fg(Color::Gray)
                 };
+                // Append a short single-line content preview when present.
+                let info_text = match ev.content.as_deref().filter(|c| !c.is_empty()) {
+                    Some(c) => format!(
+                        "{} [{}]",
+                        ev.info,
+                        c.lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(30)
+                            .collect::<String>()
+                    ),
+                    None => ev.info.clone(),
+                };
                 Row::new(vec![
                     Cell::from(Self::fmt_event_time(ev.at))
                         .style(Style::default().fg(Color::DarkGray)),
@@ -1277,7 +1521,7 @@ impl TuiDashboard {
                     Cell::from(ev.model.clone().unwrap_or_else(|| "-".into()))
                         .style(Style::default().fg(Color::Cyan)),
                     Cell::from(backend).style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(ev.info.clone()).style(info_style),
+                    Cell::from(info_text).style(info_style),
                 ])
             })
             .collect();

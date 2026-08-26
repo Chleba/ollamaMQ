@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod control;
 mod dispatcher;
+mod reqlog;
 mod tui;
 
 use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
@@ -168,8 +169,32 @@ async fn main() {
         .or(file_cfg.settings.load_keep_alive)
         .unwrap_or(86400);
     let stuck_timeout = file_cfg.settings.stuck_timeout.unwrap_or(60);
-    let max_concurrent_per_backend =
-        file_cfg.settings.max_concurrent_per_backend.unwrap_or(1);
+    // Default the global per-backend cap to the highest configured per-model
+    // concurrency so `max_concurrent_requests: N` isn't silently capped at 1
+    // when `settings.max_concurrent_per_backend` is omitted.
+    let max_concurrent_per_backend = file_cfg
+        .settings
+        .max_concurrent_per_backend
+        .unwrap_or_else(|| {
+            file_cfg
+                .models
+                .iter()
+                .map(|m| m.max_concurrent_requests)
+                .max()
+                .unwrap_or(1)
+        });
+    let request_log_path = file_cfg
+        .settings
+        .request_log_path
+        .clone()
+        .unwrap_or_else(|| "ollamamq-requests.jsonl".to_string());
+    let request_log_max_bytes = file_cfg.settings.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
+    let request_log_max_files = file_cfg.settings.request_log_max_files.unwrap_or(5);
+    let log_content_limit = file_cfg
+        .settings
+        .log_content_limit
+        .map(|v| v.max(1024))
+        .unwrap_or(65_536);
     let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
 
     let backend_urls: Vec<String> = args
@@ -219,6 +244,22 @@ async fn main() {
             .init();
     }
 
+    // Start the size-rotated request log; fall back to a no-op logger when
+    // the path is unwritable. The writer task handle is kept alive for the
+    // process lifetime (same pattern as `_guard` above).
+    let (reqlog, _reqlog_guard) =
+        match crate::reqlog::RequestLogger::start(
+            request_log_path,
+            request_log_max_bytes,
+            request_log_max_files,
+        ) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("request log disabled: {e}");
+                (crate::reqlog::RequestLogger::disabled(), tokio::task::spawn(async {}))
+            }
+        };
+
     let state = Arc::new(AppState::new(
         backend_urls,
         timeout,
@@ -227,6 +268,8 @@ async fn main() {
         max_concurrent_per_backend,
         args.model_config.clone(),
         file_cfg.models,
+        reqlog,
+        log_content_limit,
     ));
 
     let worker_state = state.clone();

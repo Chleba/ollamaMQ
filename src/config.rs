@@ -60,6 +60,20 @@ pub struct Settings {
     /// from each model entry's `max_concurrent_requests`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_per_backend: Option<u32>,
+    /// Path of the size-rotated request log file (default
+    /// "ollamamq-requests.jsonl" in the working directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_path: Option<String>,
+    /// Max bytes per request-log file before rotation (default 10 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_max_bytes: Option<u64>,
+    /// Number of rotated request-log files to keep (default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_max_files: Option<usize>,
+    /// Max bytes of request/response body content captured per record in the
+    /// request log; values below 1024 are raised to 1024 (default 65536).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_content_limit: Option<usize>,
 }
 
 /// Top-level config file structure.

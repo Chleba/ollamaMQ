@@ -297,6 +297,30 @@ models:
 
 See [`appconf.yaml.example`](appconf.yaml.example) for a fully commented template.
 
+## Request logging
+
+Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON lines to `settings.request_log_path` (default `ollamamq-requests.jsonl`). Each line is one JSON object:
+
+| field | meaning |
+| --- | --- |
+| `ts` | unix time in milliseconds |
+| `dir` | `IN` (proxied request) or `OUT` (upstream response) |
+| `user` | client address |
+| `model` | model name, when resolvable (otherwise null) |
+| `backend` | upstream backend URL (may be null) |
+| `method` | HTTP method |
+| `path` | request path |
+| `status` | response status code (responses only) |
+| `bytes` | total body size in bytes |
+| `content_type` | body content type |
+| `content` | body preview, truncated to `log_content_limit` with a `...[truncated: N bytes total]` marker |
+
+**Rotation:** when the file exceeds `request_log_max_bytes` it is renamed to `.0` (existing `.0` → `.1`, etc.), at most `request_log_max_files` rotated files are kept and the oldest is deleted. The current file size is re-read at startup, so sizing/rotation survives restarts.
+
+**TUI:** the bottom "Requests" panel shows these newest-first with a one-line content preview; press **Enter** on a row for the full-content detail view (`j`/`k` or `PgUp`/`PgDn` scroll, `q`/`Esc`/`Enter` close).
+
+> **Note:** request/response headers are deliberately **not** logged — this keeps API keys out of the file.
+
 ## 🐳 Docker
 
 ### Docker Compose

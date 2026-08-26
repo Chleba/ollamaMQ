@@ -659,6 +659,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                     "reloading '{}' on {}: context {} != configured {}",
                                     cfg.name, url, a, want
                                 ),
+                                content: None,
                             });
                             let canonical = {
                                 let backends = st.backends.lock().unwrap();
@@ -715,6 +716,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                             "load '{}' skipped: already loaded on {}",
                             cfg.name, url
                         ),
+                        content: None,
                     });
                     continue;
                 }
@@ -741,6 +743,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                     model: Some(cfg.name.clone()),
                     backend: None,
                     info,
+                    content: None,
                 });
             }
         });
@@ -1858,6 +1861,8 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
         ));
         // Simulate a probed backend: model available AND resident.
         {
@@ -1907,6 +1912,8 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
         ));
         // Simulate a probed backend: model resident with context 2048 (the
         // mock's /api/ps reports context_length), config wants 16384.
@@ -1972,6 +1979,8 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
         ));
         // llama3 is available but NOT resident (mock /api/ps lists only qwen2.5:7b).
         {

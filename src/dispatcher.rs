@@ -33,6 +33,9 @@ pub enum ResponsePart {
 pub struct Task {
     pub method: Method,
     pub path: String,
+    /// Client identity (ConnectInfo addr string) so OUT request-log records
+    /// carry the same user as their IN record.
+    pub user: String,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub responder: mpsc::Sender<ResponsePart>,
@@ -205,6 +208,10 @@ pub struct AppState {
     pub model_config_path: String,
     /// Ring buffer of recent request/control events for the TUI Logs panel.
     pub logs: Mutex<VecDeque<LogEvent>>,
+    /// Size-rotated request/response content logger (no-op when disabled).
+    pub reqlog: crate::reqlog::RequestLogger,
+    /// Max bytes of body content captured per record in the request log.
+    pub log_content_limit: usize,
 }
 
 /// One line of the TUI Logs panel: a request entering ("IN") or leaving
@@ -219,12 +226,18 @@ pub struct LogEvent {
     pub backend: Option<String>,
     /// Status code or short note ("queued", "dropped", …).
     pub info: String,
+    /// Optional body/response content preview (truncated to the configured
+    /// limit) for IN/OUT events; None for drops and control actions.
+    pub content: Option<String>,
 }
 
 /// How many log events to keep in the ring buffer.
 const MAX_LOG_EVENTS: usize = 300;
+/// How many of the newest events may keep their (potentially large) content; older ones have it stripped to bound memory.
+const MAX_LOG_CONTENT_EVENTS: usize = 100;
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_urls: Vec<String>,
         timeout: u64,
@@ -233,6 +246,8 @@ impl AppState {
         max_concurrent_per_backend: u32,
         model_config_path: String,
         model_config: Vec<crate::config::ModelConfig>,
+        reqlog: crate::reqlog::RequestLogger,
+        log_content_limit: usize,
     ) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         let backends = backend_urls
@@ -287,6 +302,8 @@ impl AppState {
             model_config: Mutex::new(model_config),
             model_config_path,
             logs: Mutex::new(VecDeque::new()),
+            reqlog,
+            log_content_limit,
         }
     }
 
@@ -361,6 +378,18 @@ impl AppState {
         logs.push_back(ev);
         while logs.len() > MAX_LOG_EVENTS {
             logs.pop_front();
+        }
+        // Bound memory: only the newest MAX_LOG_CONTENT_EVENTS may keep
+        // their (potentially large) content — strip it from older events,
+        // walking the ring from the front (oldest first).
+        let mut content_events = logs.iter().filter(|e| e.content.is_some()).count();
+        let mut i = 0;
+        while content_events > MAX_LOG_CONTENT_EVENTS {
+            if let Some(e) = logs.get_mut(i).filter(|e| e.content.is_some()) {
+                e.content = None;
+                content_events -= 1;
+            }
+            i += 1;
         }
     }
 }
@@ -838,6 +867,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         "503 no backend can serve (waited {}s)",
                                         waited
                                     ),
+                                    content: None,
                                 });
                                 let responder = dropped.responder;
                                 tokio::spawn(async move {
@@ -944,7 +974,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 tokio::spawn(async move {
                     let log_model = task.requested_model.clone();
                     let api_family = detect_api_family(&task.path);
-                    let log_out = |info: String, backend: Option<String>| {
+                    let log_out = |info: String, backend: Option<String>, content: Option<String>| {
                         state_clone.log_event(LogEvent {
                             at: std::time::SystemTime::now(),
                             dir: "OUT",
@@ -952,6 +982,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             model: log_model.clone(),
                             backend,
                             info,
+                            content,
                         });
                     };
 
@@ -972,12 +1003,23 @@ pub async fn run_worker(state: Arc<AppState>) {
                         log_out(
                             "dropped (blocked)".into(),
                             Some(backend_url.clone()),
+                            None,
                         );
                     } else {
                         {
                             let mut processing = state_clone.processing_counts.lock().unwrap();
                             *processing.entry(user_id.clone()).or_insert(0) += 1;
                         }
+
+                        // Response size + bounded content prefix for the
+                        // request log (appends stop at log_content_limit, but
+                        // total_bytes keeps counting).
+                        let mut total_bytes: u64 = 0;
+                        let mut content_acc: Vec<u8> = Vec::new();
+                        // `task.method`/`task.path` are moved into the request
+                        // builder below; capture strings for log records.
+                        let method_str = task.method.to_string();
+                        let path_str = task.path.clone();
 
                         let res_fut = client_clone
                             .request(task.method, &url)
@@ -991,6 +1033,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 let mut headers = response.headers().clone();
                                 headers.remove(axum::http::header::TRANSFER_ENCODING);
                                 headers.remove(axum::http::header::CONTENT_LENGTH);
+                                let resp_content_type = headers
+                                    .get(axum::http::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string);
 
                                 if task
                                     .responder
@@ -1012,6 +1058,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                     first_prefix = Some(
                                                         String::from_utf8_lossy(&chunk[..n])
                                                             .into_owned(),
+                                                    );
+                                                }
+                                                let n = chunk.len();
+                                                total_bytes += n as u64;
+                                                if content_acc.len() < state_clone.log_content_limit {
+                                                    let room =
+                                                        state_clone.log_content_limit
+                                                            - content_acc.len();
+                                                    content_acc.extend_from_slice(
+                                                        &chunk[..n.min(room)],
                                                     );
                                                 }
                                                 if task
@@ -1044,13 +1100,31 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         let mut counts =
                                             state_clone.processed_counts.lock().unwrap();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
+                                        drop(counts);
+                                        let content_str = crate::reqlog::truncate_utf8(
+                                            &content_acc,
+                                            state_clone.log_content_limit,
+                                        );
+                                        state_clone.reqlog.log(crate::reqlog::ReqRecord {
+                                            ts: crate::reqlog::now_unix_millis(),
+                                            dir: "OUT",
+                                            user: task.user.clone(),
+                                            model: log_model.clone(),
+                                            backend: Some(backend_url.clone()),
+                                            method: method_str.clone(),
+                                            path: path_str.clone(),
+                                            status: Some(status.as_u16()),
+                                            bytes: Some(total_bytes),
+                                            content_type: resp_content_type,
+                                            content: Some(content_str.clone()),
+                                        });
                                         log_out(
                                             format!(
-                                                "{} {}",
-                                                status.as_u16(),
-                                                status.canonical_reason().unwrap_or("")
+                                                "{} {} -> {} resp={}B",
+                                                method_str, path_str, status.as_u16(), total_bytes
                                             ),
                                             Some(backend_url.clone()),
+                                            Some(content_str),
                                         );
                                     } else {
                                         let mut dropped =
@@ -1059,17 +1133,33 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         log_out(
                                             "dropped (client gone)".into(),
                                             Some(backend_url.clone()),
+                                            None,
                                         );
                                     }
                                 }
                             }
                             Err(e) => {
+                                let err_msg = format!("upstream error: {}", e);
+                                state_clone.reqlog.log(crate::reqlog::ReqRecord {
+                                    ts: crate::reqlog::now_unix_millis(),
+                                    dir: "OUT",
+                                    user: task.user.clone(),
+                                    model: log_model.clone(),
+                                    backend: Some(backend_url.clone()),
+                                    method: method_str,
+                                    path: path_str,
+                                    status: None,
+                                    bytes: Some(total_bytes),
+                                    content_type: None,
+                                    content: Some(err_msg.clone()),
+                                });
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
                                 let mut dropped = state_clone.dropped_counts.lock().unwrap();
                                 *dropped.entry(user_id.clone()).or_insert(0) += 1;
                                 log_out(
                                     "dropped (backend error)".into(),
                                     Some(backend_url.clone()),
+                                    Some(err_msg),
                                 );
                             }
                         }
@@ -1157,9 +1247,13 @@ pub async fn proxy_handler(
     };
 
     let task_method = method.as_str().to_string();
+    // Request-log content is captured before `body` moves into the Task.
+    let body_len = body.len() as u64;
+    let content = crate::reqlog::truncate_utf8(&body, state.log_content_limit);
     let task = Task {
         path: path.clone(),
         method,
+        user: addr.to_string(),
         headers: task_headers,
         responder: tx,
         body,
@@ -1176,13 +1270,31 @@ pub async fn proxy_handler(
             .push_back(task);
     }
 
+    state.reqlog.log(crate::reqlog::ReqRecord {
+        ts: crate::reqlog::now_unix_millis(),
+        dir: "IN",
+        user: addr.to_string(),
+        model: requested_model.clone(),
+        backend: None,
+        method: task_method.clone(),
+        path: path.clone(),
+        status: None,
+        bytes: Some(body_len),
+        content_type: headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        content: Some(content.clone()),
+    });
+
     state.log_event(crate::dispatcher::LogEvent {
         at: std::time::SystemTime::now(),
         dir: "IN",
         user: user_id.clone(),
         model: requested_model.clone(),
         backend: None,
-        info: format!("queued {} {}", task_method, path),
+        info: format!("{} {} body={}B", task_method, path, body_len),
+        content: Some(content),
     });
 
     state.notify.notify_one();
@@ -1406,6 +1518,8 @@ mod tests {
             1,     // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
         ));
 
         let (tx, mut rx) = mpsc::channel(32);
@@ -1413,6 +1527,7 @@ mod tests {
             let mut queues = state.queues.lock().unwrap();
             queues.entry("tester".to_string()).or_default().push_back(Task {
                 method: Method::POST,
+                user: "127.0.0.1:41000".to_string(),
                 path: "/api/chat".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::from(r#"{"model":"no-such-model-xyz","messages":[]}"#),
