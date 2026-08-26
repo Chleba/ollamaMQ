@@ -342,6 +342,12 @@ pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
     b.api_type = probe.api_type;
     b.available_models = probe.available_models;
     b.loaded_models = probe.loaded_models;
+    // Loaded state is only KNOWN when the latest probe actually got data from
+    // a loaded-models endpoint; otherwise "available" implies "ready".
+    b.loaded_state_known = probe
+        .good_endpoints
+        .iter()
+        .any(|e| e == "/api/ps" || e == "/api/v1/models");
     b.loaded_ctx = probe.loaded_ctx;
     b.lmstudio = probe.lmstudio;
     b.native_models = probe.native_models;
@@ -1376,6 +1382,7 @@ mod tests {
             api_type,
             available_models: available.iter().map(|s| s.to_string()).collect(),
             loaded_models: loaded.iter().map(|s| s.to_string()).collect(),
+            loaded_state_known: false,
             loaded_ctx: HashMap::new(),
             current_model: None,
             active_by_model: HashMap::new(),

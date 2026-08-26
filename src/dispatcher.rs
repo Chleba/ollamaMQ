@@ -135,6 +135,11 @@ pub struct BackendStatus {
     pub api_type: BackendApiType,
     pub available_models: HashSet<String>,
     pub loaded_models: HashSet<String>,
+    /// True when the backend reported loaded-model data in its latest probe
+    /// (Ollama `/api/ps` or LM Studio `/api/v1/models`). `false` means the
+    /// loaded state is UNKNOWN (no such endpoint, or it is skipped as bad) —
+    /// for such backends (e.g. vLLM) "available" implies "ready to serve".
+    pub loaded_state_known: bool,
     /// Actual context window of each resident model, keyed by model name/key
     /// (Ollama `/api/ps` `context_length`; LM Studio loaded instance
     /// `config.context_length`). Used to detect resident models whose
@@ -260,6 +265,7 @@ impl AppState {
                 api_type: BackendApiType::Unknown,
                 available_models: HashSet::new(),
                 loaded_models: HashSet::new(),
+                loaded_state_known: false,
                 loaded_ctx: HashMap::new(),
                 current_model: None,
                 active_by_model: HashMap::new(),
@@ -422,9 +428,26 @@ fn model_base(id: &str) -> String {
     }
 }
 
+/// True when `requested` matches `listed` under the bounded rules shared by
+/// `model_routable`: tag/case-insensitive equality (`smart_model_match_one`),
+/// or equality after full normalization (lowercase, strip `:tag` and `@quant`),
+/// or — for bare requested names only — publisher-stripped base equality.
+fn name_matches_listed(requested: &str, listed: &str) -> bool {
+    if smart_model_match_one(requested, listed)
+        || normalize_model_id(listed) == normalize_model_id(requested)
+    {
+        return true;
+    }
+    if !requested.contains('/') {
+        return model_base(requested) == model_base(listed);
+    }
+    false
+}
+
 /// Scheduler-side routability check. Deterministic and bounded — no arbitrary
 /// substring matching (which could route `qwen3.8-27b` to an unrelated
-/// `huihui-qwen3.8-27b-abliterated`). A backend is eligible when any listed id:
+/// `huihui-qwen3.8-27b-abliterated`). A backend is eligible when any listed id
+/// matches via `name_matches_listed`:
 /// - equals the request after tag/case normalization (`smart_model_match_one`), or
 /// - equals it after full normalization (handles `@quant` suffixes on either side), or,
 /// - for bare requested names only — equals its publisher-stripped base, so a
@@ -433,15 +456,28 @@ fn model_base(id: &str) -> String {
 /// Owner-prefixed requests are strict: the backend must list that exact id up to
 /// tag/quant normalization.
 fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
-    let req_norm = normalize_model_id(requested);
-    // Bare names may match across publishers; owner-prefixed ones are strict.
-    let req_base = if requested.contains('/') { None } else { Some(model_base(requested)) };
-    available.iter().any(|m| {
-        if smart_model_match_one(requested, m) || normalize_model_id(m) == req_norm {
-            return true;
-        }
-        matches!(req_base.as_deref(), Some(rb) if rb == model_base(m))
-    })
+    available.iter().any(|m| name_matches_listed(requested, m))
+}
+
+/// True when the requested model is resident on this backend per its latest
+/// probe: either in `loaded_models` (Ollama `/api/ps`, LM Studio loaded
+/// instance keys/ids) or — for LM Studio — a native-list entry with loaded
+/// instances whose key or display name matches the request.
+pub fn model_loaded_on(b: &BackendStatus, requested: &str) -> bool {
+    if model_routable(requested, &b.loaded_models) {
+        return true;
+    }
+    if b.lmstudio {
+        return b.native_models.iter().any(|m| {
+            !m.loaded_instance_ids.is_empty()
+                && (name_matches_listed(requested, &m.key)
+                    || m.display_name
+                        .as_deref()
+                        .map(|d| name_matches_listed(requested, d))
+                        .unwrap_or(false))
+        });
+    }
+    false
 }
 
 /// Per-model concurrency limits keyed by normalized model name, from the
@@ -810,21 +846,55 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .map(|(i, _)| i)
                             .collect();
 
-                        // Prefer backends where the requested model is already loaded in GPU memory
-                        // (LM Studio: loaded_instances; Ollama: /api/ps). available_models stays the
-                        // HARD requirement; loaded_models is only a PREFERENCE among eligible backends.
-                        // If no eligible backend has it loaded, fall back to the full available set
-                        // so on-demand loading still works.
+                        // Model-load-aware selection among eligible backends (see model_loaded_on):
+                        //   tier 1 — the requested model is confirmed loaded on the backend, or the
+                        //            backend doesn't report loaded state at all (e.g. vLLM: "available"
+                        //            means "ready to serve");
+                        //   tier 2 — the backend reports loaded state but has nothing loaded (cold
+                        //            start; loading the requested model evicts nothing);
+                        //   tier 3 — last resort: the backend has a DIFFERENT model loaded; on-demand
+                        //            loading would evict it (slow, and may fail).
                         let eligible_indices = if let Some(ref model) = task_ref.requested_model {
-                            let loaded_eligible: Vec<usize> = eligible_indices
+                            let tier1: Vec<usize> = eligible_indices
                                 .iter()
                                 .cloned()
-                                .filter(|&i| model_routable(model, &backends[i].loaded_models))
+                                .filter(|&i| {
+                                    let b = &backends[i];
+                                    model_loaded_on(b, model) || !b.loaded_state_known
+                                })
                                 .collect();
-                            if loaded_eligible.is_empty() {
-                                eligible_indices
+                            if !tier1.is_empty() {
+                                if tier1.len() < eligible_indices.len() {
+                                    debug!(
+                                        "model '{}' ready on {} of {} eligible backend(s) — routing to loaded backend(s)",
+                                        model,
+                                        tier1.len(),
+                                        eligible_indices.len()
+                                    );
+                                }
+                                tier1
                             } else {
-                                loaded_eligible
+                                let tier2: Vec<usize> = eligible_indices
+                                    .iter()
+                                    .cloned()
+                                    .filter(|&i| {
+                                        let b = &backends[i];
+                                        b.loaded_state_known && b.loaded_models.is_empty()
+                                    })
+                                    .collect();
+                                if !tier2.is_empty() {
+                                    debug!(
+                                        "no backend has model '{}' loaded; using cold backend(s) (nothing loaded to evict)",
+                                        model
+                                    );
+                                    tier2
+                                } else {
+                                    warn!(
+                                        "no backend has model '{}' loaded and every eligible backend has a different model loaded; falling back to on-demand load (may evict a loaded model)",
+                                        model
+                                    );
+                                    eligible_indices
+                                }
                             }
                         } else {
                             eligible_indices
@@ -1398,6 +1468,7 @@ mod tests {
             api_type,
             available_models: HashSet::new(),
             loaded_models: HashSet::new(),
+            loaded_state_known: false,
             loaded_ctx: HashMap::new(),
             current_model: None,
             active_by_model: HashMap::new(),
@@ -1407,6 +1478,65 @@ mod tests {
             rejected_families: rejected.iter().copied().collect(),
             family_fail_counts: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn model_loaded_on_matches_ollama_ps() {
+        let mut b = backend_with(BackendApiType::Ollama, &[]);
+        b.loaded_state_known = true;
+        b.loaded_models = set(&["qwen3.8-27b:latest"]);
+        assert!(model_loaded_on(&b, "qwen3.8-27b"));
+        assert!(!model_loaded_on(&b, "other-model"));
+    }
+
+    #[test]
+    fn model_loaded_on_matches_lmstudio_key_with_quant() {
+        let mut b = backend_with(BackendApiType::OpenAi, &[]);
+        b.lmstudio = true;
+        b.loaded_state_known = true;
+        b.loaded_models = set(&["unsloth/qwen3.8-27b@q8_0"]);
+        // Bare request name reaches the publisher/quant-prefixed loaded key.
+        assert!(model_loaded_on(&b, "qwen3.8-27b"));
+    }
+
+    #[test]
+    fn model_loaded_on_matches_lmstudio_display_name() {
+        let mut b = backend_with(BackendApiType::OpenAi, &[]);
+        b.lmstudio = true;
+        b.loaded_state_known = true;
+        b.native_models.push(LmModelInfo {
+            key: "unsloth/qwen3.8-27b@q8_0".into(),
+            display_name: Some("Qwen3.8 27B".into()),
+            loaded_instance_ids: vec!["unsloth/qwen3.8-27b@q8_0".into()],
+        });
+        // The display name matches directly (no `:tag`/`@quant` on either side).
+        assert!(model_loaded_on(&b, "Qwen3.8 27B"));
+        // The key matches via the shared bounded rules (bare-name base compare).
+        assert!(model_loaded_on(&b, "qwen3.8-27b"));
+    }
+
+    #[test]
+    fn model_loaded_on_ignores_unloaded_native_entries() {
+        let mut b = backend_with(BackendApiType::OpenAi, &[]);
+        b.lmstudio = true;
+        b.loaded_state_known = true;
+        b.native_models.push(LmModelInfo {
+            key: "unsloth/qwen3.8-27b@q8_0".into(),
+            display_name: Some("Qwen3.8 27B".into()),
+            loaded_instance_ids: Vec::new(),
+        });
+        // Listed but with no loaded instances: not resident.
+        assert!(!model_loaded_on(&b, "qwen3.8-27b"));
+        assert!(!model_loaded_on(&b, "Qwen3.8 27B"));
+    }
+
+    #[test]
+    fn model_loaded_on_no_match() {
+        let mut b = backend_with(BackendApiType::OpenAi, &[]);
+        b.lmstudio = true;
+        b.loaded_state_known = true;
+        b.loaded_models = set(&["ovisocr2@q4_k_m"]);
+        assert!(!model_loaded_on(&b, "qwen3.8-27b"));
     }
 
     #[test]
@@ -1553,5 +1683,421 @@ mod tests {
         }
 
         worker.abort();
+    }
+
+    // -- Scheduler-tier integration tests ------------------------------------
+    //
+    // Each test stands up tiny local HTTP mocks (real TCP listeners on
+    // 127.0.0.1:0) that mimic what a backend reports to the health probes,
+    // and pre-sets state.backends to exactly the state those probe answers
+    // produce BEFORE spawning the worker: the first probe cycle runs
+    // immediately and overwrites backend state via apply_probe, so the
+    // scenario the scheduler sees is the same whether or not that cycle
+    // lands before the selection. Selection is observed via state.backends.
+
+    /// Tiny backend mock: for every accepted connection it reads the
+    /// request line and answers by path —
+    ///  - GET /v1/models     → 200 + the OpenAI-style model list (`v1_models`)
+    ///  - GET /api/v1/models → 200 + LM Studio native list, or 404 when None
+    ///  - GET /api/tags, /api/ps → 200 + LM Studio-style rejection (remembered
+    ///    as a bad endpoint by the health loop)
+    ///  - anything else (the actual proxied POST) → 200 {"ok":true}, quickly
+    ///
+    /// Returns (URL, abort handle of the accept loop).
+    async fn spawn_mock_backend(
+        v1_models: &str,
+        native_models: Option<&str>,
+    ) -> (String, tokio::task::AbortHandle) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock backend");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("mock local addr")
+        );
+        let v1 = v1_models.to_string();
+        let native = native_models.map(|s| s.to_string());
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break, // accept loop aborted
+                };
+                let v1 = v1.clone();
+                let native = native.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = match sock.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("");
+                    let (status, body) = match path {
+                        "/v1/models" => ("200 OK", v1.clone()),
+                        "/api/v1/models" => match &native {
+                            Some(json) => ("200 OK", json.clone()),
+                            None => ("404 Not Found", r#"{"detail":"Not Found"}"#.to_string()),
+                        },
+                        "/api/tags" | "/api/ps" => (
+                            "200 OK",
+                            r#"{"error":"Unexpected endpoint or method."}"#.to_string(),
+                        ),
+                        _ => ("200 OK", r#"{"ok":true}"#.to_string()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (url, handle.abort_handle())
+    }
+
+    /// LM Studio backend scenario shared by the tier tests: ovisocr2 loaded,
+    /// qwen listed but not loaded (probe answers that reproduce exactly this
+    /// state, loaded_state_known = true).
+    const OVISOCR2_V1_MODELS: &str =
+        r#"{"data":[{"id":"qwen3.8-27b"},{"id":"ovisocr2@q4_k_m"}]}"#;
+    const OVISOCR2_NATIVE: &str = r#"{"models":[{"key":"ovisocr2@q4_k_m","display_name":"OvisOCR2","loaded_instances":[{"id":"ovisocr2@q4_k_m"}]}]}"#;
+    /// OpenAI-style list for the second backend in each scenario.
+    const QWEN_V1_MODELS: &str = r#"{"data":[{"id":"qwen3.8-27b"}]}"#;
+
+    /// Marks `b` as an online LM Studio backend with the given available /
+    /// loaded model sets and native model list — exactly the state the
+    /// matching mock's probe answers produce.
+    fn lmstudio_backend_state(
+        b: &mut BackendStatus,
+        available: &[&str],
+        loaded: &[&str],
+        native: Vec<LmModelInfo>,
+    ) {
+        b.is_online = true;
+        b.api_type = BackendApiType::Both;
+        b.available_models = set(available);
+        b.loaded_models = set(loaded);
+        b.loaded_state_known = true;
+        b.lmstudio = true;
+        b.native_models = native;
+    }
+
+    /// One LM Studio native-list entry with a loaded instance (id == key).
+    fn lm_native_loaded(key: &str, display: &str) -> Vec<LmModelInfo> {
+        vec![LmModelInfo {
+            key: key.to_string(),
+            display_name: Some(display.to_string()),
+            loaded_instance_ids: vec![key.to_string()],
+        }]
+    }
+
+    /// Two-backend test AppState (same shape as the one in
+    /// `stuck_request_fails_fast_with_503`).
+    fn new_test_state(urls: Vec<String>) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            urls,
+            5,     // request timeout
+            86400, // load keep alive
+            1,     // stuck_timeout: fail fast after 1s
+            1,     // max concurrent per backend
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+        ))
+    }
+
+    /// Enqueue one `POST /v1/chat/completions` request for `qwen3.8-27b`
+    /// under user "tester" (full Task construction copied from
+    /// `stuck_request_fails_fast_with_503`). Returns the receiver — keep it
+    /// alive for the test's duration so the worker doesn't drop the request
+    /// as client-gone.
+    fn enqueue_qwen_request(state: &Arc<AppState>) -> mpsc::Receiver<ResponsePart> {
+        let (tx, rx) = mpsc::channel(32);
+        state
+            .queues
+            .lock()
+            .unwrap()
+            .entry("tester".to_string())
+            .or_default()
+            .push_back(Task {
+                method: Method::POST,
+                user: "127.0.0.1:41000".to_string(),
+                path: "/v1/chat/completions".into(),
+                headers: HeaderMap::new(),
+                body: Bytes::from(r#"{"model":"qwen3.8-27b","messages":[]}"#),
+                responder: tx,
+                requested_model: Some("qwen3.8-27b".to_string()),
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+            });
+        rx
+    }
+
+    /// Poll state.backends every 100 ms (10 s overall) until exactly one
+    /// backend has taken the single enqueued request: in-flight
+    /// (`active_requests == 1`) or completed (`processed_count == 1`). The
+    /// mock answers instantly, so the in-flight window is shorter than the
+    /// poll interval; the stable completion counter is the reliable signal.
+    /// Returns the backend index that took the request.
+    async fn wait_for_picked_backend(state: &Arc<AppState>) -> Option<usize> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let signals: Vec<usize> = state
+                    .backends
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b.active_requests + b.processed_count)
+                    .collect();
+                let total: usize = signals.iter().sum();
+                if total == 1 {
+                    // Only one request exists, so the signal is on one backend.
+                    return signals.into_iter().position(|s| s == 1);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Wait until the picked backend has completed the request
+    /// (`processed_count == 1` is stable; the in-flight counter is back to 0).
+    async fn wait_for_completion(state: &Arc<AppState>, idx: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let (processed, active) = {
+                    let b = &state.backends.lock().unwrap()[idx];
+                    (b.processed_count, b.active_requests)
+                };
+                if processed == 1 && active == 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("picked backend never completed the request");
+    }
+
+    /// Tier 1: an eligible backend where the requested model is LOADED wins
+    /// over an eligible backend that only lists it (routing there would
+    /// evict the other's loaded model).
+    #[tokio::test]
+    async fn tier1_routes_to_backend_with_model_loaded() {
+        // backend0: LM Studio with ovisocr2 loaded; backend1: LM Studio
+        // with qwen loaded.
+        let mock0 = spawn_mock_backend(OVISOCR2_V1_MODELS, Some(OVISOCR2_NATIVE)).await;
+        let mock1 = spawn_mock_backend(
+            QWEN_V1_MODELS,
+            Some(
+                r#"{"models":[{"key":"unsloth/qwen3.8-27b@q8_0","display_name":"Qwen3.8 27B","loaded_instances":[{"id":"unsloth/qwen3.8-27b@q8_0"}]}]}"#,
+            ),
+        )
+        .await;
+
+        let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
+
+        // Same state the mocks' probe answers produce: the immediate first
+        // health cycle may run and apply them without changing the scenario.
+        {
+            let mut backends = state.backends.lock().unwrap();
+            lmstudio_backend_state(
+                &mut backends[0],
+                &["qwen3.8-27b", "ovisocr2@q4_k_m"],
+                &["ovisocr2@q4_k_m"],
+                lm_native_loaded("ovisocr2@q4_k_m", "OvisOCR2"),
+            );
+            lmstudio_backend_state(
+                &mut backends[1],
+                &["qwen3.8-27b"],
+                &["unsloth/qwen3.8-27b@q8_0"],
+                lm_native_loaded("unsloth/qwen3.8-27b@q8_0", "Qwen3.8 27B"),
+            );
+        }
+
+        let _rx = enqueue_qwen_request(&state);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // qwen is loaded on backend1 (tier 1); backend0 would have to evict
+        // ovisocr2 — the request must go to backend1.
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 1);
+        wait_for_completion(&state, picked).await;
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[1].processed_count, 1);
+            assert_eq!(backends[0].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// Tier 1: a backend that does not report loaded state at all
+    /// (vLLM-style: no /api/ps or /api/v1/models) counts as READY when it
+    /// lists the requested model, and is preferred over a backend that
+    /// would have to evict a loaded model.
+    #[tokio::test]
+    async fn tier1_treats_unknown_loaded_state_as_ready() {
+        // backend0: LM Studio with ovisocr2 loaded; backend1: vLLM-style
+        // (404 on the native list, so loaded state stays unknown).
+        let mock0 = spawn_mock_backend(OVISOCR2_V1_MODELS, Some(OVISOCR2_NATIVE)).await;
+        let mock1 = spawn_mock_backend(QWEN_V1_MODELS, None).await;
+
+        let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            lmstudio_backend_state(
+                &mut backends[0],
+                &["qwen3.8-27b", "ovisocr2@q4_k_m"],
+                &["ovisocr2@q4_k_m"],
+                lm_native_loaded("ovisocr2@q4_k_m", "OvisOCR2"),
+            );
+            // vLLM-style: lists the model, reports no loaded state.
+            backends[1].is_online = true;
+            backends[1].api_type = BackendApiType::OpenAi;
+            backends[1].available_models = set(&["qwen3.8-27b"]);
+            backends[1].loaded_models = HashSet::new();
+            backends[1].loaded_state_known = false;
+            backends[1].lmstudio = false;
+            backends[1].native_models = Vec::new();
+        }
+
+        let _rx = enqueue_qwen_request(&state);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // Unknown loaded state implies ready: backend1 is tier 1 even though
+        // it cannot prove qwen is resident.
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 1);
+        wait_for_completion(&state, picked).await;
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[1].processed_count, 1);
+            assert_eq!(backends[0].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// Tier 2: a backend that reports loaded state but has nothing loaded
+    /// (cold — loading the requested model evicts nothing) is preferred
+    /// over an eligible backend with a different model loaded.
+    #[tokio::test]
+    async fn tier2_prefers_cold_backend_over_loaded_other() {
+        // backend0: LM Studio with ovisocr2 loaded; backend1: cold LM Studio
+        // (native list is empty: state known, nothing loaded).
+        let mock0 = spawn_mock_backend(OVISOCR2_V1_MODELS, Some(OVISOCR2_NATIVE)).await;
+        let mock1 = spawn_mock_backend(QWEN_V1_MODELS, Some(r#"{"models":[]}"#)).await;
+
+        let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            lmstudio_backend_state(
+                &mut backends[0],
+                &["qwen3.8-27b", "ovisocr2@q4_k_m"],
+                &["ovisocr2@q4_k_m"],
+                lm_native_loaded("ovisocr2@q4_k_m", "OvisOCR2"),
+            );
+            lmstudio_backend_state(&mut backends[1], &["qwen3.8-27b"], &[], Vec::new());
+        }
+
+        let _rx = enqueue_qwen_request(&state);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // No backend has qwen loaded; the cold backend1 is tier 2 and wins
+        // over backend0, whose ovisocr2 would be evicted.
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 1);
+        wait_for_completion(&state, picked).await;
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[1].processed_count, 1);
+            assert_eq!(backends[0].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// Tier 3: when every eligible backend has a different model loaded and
+    /// none is cold or ready, on-demand loading (which may evict the loaded
+    /// model) is preserved as the last resort. Offline backends never enter
+    /// the eligible set.
+    #[tokio::test]
+    async fn tier3_last_resort_on_demand_load() {
+        let mock0 = spawn_mock_backend(OVISOCR2_V1_MODELS, Some(OVISOCR2_NATIVE)).await;
+        // A port that was just closed: the "offline" backend never answers a
+        // probe, so the immediate first health cycle keeps it offline.
+        let offline_url = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind temp listener");
+            let addr = l.local_addr().expect("temp addr");
+            drop(l);
+            format!("http://{}", addr)
+        };
+
+        let state = new_test_state(vec![mock0.0.clone(), offline_url]);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            lmstudio_backend_state(
+                &mut backends[0],
+                &["qwen3.8-27b", "ovisocr2@q4_k_m"],
+                &["ovisocr2@q4_k_m"],
+                lm_native_loaded("ovisocr2@q4_k_m", "OvisOCR2"),
+            );
+            lmstudio_backend_state(
+                &mut backends[1],
+                &["qwen3.8-27b", "ovisocr2@q4_k_m"],
+                &["ovisocr2@q4_k_m"],
+                lm_native_loaded("ovisocr2@q4_k_m", "OvisOCR2"),
+            );
+            backends[1].is_online = false; // not eligible
+        }
+
+        let _rx = enqueue_qwen_request(&state);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // Only backend0 is eligible and it has ovisocr2 loaded — qwen is
+        // served there via on-demand load (last-resort tier), not dropped.
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 0);
+        wait_for_completion(&state, picked).await;
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[0].processed_count, 1);
+            assert_eq!(backends[1].processed_count, 0);
+            assert!(!backends[1].is_online);
+        }
+
+        worker.abort();
+        mock0.1.abort();
     }
 }
