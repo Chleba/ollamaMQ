@@ -286,6 +286,10 @@ settings:
                                  # /api/blobs/{digest} keeps its own 1 GiB allowance.
   max_queued_bytes: 536870912    # total bytes of request bodies waiting in all queues, 503 beyond it
                                  # (default 512 MiB); a request is always admitted when the queues are empty
+  request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown)
+  request_log_max_bytes: 10485760             # rotate when the file exceeds this (default 10 MiB)
+  request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
+  log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
 
 # --- Models to load on startup / reload, via the model-control logic
 models:

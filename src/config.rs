@@ -3,8 +3,8 @@
 //!
 //! * `backends` — backend URLs ollamaMQ connects to (same as
 //!   `--backend-urls`; CLI wins when given).
-//! * `settings` — runtime settings (`port`, `host`, `timeout`,
-//!   `load_keep_alive`, `allow_all_routes`); CLI flags win when given.
+//! * `settings` — runtime settings; see [`Settings`] for the full list and
+//!   the default each one falls back to. CLI flags win when given.
 //! * `models` — models to load onto backends via the model-control
 //!   load/unload logic, with per-model parameters.
 //!
