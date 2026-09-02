@@ -1356,7 +1356,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         // fails with 503 instead of routing elsewhere.
                                         Some(model) => {
                                             model_routable(model, &b.available_models)
-                                                && pin.as_ref().map_or(true, |pins| {
+                                                && pin.as_ref().is_none_or(|pins| {
                                                     pins.iter()
                                                         .any(|p| pin_url_matches(p, &b.url))
                                                 })
@@ -3699,7 +3699,7 @@ mod tests {
             .expect("responder closed");
         match &chunk {
             ResponsePart::Chunk(bytes) => {
-                let body = String::from_utf8_lossy(&bytes);
+                let body = String::from_utf8_lossy(bytes);
                 assert!(
                     body.contains(r#"no configured backend available for model 'm'"#),
                     "unexpected 503 body: {}",
