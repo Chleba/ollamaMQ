@@ -13,11 +13,14 @@
 - **Smart Model Matching**: Robust matching that handles common variations like `:latest` tags and case-insensitivity. For example, a request for `llama3` will correctly match `llama3:latest` on the backend.
 - **Model Control**: Load and unload models on connected backends (Ollama and LM Studio 0.3.6+) directly from the TUI (`L`/`U`) or the admin HTTP API — without touching the backend servers themselves.
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
-- **Backend Health Checks**: Automatically monitors backend status every 10 seconds. Probes for both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Endpoints a backend rejects are remembered and skipped until re-checked, so incompatible backends don't spam warnings. Offline instances are temporarily skipped and marked in the TUI.
+- **Aggregated Model Listings**: `GET /api/tags` and `GET /v1/models` are answered by the proxy from **every** compatible backend at once, not routed to one of them. Each backend's own listing is merged (so per-model metadata like `size`, `digest` and `details` is preserved exactly as that backend reported it) and deduplicated by name/id. Clients therefore see everything the proxy can route to, and the list no longer changes from one poll to the next depending on which backend happened to answer.
+- **Backend Health Checks**: Automatically monitors backend status every 10 seconds. All backends are probed **concurrently**, each request bounded by its own 5-second timeout, so one unresponsive backend can't hold up everyone else's status. Probes cover both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Endpoints a backend rejects are remembered and skipped until re-checked, so incompatible backends don't spam warnings. Offline instances are temporarily skipped and marked in the TUI.
 - **Fail-Fast for Unsatisfiable Requests**: If no online backend can ever serve a queued request (wrong API family or model absent everywhere), it is answered with `503` after `stuck_timeout` seconds instead of hanging forever. Requests merely waiting for a busy or loading backend are unaffected.
-- **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once).
-- **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
-- **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends.
+- **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once). The limit is keyed on the model's base name, so it applies no matter how the client spells it — `qwen3.8-27b`, `qwen/qwen3.8-27b` and `unsloth/qwen3.8-27b@q8_0` all draw on the same budget as the configured entry.
+- **Metadata Reads Never Queue**: `/`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/v1/models` and `/v1/models/{model}` don't run inference, so they neither wait for a free backend slot nor occupy one — a chat UI polling `/api/tags` on a timer is answered immediately instead of queueing behind a multi-minute generation (or a model load) with the default `max_concurrent_per_backend: 1`.
+- **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
+- **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
+- **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
@@ -93,7 +96,7 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 - `POST /api/chat`
 - `POST /api/embed`
 - `POST /api/embeddings`
-- `GET /api/tags`
+- `GET /api/tags` (answered by the proxy — merged from all Ollama-compatible backends)
 - `POST /api/show`
 - `POST /api/create`
 - `POST /api/copy`
@@ -106,7 +109,7 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 - `POST /v1/chat/completions` (OpenAI Compatible)
 - `POST /v1/completions` (OpenAI Compatible)
 - `POST /v1/embeddings` (OpenAI Compatible)
-- `GET /v1/models` (OpenAI Compatible)
+- `GET /v1/models` (OpenAI Compatible — answered by the proxy, merged from all OpenAI-compatible backends)
 - `GET /v1/models/{model}` (OpenAI Compatible)
 
 
@@ -276,7 +279,13 @@ settings:
   load_keep_alive: 86400       # how long model-control loads stay resident; -1 = forever (default 86400)
   allow_all_routes: false      # also proxy non-standard endpoints as fallback (default false)
   stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever serve a queued request (default 60)
-  max_concurrent_per_backend: 1  # global cap of in-flight requests per backend; raise to let one backend handle several at once (default 1)
+  max_concurrent_per_backend: 1  # global cap of in-flight requests per backend; raise to let one backend handle several at once (default 1).
+                                 # Metadata reads (/api/tags, /api/ps, /api/show, /v1/models, ...) are exempt: they
+                                 # neither wait for a slot nor take one.
+  max_body_bytes: 67108864       # largest request body accepted, 413 beyond it (default 64 MiB).
+                                 # /api/blobs/{digest} keeps its own 1 GiB allowance.
+  max_queued_bytes: 536870912    # total bytes of request bodies waiting in all queues, 503 beyond it
+                                 # (default 512 MiB); a request is always admitted when the queues are empty
 
 # --- Models to load on startup / reload, via the model-control logic
 models:
@@ -285,14 +294,18 @@ models:
     max_ctx: 128000             # context window — Ollama num_ctx / LM Studio context_length
     keep_alive: 86400           # seconds the model stays resident after load (Ollama; -1 = forever)
     max_concurrent_requests: 3  # in-flight requests allowed for this model on one backend (default 1)
-    backends:                   # which backends to load it on (exact or substring URL match); omitted/empty = any suitable backend
+    backends:                   # which backends to load it on — every backend whose URL contains the string is
+                                #   targeted, so `- :11434` covers all backends on that port; omitted/empty = any suitable backend
       - http://10.137.1.1:11434
 ```
+
+> **Upgrading:** `max_body_bytes` replaces a flat 1 GiB limit that applied to every route. If you push bodies larger than 64 MiB through anything other than `/api/blobs/{digest}`, raise it.
 
 **How it's applied:**
 
 - `backends` and `settings` are read at **startup only** — restart to change them.
 - `models` is applied automatically at startup (once backend probes have run) and re-applied any time you press **`r`** in the TUI. Application is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models already resident there — e.g. still loaded from an earlier run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything, and loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL`) and in the log output.
+- A backend won't accept a load while it is serving requests, so each entry **waits for that backend to go idle** (up to 5 minutes) before loading. Without this, restarting the proxy under live traffic meant every configured model was refused on the spot and never retried — leaving models unloaded, or loaded with the wrong `max_ctx`.
 - Explicit CLI flags override file values when given (e.g. `--backend-urls` over `backends`, `--port`/`--host`/`--timeout` over `settings`).
 
 See [`appconf.yaml.example`](appconf.yaml.example) for a fully commented template.
@@ -307,7 +320,7 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 | `dir` | `IN` (proxied request) or `OUT` (upstream response) |
 | `user` | client address |
 | `model` | model name, when resolvable (otherwise null) |
-| `backend` | upstream backend URL (may be null) |
+| `backend` | upstream backend URL (may be null; `<all backends>` for aggregated model listings) |
 | `method` | HTTP method |
 | `path` | request path |
 | `status` | response status code (responses only) |

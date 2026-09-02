@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
+use crate::lock::LockExt;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +23,35 @@ const BLOCKED_FILE: &str = "blocked_items.json";
 struct BlockedConfig {
     ips: HashSet<IpAddr>,
     users: HashSet<String>,
+}
+
+/// Minimal view of a request body used to pull out the requested model.
+/// Deserializing into this instead of `serde_json::Value` lets serde skip
+/// every other field (`IgnoredAny`) rather than allocating the whole tree —
+/// request bodies routinely carry hundreds of KB of chat history.
+#[derive(Deserialize)]
+struct ModelField {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Pull the requested model name out of a request body.
+///
+/// Only JSON *objects* are considered: serde deserializes a top-level array
+/// into `ModelField` positionally (`["llama3"]` would yield `llama3`), so the
+/// leading byte is checked first. That also means non-JSON bodies — an
+/// `/api/blobs` layer upload, say — are rejected without entering the parser.
+fn extract_requested_model(body: &[u8]) -> Option<String> {
+    if body
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_none_or(|b| *b != b'{')
+    {
+        return None;
+    }
+    serde_json::from_slice::<ModelField>(body)
+        .ok()
+        .and_then(|m| m.model)
 }
 
 pub enum ResponsePart {
@@ -116,25 +146,138 @@ pub fn detect_api_family(path: &str) -> ApiFamily {
     }
 }
 
+/// The model-listing endpoint of an API family: (path, array key, id field).
+fn model_list_shape(family: ApiFamily) -> Option<(&'static str, &'static str, &'static str)> {
+    match family {
+        ApiFamily::Ollama => Some(("/api/tags", "models", "name")),
+        ApiFamily::OpenAi => Some(("/v1/models", "data", "id")),
+        ApiFamily::Unknown => None,
+    }
+}
+
+/// Answer a model listing from EVERY compatible backend at once.
+///
+/// `/api/tags` and `/v1/models` used to be proxied like any other request, so
+/// a client saw whichever single backend the scheduler happened to pick: with
+/// several backends holding different models the advertised list changed from
+/// one poll to the next, and no client could see everything the proxy is able
+/// to route to. Each backend is asked for its own listing and the entries are
+/// merged, so per-model metadata (size, digest, details, ...) stays exactly as
+/// that backend reported it instead of being synthesized here.
+///
+/// Entries are deduped by name/id with the first backend winning, and the
+/// envelope of the first answering backend is reused so any extra top-level
+/// fields survive. Returns `None` when no compatible backend produced a
+/// listing — the caller then falls back to the normal queued proxy path.
+///
+/// Backends are queried without the client's headers (as health probes are),
+/// so a backend that demands its own credentials on this endpoint contributes
+/// nothing to the merge.
+async fn aggregate_model_list(
+    state: &AppState,
+    family: ApiFamily,
+) -> Option<axum::response::Response> {
+    let (endpoint, array_key, id_field) = model_list_shape(family)?;
+
+    let urls: Vec<String> = state
+        .backends
+        .lock_or_recover()
+        .iter()
+        .filter(|b| b.is_online && family_compatible(b, family))
+        .map(|b| b.url.clone())
+        .collect();
+    if urls.is_empty() {
+        return None;
+    }
+
+    let bodies = futures_util::future::join_all(urls.into_iter().map(|base| {
+        let client = state.client.clone();
+        let url = format!("{}{}", base, endpoint);
+        async move {
+            let res = client
+                .get(&url)
+                .timeout(crate::control::PROBE_TIMEOUT)
+                .send()
+                .await
+                .ok()?;
+            if !res.status().is_success() {
+                return None;
+            }
+            res.json::<serde_json::Value>().await.ok()
+        }
+    }))
+    .await;
+
+    let mut envelope: Option<serde_json::Value> = None;
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut answered = 0usize;
+    for body in bodies.into_iter().flatten() {
+        // A backend that answers 200 with an error object (LM Studio does this
+        // for foreign endpoints) has no listing to contribute.
+        let Some(entries) = body.get(array_key).and_then(|m| m.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            match entry.get(id_field).and_then(|v| v.as_str()) {
+                // Already listed by an earlier backend.
+                Some(id) if !seen.insert(id.to_string()) => continue,
+                _ => merged.push(entry.clone()),
+            }
+        }
+        answered += 1;
+        if envelope.is_none() {
+            envelope = Some(body);
+        }
+    }
+
+    let mut envelope = envelope?;
+    debug!(
+        "aggregated {} at {} model(s) from {} backend(s)",
+        endpoint,
+        merged.len(),
+        answered
+    );
+    envelope[array_key] = serde_json::Value::Array(merged);
+    Some((StatusCode::OK, axum::Json(envelope)).into_response())
+}
+
+/// True for endpoints that only read backend metadata — no inference.
+///
+/// These neither wait for a free slot nor occupy one: they don't touch the
+/// model runner, so a `/api/tags` poll (the kind chat UIs issue on a timer)
+/// must not queue behind a multi-minute generation under the default
+/// `max_concurrent_per_backend: 1`, nor behind a model load/unload. Everything
+/// else — generate, chat, embeddings, blob uploads, pulls — is scheduled
+/// normally.
+pub fn is_metadata_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/api/tags" | "/api/ps" | "/api/version" | "/api/show" | "/v1/models"
+    ) || path.starts_with("/v1/models/")
+}
+
 /// One entry from LM Studio's native model list (`GET /api/v1/models`):
 /// the model key, optional display name, and ids of currently loaded instances
 /// (used by model control to resolve the `instance_id` for unloading).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LmModelInfo {
     pub key: String,
     pub display_name: Option<String>,
     pub loaded_instance_ids: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BackendStatus {
     pub url: String,
     pub active_requests: usize,
     pub processed_count: usize,
     pub is_online: bool,
     pub api_type: BackendApiType,
-    pub available_models: HashSet<String>,
-    pub loaded_models: HashSet<String>,
+    /// Reference-counted: replaced wholesale by each probe, but cloned by
+    /// the TUI on every frame (a backend can list hundreds of models).
+    pub available_models: Arc<HashSet<String>>,
+    pub loaded_models: Arc<HashSet<String>>,
     /// True when the backend reported loaded-model data in its latest probe
     /// (Ollama `/api/ps` or LM Studio `/api/v1/models`). `false` means the
     /// loaded state is UNKNOWN (no such endpoint, or it is skipped as bad) —
@@ -146,15 +289,16 @@ pub struct BackendStatus {
     /// context doesn't match the configured `max_ctx`.
     pub loaded_ctx: HashMap<String, u64>,
     pub current_model: Option<String>,
-    /// In-flight request count per normalized model name. Only populated for
-    /// requests that carry a model; enforces the per-model
+    /// In-flight request count keyed by `model_concurrency_key`. Only
+    /// populated for requests that carry a model; enforces the per-model
     /// `max_concurrent_requests` limits from appconf.yaml (Plan D).
     pub active_by_model: HashMap<String, u32>,
     /// True when the backend speaks the LM Studio native REST API
     /// (`/api/v1/models*`), which enables model load/unload control.
     pub lmstudio: bool,
     /// LM Studio native model list (empty for other backend types).
-    pub native_models: Vec<LmModelInfo>,
+    /// Reference-counted for the same reason as `available_models`.
+    pub native_models: Arc<Vec<LmModelInfo>>,
     /// Endpoints this backend is known to reject (remembered from probes);
     /// the health loop skips them until a full re-probe.
     pub known_bad_endpoints: HashSet<String>,
@@ -178,11 +322,18 @@ pub struct AppState {
     pub blocked_users: Mutex<HashSet<String>>,
     pub vip_user: Mutex<Option<String>>,
     pub boost_user: Mutex<Option<String>>,
-    pub global_counter: Mutex<usize>,
+    /// Round counter driving the boost user's every-other-turn slot. Atomic
+    /// rather than a `Mutex` so it is not part of the lock stack the scheduler
+    /// already holds while choosing a task.
+    pub global_counter: std::sync::atomic::AtomicUsize,
+    /// Fair-share scheduling scores, keyed by user. See [`FairShare`].
+    pub fair_share: Mutex<HashMap<String, FairShare>>,
     pub notify: Notify,
     pub backend_freed: Notify,
     pub backends: Mutex<Vec<BackendStatus>>,
-    pub last_backend_idx: Mutex<usize>,
+    /// Last backend index handed a request, for round-robin among equally
+    /// loaded backends. Atomic for the same reason as `global_counter`.
+    pub last_backend_idx: std::sync::atomic::AtomicUsize,
     pub timeout: u64,
     /// How long a request may wait when no backend can *ever* serve it
     /// (all offline / wrong API family / model absent everywhere) before the
@@ -203,7 +354,7 @@ pub struct AppState {
     /// Max simultaneous in-flight requests per backend (default 1 — the
     /// historical behavior). Per-model sub-limits come from `model_limits`.
     pub max_concurrent_per_backend: u32,
-    /// Per-model concurrency limits keyed by normalized model name; rebuilt
+    /// Per-model concurrency limits keyed by `model_concurrency_key`; rebuilt
     /// whenever the model config changes. Unlisted models default to 1.
     pub model_limits: Mutex<HashMap<String, u32>>,
     /// Model configuration from `appconf.yaml` (models to load on backends,
@@ -217,11 +368,18 @@ pub struct AppState {
     pub reqlog: crate::reqlog::RequestLogger,
     /// Max bytes of body content captured per record in the request log.
     pub log_content_limit: usize,
+    /// Ceiling on `queued_bytes` (`settings.max_queued_bytes`).
+    pub max_queued_bytes: u64,
+    /// Bytes of request bodies currently waiting in the queues. Queued tasks
+    /// own their whole body, so the per-user request cap alone still allowed
+    /// gigabytes to pile up; this bounds it in bytes. Read and updated only
+    /// under the `queues` lock, so the checks are atomic with the push/pop.
+    pub queued_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// One line of the TUI Logs panel: a request entering ("IN") or leaving
 /// ("OUT") the proxy, or a model-control action ("CTL").
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogEvent {
     pub at: std::time::SystemTime,
     /// "IN" | "OUT" | "CTL"
@@ -233,8 +391,79 @@ pub struct LogEvent {
     pub info: String,
     /// Optional body/response content preview (truncated to the configured
     /// limit) for IN/OUT events; None for drops and control actions.
-    pub content: Option<String>,
+    /// Reference-counted: the TUI snapshots the newest events on every frame,
+    /// and these strings run to `log_content_limit` (64 KiB by default).
+    pub content: Option<Arc<String>>,
 }
+
+/// Half-life of a user's fair-share score: load older than this counts half
+/// as much when deciding whose turn it is.
+const FAIR_SHARE_HALF_LIFE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Recent scheduling load for one user, as an exponentially decaying score.
+///
+/// Ordering used to be by `processed_counts`, which is cumulative since
+/// startup and only counts fully delivered responses. Two things went wrong
+/// with that: a client whose requests always failed or disconnected never
+/// incremented it and so kept permanent priority over everyone else, and on a
+/// long-lived proxy a newcomer started thousands of requests "behind" an
+/// incumbent and monopolized every backend until it caught up. This score is
+/// charged when a request is DISPATCHED — whatever the outcome — and halves
+/// every [`FAIR_SHARE_HALF_LIFE`], so the order reflects recent load only.
+#[derive(Clone, Copy, Debug)]
+pub struct FairShare {
+    score: f64,
+    /// Both the decay reference point and the user's last-seen time.
+    updated: std::time::Instant,
+}
+
+impl FairShare {
+    fn new(now: std::time::Instant) -> Self {
+        Self { score: 0.0, updated: now }
+    }
+
+    /// The score as of `now`, after decay. Cheap and side-effect free.
+    fn value_at(&self, now: std::time::Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.score * 0.5f64.powf(elapsed / FAIR_SHARE_HALF_LIFE.as_secs_f64())
+    }
+
+    /// Roll the decay forward to `now` without adding load — marks the user
+    /// as seen while keeping the decay maths exact.
+    fn touch(&mut self, now: std::time::Instant) {
+        self.score = self.value_at(now);
+        self.updated = now;
+    }
+
+    /// Roll forward and charge one dispatched request.
+    fn charge(&mut self, now: std::time::Instant) {
+        self.touch(now);
+        self.score += 1.0;
+    }
+
+    /// When this user was last seen (request arrived or was dispatched).
+    fn last_seen(&self) -> std::time::Instant {
+        self.updated
+    }
+}
+
+/// Longest a user with nothing queued and nothing in flight is kept in the
+/// per-user bookkeeping.
+const USER_RETENTION: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Hard ceiling on tracked users; the least recently seen idle ones are
+/// dropped beyond it, whatever their retention.
+const MAX_TRACKED_USERS: usize = 10_000;
+
+/// How often idle users are pruned.
+const USER_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Most requests one user may have waiting before further ones are refused.
+const MAX_QUEUED_PER_USER: usize = 100;
+
+/// Body limit for `/api/blobs/{digest}`, which carries raw model layers rather
+/// than JSON. Every other route uses `settings.max_body_bytes`.
+pub const BLOB_BODY_LIMIT: usize = 1024 * 1024 * 1024;
 
 /// How many log events to keep in the ring buffer.
 const MAX_LOG_EVENTS: usize = 300;
@@ -253,6 +482,7 @@ impl AppState {
         model_config: Vec<crate::config::ModelConfig>,
         reqlog: crate::reqlog::RequestLogger,
         log_content_limit: usize,
+        max_queued_bytes: u64,
     ) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         let backends = backend_urls
@@ -263,14 +493,14 @@ impl AppState {
                 processed_count: 0,
                 is_online: true,
                 api_type: BackendApiType::Unknown,
-                available_models: HashSet::new(),
-                loaded_models: HashSet::new(),
+                available_models: Arc::default(),
+                loaded_models: Arc::default(),
                 loaded_state_known: false,
                 loaded_ctx: HashMap::new(),
                 current_model: None,
                 active_by_model: HashMap::new(),
                 lmstudio: false,
-                native_models: Vec::new(),
+                native_models: Arc::default(),
                 known_bad_endpoints: HashSet::new(),
                 rejected_families: HashSet::new(),
                 family_fail_counts: HashMap::new(),
@@ -292,11 +522,12 @@ impl AppState {
             blocked_users: Mutex::new(blocked_users),
             vip_user: Mutex::new(None),
             boost_user: Mutex::new(None),
-            global_counter: Mutex::new(0),
+            global_counter: std::sync::atomic::AtomicUsize::new(0),
+            fair_share: Mutex::new(HashMap::new()),
             notify: Notify::new(),
             backend_freed: Notify::new(),
             backends: Mutex::new(backends),
-            last_backend_idx: Mutex::new(0),
+            last_backend_idx: std::sync::atomic::AtomicUsize::new(0),
             timeout,
             stuck_timeout: std::time::Duration::from_secs(stuck_timeout_secs),
             client,
@@ -310,6 +541,8 @@ impl AppState {
             logs: Mutex::new(VecDeque::new()),
             reqlog,
             log_content_limit,
+            max_queued_bytes,
+            queued_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -324,8 +557,8 @@ impl AppState {
 
     fn save_blocked_items(&self) {
         let config = BlockedConfig {
-            ips: self.blocked_ips.lock().unwrap().clone(),
-            users: self.blocked_users.lock().unwrap().clone(),
+            ips: self.blocked_ips.lock_or_recover().clone(),
+            users: self.blocked_users.lock_or_recover().clone(),
         };
         if let Ok(content) = serde_json::to_string_pretty(&config) {
             let _ = fs::write(BLOCKED_FILE, content);
@@ -334,7 +567,7 @@ impl AppState {
 
     pub fn block_ip(&self, ip: IpAddr) {
         {
-            let mut ips = self.blocked_ips.lock().unwrap();
+            let mut ips = self.blocked_ips.lock_or_recover();
             ips.insert(ip);
         }
         self.save_blocked_items();
@@ -343,7 +576,7 @@ impl AppState {
 
     pub fn block_user(&self, user_id: String) {
         {
-            let mut users = self.blocked_users.lock().unwrap();
+            let mut users = self.blocked_users.lock_or_recover();
             users.insert(user_id.clone());
         }
         self.save_blocked_items();
@@ -353,7 +586,7 @@ impl AppState {
     #[allow(dead_code)]
     pub fn unblock_ip(&self, ip: IpAddr) {
         {
-            let mut ips = self.blocked_ips.lock().unwrap();
+            let mut ips = self.blocked_ips.lock_or_recover();
             ips.remove(&ip);
         }
         self.save_blocked_items();
@@ -363,7 +596,7 @@ impl AppState {
     #[allow(dead_code)]
     pub fn unblock_user(&self, user_id: &str) {
         {
-            let mut users = self.blocked_users.lock().unwrap();
+            let mut users = self.blocked_users.lock_or_recover();
             users.remove(user_id);
         }
         self.save_blocked_items();
@@ -371,16 +604,16 @@ impl AppState {
     }
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
-        self.blocked_ips.lock().unwrap().contains(ip)
+        self.blocked_ips.lock_or_recover().contains(ip)
     }
 
     pub fn is_user_blocked(&self, user_id: &str) -> bool {
-        self.blocked_users.lock().unwrap().contains(user_id)
+        self.blocked_users.lock_or_recover().contains(user_id)
     }
 
     /// Append an event to the logs ring buffer (bounded).
     pub fn log_event(&self, ev: LogEvent) {
-        let mut logs = self.logs.lock().unwrap();
+        let mut logs = self.logs.lock_or_recover();
         logs.push_back(ev);
         while logs.len() > MAX_LOG_EVENTS {
             logs.pop_front();
@@ -426,6 +659,22 @@ fn model_base(id: &str) -> String {
         Some((_, m)) => m.to_string(),
         None => n,
     }
+}
+
+/// Key under which per-model concurrency is both limited and counted.
+///
+/// Every site that reads `models[].max_concurrent_requests` or touches
+/// `active_by_model` MUST use this one function. Keying the limits by one
+/// normalization and the in-flight counters by another meant a config entry
+/// `qwen/qwen3.8-27b` never matched a client asking for `qwen3.8-27b`: the
+/// limit silently fell back to 1, and the two spellings accumulated in
+/// separate counters, so the cap could be exceeded on a single backend.
+///
+/// It is the publisher-stripped base name — the same normalization the routing
+/// rules apply to bare requests — so two publishers' builds of one model share
+/// a budget. That errs toward protecting the backend.
+fn model_concurrency_key(id: &str) -> String {
+    model_base(id)
 }
 
 /// True when `requested` matches `listed` under the bounded rules shared by
@@ -480,12 +729,12 @@ pub fn model_loaded_on(b: &BackendStatus, requested: &str) -> bool {
     false
 }
 
-/// Per-model concurrency limits keyed by normalized model name, from the
+/// Per-model concurrency limits keyed by `model_concurrency_key`, from the
 /// `models:` section of appconf.yaml. Unlisted models default to 1 at lookup.
 pub fn build_model_limits(configs: &[crate::config::ModelConfig]) -> HashMap<String, u32> {
     configs
         .iter()
-        .map(|c| (normalize_model_id(&c.name), c.max_concurrent_requests))
+        .map(|c| (model_concurrency_key(&c.name), c.max_concurrent_requests))
         .collect()
 }
 
@@ -532,19 +781,20 @@ fn is_endpoint_rejection(status: StatusCode, body_prefix: &str) -> bool {
     if !text.starts_with('{') {
         return false;
     }
-    // Prefer a full JSON parse (error bodies are small); fall back to a raw
-    // substring scan when the prefix is truncated mid-JSON.
-    let error_text = match serde_json::from_str::<serde_json::Value>(text).ok() {
-        Some(v) => v
-            .get("error")
-            .and_then(|e| e.as_str())
-            .map(str::to_lowercase)
-            .unwrap_or_default(),
-        None => text.to_lowercase(),
-    };
-    if error_text.is_empty() {
+    // The body must parse as JSON *in this prefix*. A dialect rejection is a
+    // short error object, so it always fits; a prefix that is truncated
+    // mid-JSON therefore belongs to some long body — a streaming completion,
+    // say — and must not be scanned for "endpoint"/"method" as raw text. Doing
+    // so let an assistant reply that happened to be cut mid-sentence while
+    // discussing HTTP methods count as a strike against the backend, and two
+    // strikes drop it from rotation for that API family.
+    let Some(value) = serde_json::from_str::<serde_json::Value>(text).ok() else {
         return false;
-    }
+    };
+    let Some(error_text) = value.get("error").and_then(|e| e.as_str()) else {
+        return false;
+    };
+    let error_text = error_text.to_lowercase();
     error_text.contains("endpoint") || error_text.contains("method")
 }
 
@@ -560,7 +810,7 @@ fn apply_family_learning(
     if family == ApiFamily::Unknown {
         return; // nothing to learn from unrecognized paths
     }
-    let mut backends = state.backends.lock().unwrap();
+    let mut backends = state.backends.lock_or_recover();
     let Some(b) = backends.get_mut(backend_idx) else {
         return;
     };
@@ -587,6 +837,193 @@ fn apply_family_learning(
     }
 }
 
+/// Give back the queue-memory budget held by a task that has left a queue.
+/// Saturating, so a task queued outside the normal enqueue path can never wrap
+/// the counter and lock out every later request.
+fn release_queued_bytes(state: &AppState, bytes: u64) {
+    let _ = state.queued_bytes.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |held| Some(held.saturating_sub(bytes)),
+    );
+}
+
+/// Drop per-user bookkeeping for users that are gone.
+///
+/// Every one of these maps is keyed by the client-supplied `X-User-ID` header
+/// and nothing ever removed from them, so a client could grow them without
+/// bound just by varying the header. A user is prunable only while nothing of
+/// theirs is queued or in flight; beyond that they are kept for
+/// [`USER_RETENTION`] so the dashboard still shows recent activity, and the
+/// least recently seen are dropped early once more than [`MAX_TRACKED_USERS`]
+/// are tracked.
+fn prune_idle_users(state: &AppState, retention: std::time::Duration) {
+    let now = std::time::Instant::now();
+
+    // Candidates: nothing queued, nothing being served.
+    let mut idle: Vec<(String, std::time::Instant)> = {
+        let queues = state.queues.lock_or_recover();
+        let processing = state.processing_counts.lock_or_recover();
+        let scores = state.fair_share.lock_or_recover();
+        scores
+            .iter()
+            .filter(|(u, _)| {
+                queues.get(*u).is_none_or(|q| q.is_empty())
+                    && processing.get(*u).copied().unwrap_or(0) == 0
+            })
+            .map(|(u, s)| (u.clone(), s.last_seen()))
+            .collect()
+    };
+    if idle.is_empty() {
+        return;
+    }
+
+    // Stalest first, so an over-cap trim drops the least recently seen.
+    idle.sort_by_key(|(_, seen)| *seen);
+    let tracked = state.fair_share.lock_or_recover().len();
+    let over_cap = tracked.saturating_sub(MAX_TRACKED_USERS);
+
+    let mut remove: Vec<String> = idle
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, seen))| {
+            *i < over_cap || now.saturating_duration_since(*seen) > retention
+        })
+        .map(|(_, (user, _))| user.clone())
+        .collect();
+    if remove.is_empty() {
+        return;
+    }
+
+    // Re-check emptiness while removing: a request may have arrived since the
+    // candidate list was built, and dropping a queue with a task still in it
+    // would lose that request.
+    {
+        let mut queues = state.queues.lock_or_recover();
+        remove.retain(|u| queues.get(u).is_none_or(|q| q.is_empty()));
+        for u in &remove {
+            queues.remove(u);
+        }
+    }
+    for u in &remove {
+        state.processing_counts.lock_or_recover().remove(u);
+        state.processed_counts.lock_or_recover().remove(u);
+        state.dropped_counts.lock_or_recover().remove(u);
+        state.user_ips.lock_or_recover().remove(u);
+        state.fair_share.lock_or_recover().remove(u);
+    }
+    debug!("pruned {} idle user(s) from per-user state", remove.len());
+}
+
+/// One pass of the background health check: probe every backend and merge the
+/// results into `state`.
+///
+/// Backends are probed CONCURRENTLY. Probing them one after another let a
+/// single unresponsive backend hold up everyone else's status for the whole
+/// round — combined with the probe timeout (see [`crate::control::PROBE_TIMEOUT`])
+/// that could stall the loop for minutes while the scheduler routed on stale
+/// online/loaded state.
+async fn health_check_round(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    full_reprobe: bool,
+    probe_timeout: std::time::Duration,
+) {
+    // Snapshot what to probe, and which endpoints to skip, in one lock pass.
+    let to_check: Vec<(usize, String, bool, HashSet<String>)> = {
+        let backends = state.backends.lock_or_recover();
+        backends
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                // Skip endpoints this backend is known to reject — except on a
+                // full re-probe or right after recovery from offline (memory
+                // may be stale after a restart). Never skip both primary API
+                // probes: online status must stay re-establishable.
+                let skip = if full_reprobe || !b.is_online {
+                    HashSet::new()
+                } else {
+                    let mut s = b.known_bad_endpoints.clone();
+                    if s.contains("/api/tags") && s.contains("/v1/models") {
+                        s.clear();
+                    }
+                    s
+                };
+                (i, b.url.clone(), b.is_online, skip)
+            })
+            .collect()
+    };
+
+    let probes = futures_util::future::join_all(to_check.into_iter().map(
+        |(idx, url, was_online, skip)| {
+            let client = client.clone();
+            async move {
+                let probe =
+                    crate::control::probe_backend(&client, &url, &skip, probe_timeout).await;
+                (idx, url, was_online, probe)
+            }
+        },
+    ))
+    .await;
+
+    let mut any_changed = false;
+    for (idx, url, was_online, probe) in probes {
+        let mut backends = state.backends.lock_or_recover();
+        let Some(b) = backends.get_mut(idx) else {
+            continue;
+        };
+
+        // A backend that just recovered from offline may have been
+        // restarted: clear learned endpoint/family memory so it is
+        // re-learned from scratch.
+        if !was_online && probe.is_online {
+            b.known_bad_endpoints.clear();
+            b.rejected_families.clear();
+            b.family_fail_counts.clear();
+        }
+
+        let newly_bad: Vec<String> = probe
+            .bad_endpoints
+            .iter()
+            .filter(|e| !b.known_bad_endpoints.contains(*e))
+            .cloned()
+            .collect();
+
+        let changed = b.is_online != probe.is_online
+            || b.api_type != probe.api_type
+            || *b.available_models != probe.available_models
+            || *b.loaded_models != probe.loaded_models;
+
+        let was_api_type = b.api_type;
+        let now_online = probe.is_online;
+        crate::control::apply_probe(b, probe);
+
+        if !was_online && now_online {
+            info!("Backend {} status changed to: ONLINE", url);
+        } else if was_online && !now_online {
+            info!("Backend {} status changed to: OFFLINE", url);
+        }
+        if b.api_type != was_api_type {
+            info!("Backend {} API type detected: {}", url, b.api_type.display());
+        }
+        for e in &newly_bad {
+            info!(
+                "Backend {} does not serve {} — remembered, will skip it until re-check",
+                url, e
+            );
+        }
+
+        any_changed |= changed;
+    }
+
+    // Wake the dispatcher if anything relevant to scheduling changed (model
+    // finished loading, backend came online, etc.) so queued requests are
+    // re-evaluated immediately.
+    if any_changed {
+        state.notify.notify_one();
+    }
+}
+
 pub async fn run_worker(state: Arc<AppState>) {
     let client = state.client.clone();
     let mut current_idx = 0;
@@ -601,173 +1038,109 @@ pub async fn run_worker(state: Arc<AppState>) {
             // "bad" ones are re-verified (the backend may have been upgraded).
             let full_reprobe = cycle.is_multiple_of(6);
             cycle += 1;
-
-            let backends_to_check: Vec<(usize, String, bool)> = {
-                let backends = health_state.backends.lock().unwrap();
-                backends
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| (i, b.url.clone(), b.is_online))
-                    .collect()
-            };
-
-            for (idx, url, was_online) in backends_to_check {
-                // Skip endpoints this backend is known to reject — except on a
-                // full re-probe or right after recovery from offline (memory
-                // may be stale after a restart). Never skip both primary API
-                // probes: online status must stay re-establishable.
-                let skip = {
-                    let backends = health_state.backends.lock().unwrap();
-                    if full_reprobe || !was_online {
-                        HashSet::new()
-                    } else {
-                        let mut s = backends[idx].known_bad_endpoints.clone();
-                        if s.contains("/api/tags") && s.contains("/v1/models") {
-                            s.clear();
-                        }
-                        s
-                    }
-                };
-
-                let probe = crate::control::probe_backend(&health_client, &url, &skip).await;
-
-                let mut backends = health_state.backends.lock().unwrap();
-                let b = &mut backends[idx];
-
-                // A backend that just recovered from offline may have been
-                // restarted: clear learned endpoint/family memory so it is
-                // re-learned from scratch.
-                if !was_online && probe.is_online {
-                    b.known_bad_endpoints.clear();
-                    b.rejected_families.clear();
-                    b.family_fail_counts.clear();
-                }
-
-                let newly_bad: Vec<String> = probe
-                    .bad_endpoints
-                    .iter()
-                    .filter(|e| !b.known_bad_endpoints.contains(*e))
-                    .cloned()
-                    .collect();
-
-                let changed = b.is_online != probe.is_online
-                    || b.api_type != probe.api_type
-                    || b.available_models != probe.available_models
-                    || b.loaded_models != probe.loaded_models;
-
-                let was_api_type = b.api_type;
-                let now_online = probe.is_online;
-                crate::control::apply_probe(b, probe);
-
-                if !was_online && now_online {
-                    info!("Backend {} status changed to: ONLINE", url);
-                } else if was_online && !now_online {
-                    info!("Backend {} status changed to: OFFLINE", url);
-                }
-                if b.api_type != was_api_type {
-                    info!(
-                        "Backend {} API type detected: {}",
-                        url,
-                        b.api_type.display()
-                    );
-                }
-                for e in &newly_bad {
-                    info!(
-                        "Backend {} does not serve {} — remembered, will skip it until re-check",
-                        url, e
-                    );
-                }
-
-                // Wake the dispatcher if anything relevant to scheduling
-                // changed (model finished loading, backend came online, etc.)
-                // so queued requests are re-evaluated immediately.
-                if changed {
-                    drop(backends);
-                    health_state.notify.notify_one();
-                }
-            }
+            health_check_round(
+                &health_state,
+                &health_client,
+                full_reprobe,
+                crate::control::PROBE_TIMEOUT,
+            )
+            .await;
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+
+    // Bound the per-user bookkeeping (see `prune_idle_users`).
+    let prune_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(USER_PRUNE_INTERVAL).await;
+            prune_idle_users(&prune_state, USER_RETENTION);
         }
     });
 
     loop {
         let selection_opt = {
-            let mut queues = state.queues.lock().unwrap();
+            let mut queues = state.queues.lock_or_recover();
             // Backends with a model control op (load/unload) in flight are treated as
             // busy: loading a new model can evict whatever is currently running.
             let control_busy: HashSet<usize> =
-                state.control_ops.lock().unwrap().keys().copied().collect();
-            let mut backends = state.backends.lock().unwrap();
-            let mut last_idx = state.last_backend_idx.lock().unwrap();
+                state.control_ops.lock_or_recover().keys().copied().collect();
+            let mut backends = state.backends.lock_or_recover();
+            let mut last_idx = state
+                .last_backend_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
 
             // 1. Pick a user and peek at their front task to know required API family
-            let vip = state.vip_user.lock().unwrap().clone();
-            let boost = state.boost_user.lock().unwrap().clone();
-            let mut counter = state.global_counter.lock().unwrap();
+            let vip = state.vip_user.lock_or_recover().clone();
+            let boost = state.boost_user.lock_or_recover().clone();
+            let counter = state
+                .global_counter
+                .load(std::sync::atomic::Ordering::Relaxed);
 
             let mut active_users: Vec<String> = queues
-                .keys()
-                .filter(|u| !queues.get(*u).unwrap().is_empty())
-                .cloned()
+                .iter()
+                .filter(|(_, q)| !q.is_empty())
+                .map(|(u, _)| u.clone())
                 .collect();
 
             if active_users.is_empty() {
                 None
             } else {
-                active_users.sort_by(|a, b| {
-                    let a_total = state
-                        .processed_counts
-                        .lock()
-                        .unwrap()
-                        .get(a)
-                        .cloned()
-                        .unwrap_or(0);
-                    let b_total = state
-                        .processed_counts
-                        .lock()
-                        .unwrap()
-                        .get(b)
-                        .cloned()
-                        .unwrap_or(0);
-                    a_total.cmp(&b_total).then_with(|| a.cmp(b))
-                });
+                {
+                    // Least recent load first. One acquisition for the whole
+                    // sort: the comparator used to lock and release the counts
+                    // twice per comparison — O(n log n) acquisitions, nested
+                    // inside the four locks already held here.
+                    let now = std::time::Instant::now();
+                    let scores = state.fair_share.lock_or_recover();
+                    active_users.sort_by(|a, b| {
+                        let a_load = scores.get(a).map_or(0.0, |s| s.value_at(now));
+                        let b_load = scores.get(b).map_or(0.0, |s| s.value_at(now));
+                        a_load
+                            .partial_cmp(&b_load)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.cmp(b))
+                    });
+                }
 
                 // Build candidate order: VIP first, then boost on every other
-                // turn, then fair-share round-robin over the rest.
-                let mut candidates: Vec<String> = Vec::new();
-                if let Some(ref v) = vip {
-                    if active_users.contains(v) {
-                        candidates.push(v.clone());
-                    }
+                // turn, then fair-share round-robin over the rest. The order is
+                // a permutation of `active_users` held as indices — it used to
+                // be built by cloning the user ids into two more Vec<String>
+                // and de-duplicating with O(n) string comparisons.
+                let mut order: Vec<usize> = Vec::with_capacity(active_users.len());
+                let position_of = |name: &String| active_users.iter().position(|u| u == name);
+                if let Some(i) = vip.as_ref().and_then(&position_of) {
+                    order.push(i);
                 }
-                if *counter % 2 == 0 {
-                    if let Some(ref b) = boost {
-                        if active_users.contains(b) && !candidates.contains(b) {
-                            candidates.push(b.clone());
-                        }
-                    }
+                if counter.is_multiple_of(2)
+                    && let Some(i) = boost.as_ref().and_then(&position_of)
+                    && !order.contains(&i)
+                {
+                    order.push(i);
                 }
                 if current_idx >= active_users.len() {
                     current_idx = 0;
                 }
-                let rest: Vec<String> = active_users
-                    .iter()
-                    .filter(|u| !candidates.contains(u))
-                    .cloned()
+                let rest: Vec<usize> = (0..active_users.len())
+                    .filter(|i| !order.contains(i))
                     .collect();
                 current_idx += 1;
                 if !rest.is_empty() {
                     let start = current_idx % rest.len();
-                    candidates.extend(rest[start..].iter().cloned());
-                    candidates.extend(rest[..start].iter().cloned());
+                    order.extend(rest[start..].iter().copied());
+                    order.extend(rest[..start].iter().copied());
                 }
+
+                let limits = state.model_limits.lock_or_recover();
 
                 // Try users in candidate order. Within a user's queue, pick
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<(String, Task, usize, String)> = None;
-                'users: for user_id in &candidates {
+                let mut selection: Option<(String, Task, usize, String, bool)> = None;
+                'users: for &ui in &order {
+                    let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
                     for pos in 0..queue_len {
                         let task_ref = match queues.get(user_id).and_then(|q| q.get(pos)) {
@@ -775,6 +1148,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                             None => continue,
                         };
                         let api_family = detect_api_family(&task_ref.path);
+                        // Metadata reads are cheap and don't use the model
+                        // runner: they ignore backend capacity and in-flight
+                        // control ops, and are not accounted against either.
+                        let metadata = is_metadata_path(&task_ref.path);
                         debug!(
                             "Request for user {}: pos={} path={} family={:?}",
                             user_id, pos, task_ref.path, api_family
@@ -782,24 +1159,26 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                         // Find eligible backends: online, has capacity (global per-backend
                         // cap + per-model limit), and support the required API + Model.
-                        let limits = state.model_limits.lock().unwrap();
-                        let model_key = task_ref.requested_model.as_deref().map(normalize_model_id);
+                        // `limits` is taken once per selection round, above —
+                        // it used to be locked and dropped for every task examined.
+                        let model_key =
+                            task_ref.requested_model.as_deref().map(model_concurrency_key);
                         let model_limit = match &model_key {
                             Some(k) => limits.get(k).copied().unwrap_or(1),
                             None => 0, // unused for model-less requests
                         };
-                        drop(limits);
                         let eligible_indices: Vec<usize> = backends.iter()
                             .enumerate()
                             .filter(|(i, b)| {
                                 let online = b.is_online;
-                                let free = backend_has_capacity(
-                                    b,
-                                    model_key.as_deref(),
-                                    model_limit,
-                                    state.max_concurrent_per_backend,
-                                );
-                                let no_op = !control_busy.contains(i);
+                                let free = metadata
+                                    || backend_has_capacity(
+                                        b,
+                                        model_key.as_deref(),
+                                        model_limit,
+                                        state.max_concurrent_per_backend,
+                                    );
+                                let no_op = metadata || !control_busy.contains(i);
                                 if !online || !free || !no_op {
                                     debug!(
                                         "Backend {} rejected: online={}, active={}/{}, control_op={}",
@@ -922,9 +1301,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     .unwrap()
                                     .remove(pos)
                                     .unwrap();
-                                *counter += 1;
+                                release_queued_bytes(&state, dropped.body.len() as u64);
+                                state
+                                    .global_counter
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let waited = dropped.queued_at.elapsed().as_secs();
-                                let mut dropped_counts = state.dropped_counts.lock().unwrap();
+                                let mut dropped_counts = state.dropped_counts.lock_or_recover();
                                 *dropped_counts.entry(user_id.clone()).or_insert(0) += 1;
                                 drop(dropped_counts);
                                 state.log_event(LogEvent {
@@ -991,7 +1373,22 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
 
                         let task = queues.get_mut(user_id).unwrap().remove(pos).unwrap();
-                        *counter += 1;
+                        release_queued_bytes(&state, task.body.len() as u64);
+                        state
+                            .global_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Charge the user for the work now, not on success:
+                        // a request that fails or is abandoned still consumed
+                        // a backend, and must not buy priority for the next.
+                        {
+                            let now = std::time::Instant::now();
+                            state
+                                .fair_share
+                                .lock_or_recover()
+                                .entry(user_id.clone())
+                                .or_insert_with(|| FairShare::new(now))
+                                .charge(now);
+                        }
 
                         // Round-Robin among eligible backends with min connections
                         let min_conns = eligible_indices
@@ -1006,26 +1403,33 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .collect();
                         let candidate_pos = candidates_backends
                             .iter()
-                            .position(|&i| i > *last_idx)
+                            .position(|&i| i > last_idx)
                             .unwrap_or(0);
                         let selected_backend_idx = candidates_backends[candidate_pos];
 
-                        *last_idx = selected_backend_idx;
-                        backends[selected_backend_idx].active_requests += 1;
-                        if let Some(ref m) = task.requested_model {
-                            let k = normalize_model_id(m);
-                            *backends[selected_backend_idx]
-                                .active_by_model
-                                .entry(k)
-                                .or_insert(0) += 1;
+                        last_idx = selected_backend_idx;
+                        state
+                            .last_backend_idx
+                            .store(last_idx, std::sync::atomic::Ordering::Relaxed);
+                        if !metadata {
+                            backends[selected_backend_idx].active_requests += 1;
+                            if let Some(ref m) = task.requested_model {
+                                let k = model_concurrency_key(m);
+                                *backends[selected_backend_idx]
+                                    .active_by_model
+                                    .entry(k)
+                                    .or_insert(0) += 1;
+                            }
+                            backends[selected_backend_idx].current_model =
+                                task.requested_model.clone();
                         }
-                        backends[selected_backend_idx].current_model = task.requested_model.clone();
 
                         selection = Some((
                             user_id.clone(),
                             task,
                             selected_backend_idx,
                             backends[selected_backend_idx].url.clone(),
+                            metadata,
                         ));
                         break 'users;
                     }
@@ -1036,7 +1440,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         };
 
         match selection_opt {
-            Some((user_id, task, backend_idx, backend_url)) => {
+            Some((user_id, task, backend_idx, backend_url, metadata)) => {
                 let state_clone = state.clone();
                 let client_clone = client.clone();
                 let url = format!("{}{}", backend_url, task.path);
@@ -1044,7 +1448,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                 tokio::spawn(async move {
                     let log_model = task.requested_model.clone();
                     let api_family = detect_api_family(&task.path);
-                    let log_out = |info: String, backend: Option<String>, content: Option<String>| {
+                    let log_out = |info: String,
+                                   backend: Option<String>,
+                                   content: Option<Arc<String>>| {
                         state_clone.log_event(LogEvent {
                             at: std::time::SystemTime::now(),
                             dir: "OUT",
@@ -1056,10 +1462,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                         });
                     };
 
+                    // Set only when a response was delivered to the client in
+                    // full; `processed_count` used to be bumped on every exit
+                    // path, so the TUI counted blocked, abandoned and errored
+                    // requests as throughput.
+                    let mut delivered = false;
+
                     let is_blocked = {
-                        let user_ips = state_clone.user_ips.lock().unwrap();
-                        let blocked_ips = state_clone.blocked_ips.lock().unwrap();
-                        let blocked_users = state_clone.blocked_users.lock().unwrap();
+                        let user_ips = state_clone.user_ips.lock_or_recover();
+                        let blocked_ips = state_clone.blocked_ips.lock_or_recover();
+                        let blocked_users = state_clone.blocked_users.lock_or_recover();
                         blocked_users.contains(&user_id)
                             || user_ips
                                 .get(&user_id)
@@ -1068,7 +1480,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     };
 
                     if is_blocked || task.responder.is_closed() {
-                        let mut dropped = state_clone.dropped_counts.lock().unwrap();
+                        let mut dropped = state_clone.dropped_counts.lock_or_recover();
                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
                         log_out(
                             "dropped (blocked)".into(),
@@ -1077,7 +1489,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         );
                     } else {
                         {
-                            let mut processing = state_clone.processing_counts.lock().unwrap();
+                            let mut processing = state_clone.processing_counts.lock_or_recover();
                             *processing.entry(user_id.clone()).or_insert(0) += 1;
                         }
 
@@ -1167,13 +1579,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     );
 
                                     if !client_disconnected {
+                                        delivered = true;
                                         let mut counts =
-                                            state_clone.processed_counts.lock().unwrap();
+                                            state_clone.processed_counts.lock_or_recover();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
                                         drop(counts);
-                                        let content_str = crate::reqlog::truncate_utf8(
-                                            &content_acc,
-                                            state_clone.log_content_limit,
+                                        let content_str = Arc::new(
+                                            crate::reqlog::truncate_utf8(
+                                                &content_acc,
+                                                state_clone.log_content_limit,
+                                            ),
                                         );
                                         state_clone.reqlog.log(crate::reqlog::ReqRecord {
                                             ts: crate::reqlog::now_unix_millis(),
@@ -1198,7 +1613,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         );
                                     } else {
                                         let mut dropped =
-                                            state_clone.dropped_counts.lock().unwrap();
+                                            state_clone.dropped_counts.lock_or_recover();
                                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
                                         log_out(
                                             "dropped (client gone)".into(),
@@ -1209,7 +1624,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 }
                             }
                             Err(e) => {
-                                let err_msg = format!("upstream error: {}", e);
+                                let err_msg = Arc::new(format!("upstream error: {}", e));
                                 state_clone.reqlog.log(crate::reqlog::ReqRecord {
                                     ts: crate::reqlog::now_unix_millis(),
                                     dir: "OUT",
@@ -1224,7 +1639,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     content: Some(err_msg.clone()),
                                 });
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
-                                let mut dropped = state_clone.dropped_counts.lock().unwrap();
+                                let mut dropped = state_clone.dropped_counts.lock_or_recover();
                                 *dropped.entry(user_id.clone()).or_insert(0) += 1;
                                 log_out(
                                     "dropped (backend error)".into(),
@@ -1235,7 +1650,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
 
                         {
-                            let mut processing = state_clone.processing_counts.lock().unwrap();
+                            let mut processing = state_clone.processing_counts.lock_or_recover();
                             if let Some(count) = processing.get_mut(&user_id) {
                                 *count = count.saturating_sub(1);
                             }
@@ -1243,19 +1658,30 @@ pub async fn run_worker(state: Arc<AppState>) {
                     }
 
                     {
-                        let mut backends = state_clone.backends.lock().unwrap();
+                        let mut backends = state_clone.backends.lock_or_recover();
                         let b = &mut backends[backend_idx];
-                        b.active_requests = b.active_requests.saturating_sub(1);
-                        if let Some(ref m) = task.requested_model {
-                            let k = normalize_model_id(m);
-                            if let Some(c) = b.active_by_model.get_mut(&k) {
-                                *c = c.saturating_sub(1);
-                                if *c == 0 {
-                                    b.active_by_model.remove(&k);
+                        // Metadata reads were never accounted at dispatch.
+                        if !metadata {
+                            b.active_requests = b.active_requests.saturating_sub(1);
+                            if let Some(ref m) = task.requested_model {
+                                let k = model_concurrency_key(m);
+                                if let Some(c) = b.active_by_model.get_mut(&k) {
+                                    *c = c.saturating_sub(1);
+                                    if *c == 0 {
+                                        b.active_by_model.remove(&k);
+                                    }
                                 }
                             }
+                            // Nothing of ours is running here any more, so the
+                            // backend has no current model. It used to keep
+                            // showing the last model it ever touched.
+                            if b.active_requests == 0 {
+                                b.current_model = None;
+                            }
                         }
-                        b.processed_count += 1;
+                        if delivered {
+                            b.processed_count += 1;
+                        }
                     }
                     state_clone.backend_freed.notify_one();
                 });
@@ -1300,26 +1726,71 @@ pub async fn proxy_handler(
     }
 
     {
-        let mut ips = state.user_ips.lock().unwrap();
+        let mut ips = state.user_ips.lock_or_recover();
         ips.insert(user_id.clone(), ip);
+    }
+
+    // Mark the user as seen (without charging them) so idle-user pruning has
+    // an accurate last-seen even for requests that never get dispatched.
+    {
+        let now = std::time::Instant::now();
+        state
+            .fair_share
+            .lock_or_recover()
+            .entry(user_id.clone())
+            .or_insert_with(|| FairShare::new(now))
+            .touch(now);
+    }
+
+    // Model listings are answered from every backend at once instead of being
+    // routed to one of them (see `aggregate_model_list`). If nothing can be
+    // merged, fall through to the normal queued path.
+    let family = detect_api_family(&path);
+    if method == Method::GET
+        && model_list_shape(family).is_some_and(|(endpoint, _, _)| endpoint == path)
+        && let Some(response) = aggregate_model_list(&state, family).await
+    {
+        let ts = crate::reqlog::now_unix_millis();
+        for (dir, info) in [
+            ("IN", format!("GET {} body=0B", path)),
+            ("OUT", format!("GET {} -> 200 aggregated", path)),
+        ] {
+            state.reqlog.log(crate::reqlog::ReqRecord {
+                ts,
+                dir,
+                user: addr.to_string(),
+                model: None,
+                backend: Some("<all backends>".to_string()),
+                method: "GET".to_string(),
+                path: path.clone(),
+                status: (dir == "OUT").then_some(200),
+                bytes: Some(0),
+                content_type: None,
+                content: None,
+            });
+            state.log_event(LogEvent {
+                at: std::time::SystemTime::now(),
+                dir,
+                user: user_id.clone(),
+                model: None,
+                backend: Some("<all backends>".to_string()),
+                info,
+                content: None,
+            });
+        }
+        return response;
     }
 
     let (tx, rx) = mpsc::channel(32);
     let mut task_headers = headers.clone();
     task_headers.remove(axum::http::header::HOST);
 
-    let requested_model = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-        json.get("model")
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
+    let requested_model = extract_requested_model(&body);
 
     let task_method = method.as_str().to_string();
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
-    let content = crate::reqlog::truncate_utf8(&body, state.log_content_limit);
+    let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit));
     let task = Task {
         path: path.clone(),
         method,
@@ -1333,11 +1804,78 @@ pub async fn proxy_handler(
     };
 
     {
-        let mut queues = state.queues.lock().unwrap();
-        queues
-            .entry(user_id.clone())
-            .or_insert_with(VecDeque::new)
-            .push_back(task);
+        let mut queues = state.queues.lock_or_recover();
+        let queue = queues.entry(user_id.clone()).or_default();
+        // A per-user ceiling: queued tasks hold their whole request body, so
+        // an unbounded queue is an unbounded memory commitment.
+        if queue.len() >= MAX_QUEUED_PER_USER {
+            drop(queues);
+            warn!(
+                "User {} already has {} requests queued; refusing this one",
+                user_id, MAX_QUEUED_PER_USER
+            );
+            *state
+                .dropped_counts
+                .lock_or_recover()
+                .entry(user_id.clone())
+                .or_insert(0) += 1;
+            state.log_event(LogEvent {
+                at: std::time::SystemTime::now(),
+                dir: "OUT",
+                user: user_id.clone(),
+                model: requested_model.clone(),
+                backend: None,
+                info: format!("429 queue full ({} waiting)", MAX_QUEUED_PER_USER),
+                content: None,
+            });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({
+                    "error": "too many queued requests for this user"
+                })),
+            )
+                .into_response();
+        }
+        // Bodies are held for as long as the request waits, so the request
+        // count alone did not bound the memory: 100 queued requests at the
+        // maximum body size is gigabytes. A request is always admitted when
+        // the queues are empty, so an oversized body can never lock the proxy
+        // out of making progress.
+        let queued_now = state
+            .queued_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if queued_now > 0 && queued_now + body_len > state.max_queued_bytes {
+            drop(queues);
+            warn!(
+                "queued bodies at {} B (limit {}); refusing a {} B request from {}",
+                queued_now, state.max_queued_bytes, body_len, user_id
+            );
+            *state
+                .dropped_counts
+                .lock_or_recover()
+                .entry(user_id.clone())
+                .or_insert(0) += 1;
+            state.log_event(LogEvent {
+                at: std::time::SystemTime::now(),
+                dir: "OUT",
+                user: user_id.clone(),
+                model: requested_model.clone(),
+                backend: None,
+                info: format!("503 queue memory full ({} B waiting)", queued_now),
+                content: None,
+            });
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": "proxy queue is full; retry shortly"
+                })),
+            )
+                .into_response();
+        }
+        queue.push_back(task);
+        state
+            .queued_bytes
+            .fetch_add(body_len, std::sync::atomic::Ordering::Relaxed);
     }
 
     state.reqlog.log(crate::reqlog::ReqRecord {
@@ -1405,6 +1943,72 @@ mod tests {
     }
 
     #[test]
+    fn metadata_paths_are_classified() {
+        for p in [
+            "/",
+            "/api/tags",
+            "/api/ps",
+            "/api/version",
+            "/api/show",
+            "/v1/models",
+            "/v1/models/llama3",
+        ] {
+            assert!(is_metadata_path(p), "{p} should be a metadata read");
+        }
+        // Anything that can run inference, transfer a model or mutate state
+        // is scheduled normally.
+        for p in [
+            "/api/generate",
+            "/api/chat",
+            "/api/embed",
+            "/api/embeddings",
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/embeddings",
+            "/api/pull",
+            "/api/push",
+            "/api/create",
+            "/api/copy",
+            "/api/delete",
+            "/api/blobs/sha256:abc",
+        ] {
+            assert!(!is_metadata_path(p), "{p} must not bypass scheduling");
+        }
+    }
+
+    #[test]
+    fn model_field_extracts_the_requested_model() {
+        let parse = |b: &str| extract_requested_model(b.as_bytes());
+        assert_eq!(
+            parse(r#"{"model":"llama3","stream":true}"#).as_deref(),
+            Some("llama3")
+        );
+        // Everything but `model` is skipped by the deserializer rather than
+        // allocated — a big ignored field must not change the outcome.
+        let big = format!(
+            r#"{{"messages":[{{"role":"user","content":"{}"}}],"model":"qwen3"}}"#,
+            "x".repeat(10_000)
+        );
+        assert_eq!(parse(&big).as_deref(), Some("qwen3"));
+        // Field order must not matter either.
+        assert_eq!(parse(r#"{"model":"a","options":{"num_ctx":8}}"#).as_deref(), Some("a"));
+
+        // Leading whitespace is fine.
+        assert_eq!(parse("  \n\t{\"model\":\"b\"}").as_deref(), Some("b"));
+
+        // No model, not an object, not JSON, empty → None, as before.
+        assert_eq!(parse(r#"{"stream":true}"#), None);
+        // A top-level array must NOT be read positionally into `model`.
+        assert_eq!(parse(r#"["llama3"]"#), None);
+        assert_eq!(parse(r#""llama3""#), None);
+        assert_eq!(parse("not json at all"), None);
+        assert_eq!(parse(""), None);
+        // A non-string `model` is not a usable name.
+        assert_eq!(parse(r#"{"model":123}"#), None);
+        assert_eq!(parse(r#"{"model":null}"#), None);
+    }
+
+    #[test]
     fn pair_matching_handles_tags_and_case() {
         // Case-insensitive, tag-stripped — but publisher-strict at pair level;
         // cross-publisher matching happens in model_routable via base compare.
@@ -1466,14 +2070,14 @@ mod tests {
             processed_count: 0,
             is_online: true,
             api_type,
-            available_models: HashSet::new(),
-            loaded_models: HashSet::new(),
+            available_models: Arc::default(),
+            loaded_models: Arc::default(),
             loaded_state_known: false,
             loaded_ctx: HashMap::new(),
             current_model: None,
             active_by_model: HashMap::new(),
             lmstudio: false,
-            native_models: Vec::new(),
+            native_models: Arc::default(),
             known_bad_endpoints: HashSet::new(),
             rejected_families: rejected.iter().copied().collect(),
             family_fail_counts: HashMap::new(),
@@ -1484,7 +2088,7 @@ mod tests {
     fn model_loaded_on_matches_ollama_ps() {
         let mut b = backend_with(BackendApiType::Ollama, &[]);
         b.loaded_state_known = true;
-        b.loaded_models = set(&["qwen3.8-27b:latest"]);
+        b.loaded_models = Arc::new(set(&["qwen3.8-27b:latest"]));
         assert!(model_loaded_on(&b, "qwen3.8-27b"));
         assert!(!model_loaded_on(&b, "other-model"));
     }
@@ -1494,7 +2098,7 @@ mod tests {
         let mut b = backend_with(BackendApiType::OpenAi, &[]);
         b.lmstudio = true;
         b.loaded_state_known = true;
-        b.loaded_models = set(&["unsloth/qwen3.8-27b@q8_0"]);
+        b.loaded_models = Arc::new(set(&["unsloth/qwen3.8-27b@q8_0"]));
         // Bare request name reaches the publisher/quant-prefixed loaded key.
         assert!(model_loaded_on(&b, "qwen3.8-27b"));
     }
@@ -1504,11 +2108,11 @@ mod tests {
         let mut b = backend_with(BackendApiType::OpenAi, &[]);
         b.lmstudio = true;
         b.loaded_state_known = true;
-        b.native_models.push(LmModelInfo {
+        b.native_models = Arc::new(vec![LmModelInfo {
             key: "unsloth/qwen3.8-27b@q8_0".into(),
             display_name: Some("Qwen3.8 27B".into()),
             loaded_instance_ids: vec!["unsloth/qwen3.8-27b@q8_0".into()],
-        });
+        }]);
         // The display name matches directly (no `:tag`/`@quant` on either side).
         assert!(model_loaded_on(&b, "Qwen3.8 27B"));
         // The key matches via the shared bounded rules (bare-name base compare).
@@ -1520,11 +2124,11 @@ mod tests {
         let mut b = backend_with(BackendApiType::OpenAi, &[]);
         b.lmstudio = true;
         b.loaded_state_known = true;
-        b.native_models.push(LmModelInfo {
+        b.native_models = Arc::new(vec![LmModelInfo {
             key: "unsloth/qwen3.8-27b@q8_0".into(),
             display_name: Some("Qwen3.8 27B".into()),
             loaded_instance_ids: Vec::new(),
-        });
+        }]);
         // Listed but with no loaded instances: not resident.
         assert!(!model_loaded_on(&b, "qwen3.8-27b"));
         assert!(!model_loaded_on(&b, "Qwen3.8 27B"));
@@ -1535,7 +2139,7 @@ mod tests {
         let mut b = backend_with(BackendApiType::OpenAi, &[]);
         b.lmstudio = true;
         b.loaded_state_known = true;
-        b.loaded_models = set(&["ovisocr2@q4_k_m"]);
+        b.loaded_models = Arc::new(set(&["ovisocr2@q4_k_m"]));
         assert!(!model_loaded_on(&b, "qwen3.8-27b"));
     }
 
@@ -1560,6 +2164,17 @@ mod tests {
             "boom"
         ));
         assert!(!is_endpoint_rejection(StatusCode::OK, r#"{"message":"ok"}"#));
+
+        // A body prefix truncated mid-JSON is NOT evidence either way: real
+        // rejections are short and parse whole. This is the first 512 bytes of
+        // a streaming answer that happens to discuss HTTP methods.
+        let truncated = r#"{"model":"llama3","created_at":"2026-01-01T00:00:00Z","response":"The endpoint you want depends on the request method"#;
+        assert!(!is_endpoint_rejection(StatusCode::OK, truncated));
+        // Same shape, but complete and with no error field: still not one.
+        let complete = r#"{"model":"llama3","response":"use the POST method on that endpoint"}"#;
+        assert!(!is_endpoint_rejection(StatusCode::OK, complete));
+        // A non-string error field is not a message to match on.
+        assert!(!is_endpoint_rejection(StatusCode::OK, r#"{"error":{"code":42}}"#));
     }
 
     #[test]
@@ -1609,6 +2224,41 @@ mod tests {
     }
 
     #[test]
+    fn model_limit_key_survives_publisher_and_quant_spellings() {
+        // appconf.yaml.example pins this model with a publisher prefix while
+        // clients ask for the bare name; both must land on the same key, or
+        // the configured limit silently degrades to 1 and the two spellings
+        // get separate in-flight budgets on one backend.
+        let configs = vec![crate::config::ModelConfig {
+            name: "qwen/qwen3.8-27b".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 3,
+            backends: Vec::new(),
+        }];
+        let limits = build_model_limits(&configs);
+        for requested in [
+            "qwen3.8-27b",
+            "qwen/qwen3.8-27b",
+            "unsloth/qwen3.8-27b@q8_0",
+            "QWEN3.8-27B:latest",
+        ] {
+            assert_eq!(
+                limits.get(&model_concurrency_key(requested)),
+                Some(&3),
+                "'{requested}' must resolve to the configured limit"
+            );
+        }
+        // A different model still gets its own (default) budget.
+        assert_ne!(
+            model_concurrency_key("qwen3.8-27b"),
+            model_concurrency_key("qwen3.8-32b")
+        );
+        assert_eq!(limits.get(&model_concurrency_key("llama3")), None);
+    }
+
+    #[test]
     fn backend_capacity_enforces_global_and_per_model() {
         let mut b = backend_with(BackendApiType::Ollama, &[]);
         let cap: u32 = 3;
@@ -1650,11 +2300,12 @@ mod tests {
             Vec::new(),
             crate::reqlog::RequestLogger::disabled(),
             65_536,
+            512 * 1024 * 1024,
         ));
 
         let (tx, mut rx) = mpsc::channel(32);
         {
-            let mut queues = state.queues.lock().unwrap();
+            let mut queues = state.queues.lock_or_recover();
             queues.entry("tester".to_string()).or_default().push_back(Task {
                 method: Method::POST,
                 user: "127.0.0.1:41000".to_string(),
@@ -1786,11 +2437,11 @@ mod tests {
     ) {
         b.is_online = true;
         b.api_type = BackendApiType::Both;
-        b.available_models = set(available);
-        b.loaded_models = set(loaded);
+        b.available_models = Arc::new(set(available));
+        b.loaded_models = Arc::new(set(loaded));
         b.loaded_state_known = true;
         b.lmstudio = true;
-        b.native_models = native;
+        b.native_models = Arc::new(native);
     }
 
     /// One LM Studio native-list entry with a loaded instance (id == key).
@@ -1805,6 +2456,10 @@ mod tests {
     /// Two-backend test AppState (same shape as the one in
     /// `stuck_request_fails_fast_with_503`).
     fn new_test_state(urls: Vec<String>) -> Arc<AppState> {
+        new_test_state_with_budget(urls, 512 * 1024 * 1024)
+    }
+
+    fn new_test_state_with_budget(urls: Vec<String>, max_queued_bytes: u64) -> Arc<AppState> {
         Arc::new(AppState::new(
             urls,
             5,     // request timeout
@@ -1815,6 +2470,7 @@ mod tests {
             Vec::new(),
             crate::reqlog::RequestLogger::disabled(),
             65_536,
+            max_queued_bytes,
         ))
     }
 
@@ -1825,10 +2481,13 @@ mod tests {
     /// as client-gone.
     fn enqueue_qwen_request(state: &Arc<AppState>) -> mpsc::Receiver<ResponsePart> {
         let (tx, rx) = mpsc::channel(32);
+        let body = Bytes::from(r#"{"model":"qwen3.8-27b","messages":[]}"#);
+        state
+            .queued_bytes
+            .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
         state
             .queues
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry("tester".to_string())
             .or_default()
             .push_back(Task {
@@ -1836,7 +2495,7 @@ mod tests {
                 user: "127.0.0.1:41000".to_string(),
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
-                body: Bytes::from(r#"{"model":"qwen3.8-27b","messages":[]}"#),
+                body,
                 responder: tx,
                 requested_model: Some("qwen3.8-27b".to_string()),
                 stuck_warned: false,
@@ -1856,8 +2515,7 @@ mod tests {
             loop {
                 let signals: Vec<usize> = state
                     .backends
-                    .lock()
-                    .unwrap()
+                    .lock_or_recover()
                     .iter()
                     .map(|b| b.active_requests + b.processed_count)
                     .collect();
@@ -1880,7 +2538,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let (processed, active) = {
-                    let b = &state.backends.lock().unwrap()[idx];
+                    let b = &state.backends.lock_or_recover()[idx];
                     (b.processed_count, b.active_requests)
                 };
                 if processed == 1 && active == 0 {
@@ -1914,7 +2572,7 @@ mod tests {
         // Same state the mocks' probe answers produce: the immediate first
         // health cycle may run and apply them without changing the scenario.
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             lmstudio_backend_state(
                 &mut backends[0],
                 &["qwen3.8-27b", "ovisocr2@q4_k_m"],
@@ -1940,7 +2598,7 @@ mod tests {
         assert_eq!(picked, 1);
         wait_for_completion(&state, picked).await;
         {
-            let backends = state.backends.lock().unwrap();
+            let backends = state.backends.lock_or_recover();
             assert_eq!(backends[1].processed_count, 1);
             assert_eq!(backends[0].processed_count, 0);
         }
@@ -1963,7 +2621,7 @@ mod tests {
 
         let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             lmstudio_backend_state(
                 &mut backends[0],
                 &["qwen3.8-27b", "ovisocr2@q4_k_m"],
@@ -1973,11 +2631,11 @@ mod tests {
             // vLLM-style: lists the model, reports no loaded state.
             backends[1].is_online = true;
             backends[1].api_type = BackendApiType::OpenAi;
-            backends[1].available_models = set(&["qwen3.8-27b"]);
-            backends[1].loaded_models = HashSet::new();
+            backends[1].available_models = Arc::new(set(&["qwen3.8-27b"]));
+            backends[1].loaded_models = Arc::default();
             backends[1].loaded_state_known = false;
             backends[1].lmstudio = false;
-            backends[1].native_models = Vec::new();
+            backends[1].native_models = Arc::default();
         }
 
         let _rx = enqueue_qwen_request(&state);
@@ -1991,7 +2649,7 @@ mod tests {
         assert_eq!(picked, 1);
         wait_for_completion(&state, picked).await;
         {
-            let backends = state.backends.lock().unwrap();
+            let backends = state.backends.lock_or_recover();
             assert_eq!(backends[1].processed_count, 1);
             assert_eq!(backends[0].processed_count, 0);
         }
@@ -2013,7 +2671,7 @@ mod tests {
 
         let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             lmstudio_backend_state(
                 &mut backends[0],
                 &["qwen3.8-27b", "ovisocr2@q4_k_m"],
@@ -2034,7 +2692,7 @@ mod tests {
         assert_eq!(picked, 1);
         wait_for_completion(&state, picked).await;
         {
-            let backends = state.backends.lock().unwrap();
+            let backends = state.backends.lock_or_recover();
             assert_eq!(backends[1].processed_count, 1);
             assert_eq!(backends[0].processed_count, 0);
         }
@@ -2064,7 +2722,7 @@ mod tests {
 
         let state = new_test_state(vec![mock0.0.clone(), offline_url]);
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             lmstudio_backend_state(
                 &mut backends[0],
                 &["qwen3.8-27b", "ovisocr2@q4_k_m"],
@@ -2091,7 +2749,7 @@ mod tests {
         assert_eq!(picked, 0);
         wait_for_completion(&state, picked).await;
         {
-            let backends = state.backends.lock().unwrap();
+            let backends = state.backends.lock_or_recover();
             assert_eq!(backends[0].processed_count, 1);
             assert_eq!(backends[1].processed_count, 0);
             assert!(!backends[1].is_online);
@@ -2099,5 +2757,497 @@ mod tests {
 
         worker.abort();
         mock0.1.abort();
+    }
+
+    /// Accept connections and never answer them — a backend that is reachable
+    /// but black-holed, the case a probe must not wait out at the inference
+    /// timeout. Returns (url, abort handle of the accept loop).
+    async fn spawn_black_holed_backend() -> (String, tokio::task::AbortHandle) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind black-holed backend");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // hold the connection open, answer nothing
+            }
+        });
+        (url, handle.abort_handle())
+    }
+
+    /// Read a finished response's JSON body.
+    async fn response_json(res: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&bytes).expect("response is JSON")
+    }
+
+    #[test]
+    fn fair_share_decays_and_charges_every_dispatch() {
+        let now = std::time::Instant::now();
+        let mut u = FairShare::new(now);
+        assert_eq!(u.value_at(now), 0.0);
+
+        u.charge(now);
+        assert!((u.value_at(now) - 1.0).abs() < 1e-9);
+        // One half-life on, that unit of load counts half.
+        let half = now + FAIR_SHARE_HALF_LIFE;
+        assert!((u.value_at(half) - 0.5).abs() < 1e-9);
+
+        // `touch` marks the user as seen without adding load.
+        let mut v = FairShare::new(now);
+        v.charge(now);
+        v.touch(half);
+        assert!((v.value_at(half) - 0.5).abs() < 1e-9);
+        assert_eq!(v.last_seen(), half);
+    }
+
+    #[test]
+    fn fair_share_lets_a_past_heavy_user_back_in() {
+        // The old ordering key was cumulative since startup, so a user with a
+        // big history stayed behind a newcomer for thousands of requests.
+        let now = std::time::Instant::now();
+        let mut heavy = FairShare::new(now);
+        for _ in 0..10 {
+            heavy.charge(now);
+        }
+        let mut light = FairShare::new(now);
+        light.charge(now);
+
+        // Twenty minutes (four half-lives) later the heavy user has been
+        // quiet while the light user keeps working: 10/16 vs 1/16 + 1.
+        let later = now + std::time::Duration::from_secs(1200);
+        light.charge(later);
+        assert!(
+            heavy.value_at(later) < light.value_at(later),
+            "the formerly heavy user must get a turn: {} vs {}",
+            heavy.value_at(later),
+            light.value_at(later)
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_depth_is_capped_per_user() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        // Fill one user's queue to the cap. No worker runs, so nothing drains.
+        // The receivers are held for the test's duration: a dropped one makes
+        // the task look client-gone.
+        let mut keep_alive = Vec::new();
+        {
+            let mut queues = state.queues.lock_or_recover();
+            let q = queues.entry("tester".to_string()).or_default();
+            for _ in 0..MAX_QUEUED_PER_USER {
+                let (tx, rx) = mpsc::channel(32);
+                keep_alive.push(rx);
+                q.push_back(Task {
+                    method: Method::POST,
+                    user: "127.0.0.1:41000".to_string(),
+                    path: "/api/chat".into(),
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(b"{}"),
+                    responder: tx,
+                    requested_model: None,
+                    stuck_warned: false,
+                    queued_at: std::time::Instant::now(),
+                });
+            }
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-User-ID", "tester".parse().expect("header value"));
+        let res = proxy_handler(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:41001".parse().expect("addr")),
+            Method::POST,
+            headers,
+            axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+            Bytes::from_static(br#"{"model":"llama3"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The queue is unchanged and the refusal is counted as a drop.
+        assert_eq!(
+            state.queues.lock_or_recover()["tester"].len(),
+            MAX_QUEUED_PER_USER
+        );
+        assert_eq!(
+            state.dropped_counts.lock_or_recover().get("tester").copied(),
+            Some(1)
+        );
+        drop(keep_alive);
+    }
+
+    #[tokio::test]
+    async fn queued_body_bytes_are_capped() {
+        let state = new_test_state_with_budget(vec!["http://127.0.0.1:9".into()], 1_000);
+
+        let call = |body: &'static [u8]| {
+            let state = state.clone();
+            let mut headers = HeaderMap::new();
+            headers.insert("X-User-ID", "tester".parse().expect("header value"));
+            async move {
+                proxy_handler(
+                    State(state),
+                    ConnectInfo("127.0.0.1:41002".parse().expect("addr")),
+                    Method::POST,
+                    headers,
+                    axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                    Bytes::from_static(body),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        // Bodies already waiting take the budget close to its limit.
+        state
+            .queued_bytes
+            .store(900, std::sync::atomic::Ordering::Relaxed);
+        let res = call(&[b'x'; 200]).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            900,
+            "a refused request must not consume budget"
+        );
+        assert_eq!(
+            state.dropped_counts.lock_or_recover().get("tester").copied(),
+            Some(1)
+        );
+
+        // With the queues empty, a body larger than the whole budget is still
+        // admitted — it waits for a backend instead of being refused, so an
+        // oversized request can never lock the proxy out of progress. No
+        // worker runs, so an admitted request simply never completes.
+        state
+            .queued_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let admitted =
+            tokio::time::timeout(std::time::Duration::from_millis(300), call(&[b'y'; 4_000]))
+                .await;
+        assert!(
+            admitted.is_err(),
+            "an oversized body on an empty queue must be admitted, not refused"
+        );
+        assert_eq!(
+            state
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4_000,
+            "an admitted request must claim its body's budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_users_are_pruned_but_active_ones_kept() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        let now = std::time::Instant::now();
+        let a_while_ago = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("monotonic clock has a second of history");
+
+        {
+            let mut scores = state.fair_share.lock_or_recover();
+            // Seen a while back, nothing queued → prunable.
+            scores.insert("stale".into(), FairShare { score: 0.0, updated: a_while_ago });
+            // Seen just now → kept regardless.
+            scores.insert("recent".into(), FairShare::new(now));
+            // Seen a while back, but still has a request waiting → kept.
+            scores.insert("waiting".into(), FairShare { score: 0.0, updated: a_while_ago });
+        }
+        state.processed_counts.lock_or_recover().insert("stale".into(), 7);
+        state
+            .user_ips
+            .lock_or_recover()
+            .insert("stale".into(), "127.0.0.1".parse().expect("ip"));
+        let (tx, rx) = mpsc::channel(32);
+        {
+            state
+                .queues
+                .lock_or_recover()
+                .entry("waiting".to_string())
+                .or_default()
+                .push_back(Task {
+                    method: Method::POST,
+                    user: "127.0.0.1:41000".to_string(),
+                    path: "/api/chat".into(),
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(b"{}"),
+                    responder: tx,
+                    requested_model: None,
+                    stuck_warned: false,
+                    queued_at: now,
+                });
+        }
+
+        prune_idle_users(&state, std::time::Duration::from_millis(500));
+
+        let scores = state.fair_share.lock_or_recover();
+        assert!(!scores.contains_key("stale"), "idle user should be dropped");
+        assert!(scores.contains_key("recent"), "recently seen user stays");
+        assert!(
+            scores.contains_key("waiting"),
+            "a user with a queued request must never be dropped"
+        );
+        // The stale user's other bookkeeping goes with them...
+        assert!(!state.processed_counts.lock_or_recover().contains_key("stale"));
+        assert!(!state.user_ips.lock_or_recover().contains_key("stale"));
+        // ...and the waiting user's request is still queued.
+        assert_eq!(state.queues.lock_or_recover()["waiting"].len(), 1);
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn model_listing_is_merged_across_backends() {
+        let (url_a, mock_a) = spawn_mock_backend(
+            r#"{"object":"list","data":[{"id":"qwen3.8-27b"},{"id":"shared"}]}"#,
+            None,
+        )
+        .await;
+        let (url_b, mock_b) = spawn_mock_backend(
+            r#"{"object":"list","data":[{"id":"shared"},{"id":"ovisocr2@q4_k_m"}]}"#,
+            None,
+        )
+        .await;
+        let state = new_test_state(vec![url_a, url_b]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            for b in backends.iter_mut() {
+                b.is_online = true;
+                b.api_type = BackendApiType::OpenAi;
+            }
+        }
+
+        let res = aggregate_model_list(&state, ApiFamily::OpenAi)
+            .await
+            .expect("both backends answer");
+        let v = response_json(res).await;
+
+        // The first answering backend's envelope is kept...
+        assert_eq!(v["object"], "list");
+        // ...and every backend's models are visible at once, deduped, in
+        // backend order. Proxying to one backend showed only half of these.
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["qwen3.8-27b", "shared", "ovisocr2@q4_k_m"]);
+
+        mock_a.abort();
+        mock_b.abort();
+    }
+
+    #[tokio::test]
+    async fn model_listing_skips_incompatible_and_offline_backends() {
+        let (url_a, mock_a) = spawn_mock_backend(QWEN_V1_MODELS, None).await;
+        let (url_b, mock_b) = spawn_mock_backend(
+            r#"{"object":"list","data":[{"id":"never-listed"}]}"#,
+            None,
+        )
+        .await;
+        let state = new_test_state(vec![url_a, url_b]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::OpenAi;
+            // Speaks a different dialect: must not be asked for /v1/models.
+            backends[1].is_online = true;
+            backends[1].api_type = BackendApiType::Ollama;
+        }
+
+        let v = response_json(
+            aggregate_model_list(&state, ApiFamily::OpenAi)
+                .await
+                .expect("the OpenAI backend answers"),
+        )
+        .await;
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["qwen3.8-27b"]);
+
+        // With no compatible backend online there is nothing to merge, and the
+        // caller falls back to the normal queued proxy path.
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = false;
+        }
+        assert!(aggregate_model_list(&state, ApiFamily::OpenAi).await.is_none());
+
+        mock_a.abort();
+        mock_b.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_request_is_served_by_a_busy_backend() {
+        let (url, mock) = spawn_mock_backend(QWEN_V1_MODELS, None).await;
+        let state = new_test_state(vec![url]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::OpenAi;
+            backends[0].available_models = Arc::new(set(&["qwen3.8-27b"]));
+            // A generation holds the only slot (max_concurrent_per_backend = 1)
+            // and a model load is running on top of it.
+            backends[0].active_requests = 1;
+        }
+        state.control_ops.lock_or_recover().insert(
+            0,
+            crate::control::ControlOp {
+                backend_idx: 0,
+                action: crate::control::ControlAction::Load,
+                requested: "qwen3.8-27b".into(),
+                canonical: "qwen3.8-27b".into(),
+                identifier: None,
+                started: std::time::Instant::now(),
+            },
+        );
+
+        // Queued first: a chat request that cannot run until the slot frees.
+        let _chat_rx = enqueue_qwen_request(&state);
+        // Queued behind it, same user: a metadata read.
+        let (tx, mut rx) = mpsc::channel(32);
+        state
+            .queues
+            .lock_or_recover()
+            .entry("tester".to_string())
+            .or_default()
+            .push_back(Task {
+                method: Method::GET,
+                user: "127.0.0.1:41000".to_string(),
+                path: "/v1/models".into(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+                responder: tx,
+                requested_model: None,
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+            });
+
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // The metadata read is answered even though the backend is at capacity
+        // AND control-busy — it never waits on the generation ahead of it.
+        let part = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("metadata request was not served within 10s");
+        match part {
+            Some(ResponsePart::Status(status, _)) => assert_eq!(status, StatusCode::OK),
+            other => panic!("expected a status part, got {:?}", other.is_some()),
+        }
+
+        {
+            let backends = state.backends.lock_or_recover();
+            // It never took the inference slot: still just the generation.
+            assert_eq!(backends[0].active_requests, 1);
+            // And it did not evict the chat request, which is still waiting.
+            assert_eq!(state.queues.lock_or_recover()["tester"].len(), 1);
+        }
+
+        worker.abort();
+        mock.abort();
+    }
+
+    #[tokio::test]
+    async fn abandoned_requests_are_not_counted_as_throughput() {
+        let (url, mock) = spawn_mock_backend(QWEN_V1_MODELS, None).await;
+        let state = new_test_state(vec![url]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::OpenAi;
+            backends[0].available_models = Arc::new(set(&["qwen3.8-27b"]));
+        }
+
+        // The client hangs up before the request is dispatched.
+        drop(enqueue_qwen_request(&state));
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state
+                    .dropped_counts
+                    .lock_or_recover()
+                    .get("tester")
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(dropped.is_ok(), "the abandoned request was never resolved");
+
+        {
+            let backends = state.backends.lock_or_recover();
+            // It reached a backend, but no response was delivered — it is not
+            // throughput. `processed_count` used to be bumped on every exit
+            // path, including this one.
+            assert_eq!(backends[0].processed_count, 0);
+            assert_eq!(backends[0].active_requests, 0);
+            // With nothing in flight the backend has no current model; it used
+            // to keep displaying the last one it ever touched.
+            assert!(backends[0].current_model.is_none());
+        }
+        // Leaving the queue returns the body's share of the memory budget.
+        assert_eq!(
+            state
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        worker.abort();
+        mock.abort();
+    }
+
+    #[tokio::test]
+    async fn health_round_probes_backends_concurrently() {
+        // Three black-holed backends: every endpoint burns the full probe
+        // budget, so a sequential round would take three times as long.
+        let mut urls = Vec::new();
+        let mut aborts = Vec::new();
+        for _ in 0..3 {
+            let (url, abort) = spawn_black_holed_backend().await;
+            urls.push(url);
+            aborts.push(abort);
+        }
+        let state = new_test_state(urls);
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("build probe client");
+        let probe_timeout = std::time::Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        health_check_round(&state, &client, true, probe_timeout).await;
+        let elapsed = started.elapsed();
+        for a in aborts {
+            a.abort();
+        }
+
+        // One backend's own endpoint probes stay sequential (~4 x 200 ms);
+        // three backends in sequence would be ~2.4 s.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "health round took {:?} — backends look sequential",
+            elapsed
+        );
+        for b in state.backends.lock_or_recover().iter() {
+            assert!(!b.is_online, "black-holed backend must be marked offline");
+        }
     }
 }

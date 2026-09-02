@@ -13,7 +13,8 @@
 # endpoint is checked live first, so models that are already resident on a
 # target backend — e.g. still loaded from an earlier run because of long
 # keep_alive — are skipped instead of being loaded twice. It never unloads
-# anything.
+# anything. A backend won't accept a load while it is serving requests, so
+# each entry waits (up to 5 minutes) for that backend to go idle first.
 
 # --- Backends ollamaMQ connects to (same as --backend-urls) -----------------
 backends:
@@ -35,7 +36,17 @@ settings:
                                  # (default 1 = one at a time, the historical behavior;
                                  # raise it to let one backend serve several requests
                                  # concurrently, bounded per model by
-                                 # models[].max_concurrent_requests)
+                                 # models[].max_concurrent_requests).
+                                 # Metadata reads (/api/tags, /api/ps, /api/show,
+                                 # /v1/models, /api/version, /) are exempt: they run no
+                                 # inference, so they never wait for a slot or take one.
+  max_body_bytes: 67108864     # largest request body accepted; 413 beyond it (default 64 MiB).
+                               # Bodies are buffered whole while a request waits for a backend,
+                               # so this is the per-request memory commitment.
+                               # /api/blobs/{digest} keeps its own 1 GiB allowance for model layers.
+  max_queued_bytes: 536870912  # total bytes of request bodies waiting in all queues; 503 beyond it
+                               # (default 512 MiB). A request is always admitted when the queues are
+                               # empty, so one oversized body can never stall the proxy.
   request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown)
   request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
@@ -50,9 +61,14 @@ settings:
 #   keep_alive               seconds to stay resident after load (Ollama only;
 #                            default: settings.load_keep_alive; -1 = forever)
 #   max_concurrent_requests  max in-flight requests for this model on one backend
-#                            (default 1; also bounded by settings.max_concurrent_per_backend)
-#   backends                 URLs to load on (exact or substring match);
-#                            empty/omitted = any suitable backend
+#                            (default 1; also bounded by settings.max_concurrent_per_backend).
+#                            Keyed on the model's base name, so the same budget applies
+#                            however the client spells it: 'qwen3.8-27b',
+#                            'qwen/qwen3.8-27b' and 'unsloth/qwen3.8-27b@q8_0' all count
+#                            against this one entry.
+#   backends                 URLs to load on — EVERY backend whose URL contains the
+#                            string is targeted, so '- :11434' covers all backends on
+#                            that port; empty/omitted = any suitable backend
 models:
   # Big MoE model pinned to two specific backends with a large context
   - name: "gpt-oss:120b"
@@ -69,7 +85,8 @@ models:
     identifier: "coder"
     max_ctx: 32768
 
-  # LM Studio example: 'backends' matches by substring too
+  # LM Studio example: 'backends' matches by substring too (and covers every
+  # backend whose URL contains it, not just the first)
   - name: "qwen/qwen3.8-27b"
     identifier: "qwen3.8"
     max_ctx: 130000

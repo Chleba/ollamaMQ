@@ -74,6 +74,19 @@ pub struct Settings {
     /// request log; values below 1024 are raised to 1024 (default 65536).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_content_limit: Option<usize>,
+    /// Largest request body accepted on normal routes, in bytes (default
+    /// 64 MiB). Bodies are buffered whole — they have to be, since a request
+    /// may wait in a queue before a backend takes it — so this is the per
+    /// request memory commitment. `/api/blobs/{digest}` keeps its own 1 GiB
+    /// allowance for model-layer uploads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+    /// Max total bytes of request bodies waiting in all queues at once
+    /// (default 512 MiB). Past this the proxy answers 503 instead of
+    /// accumulating; a request always gets in when the queues are empty, so
+    /// one oversized body can never deadlock the proxy against itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queued_bytes: Option<u64>,
 }
 
 /// Top-level config file structure.
