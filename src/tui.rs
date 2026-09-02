@@ -411,16 +411,15 @@ impl TuiDashboard {
                             self.active_panel = self.active_panel.prev();
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
-                            if self.active_panel == Panel::Backends {
-                                if let Some(i) = self.backend_table_state.selected() {
-                                    if i < snapshot.backends.len() {
-                                        let url = snapshot.backends[i].url.clone();
-                                        if self.expanded_backends.contains(&url) {
-                                            self.expanded_backends.remove(&url);
-                                        } else {
-                                            self.expanded_backends.insert(url);
-                                        }
-                                    }
+                            if self.active_panel == Panel::Backends
+                                && let Some(i) = self.backend_table_state.selected()
+                                && i < snapshot.backends.len()
+                            {
+                                let url = snapshot.backends[i].url.clone();
+                                if self.expanded_backends.contains(&url) {
+                                    self.expanded_backends.remove(&url);
+                                } else {
+                                    self.expanded_backends.insert(url);
                                 }
                             } else if self.active_panel == Panel::Logs
                                 && key.code == KeyCode::Enter
@@ -535,78 +534,73 @@ impl TuiDashboard {
                             }
                         }
                         KeyCode::Char('p') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.users.len() {
-                                        let user_id = snapshot.users[i].id.clone();
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user_id = snapshot.users[i].id.clone();
 
-                                        // 1. Handle VIP
-                                        {
-                                            let mut vip = state.vip_user.lock_or_recover();
-                                            if vip.as_ref() == Some(&user_id) {
-                                                *vip = None;
-                                            } else {
-                                                *vip = Some(user_id.clone());
-                                            }
-                                        }
+                                // 1. Handle VIP
+                                {
+                                    let mut vip = state.vip_user.lock_or_recover();
+                                    if vip.as_ref() == Some(&user_id) {
+                                        *vip = None;
+                                    } else {
+                                        *vip = Some(user_id.clone());
+                                    }
+                                }
 
-                                        // 2. Clear Boost if we just set VIP
-                                        {
-                                            let mut boost = state.boost_user.lock_or_recover();
-                                            if boost.as_ref() == Some(&user_id) {
-                                                *boost = None;
-                                            }
-                                        }
+                                // 2. Clear Boost if we just set VIP
+                                {
+                                    let mut boost = state.boost_user.lock_or_recover();
+                                    if boost.as_ref() == Some(&user_id) {
+                                        *boost = None;
                                     }
                                 }
                             }
                         }
                         KeyCode::Char('b') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.users.len() {
-                                        let user_id = snapshot.users[i].id.clone();
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user_id = snapshot.users[i].id.clone();
 
-                                        // 1. Handle Boost
-                                        {
-                                            let mut boost = state.boost_user.lock_or_recover();
-                                            if boost.as_ref() == Some(&user_id) {
-                                                *boost = None;
-                                            } else {
-                                                *boost = Some(user_id.clone());
-                                            }
-                                        }
+                                // 1. Handle Boost
+                                {
+                                    let mut boost = state.boost_user.lock_or_recover();
+                                    if boost.as_ref() == Some(&user_id) {
+                                        *boost = None;
+                                    } else {
+                                        *boost = Some(user_id.clone());
+                                    }
+                                }
 
-                                        // 2. Clear VIP if we just set Boost
-                                        {
-                                            let mut vip = state.vip_user.lock_or_recover();
-                                            if vip.as_ref() == Some(&user_id) {
-                                                *vip = None;
-                                            }
-                                        }
+                                // 2. Clear VIP if we just set Boost
+                                {
+                                    let mut vip = state.vip_user.lock_or_recover();
+                                    if vip.as_ref() == Some(&user_id) {
+                                        *vip = None;
                                     }
                                 }
                             }
                         }
                         KeyCode::Char('x') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.users.len() {
-                                        let user_id = snapshot.users[i].id.clone();
-                                        state.block_user(user_id);
-                                    }
-                                }
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user_id = snapshot.users[i].id.clone();
+                                state.block_user(user_id);
                             }
                         }
                         KeyCode::Char('X') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.users.len()
-                                        && let Some(ip) = snapshot.users[i].ip
-                                    {
-                                        state.block_ip(ip);
-                                    }
-                                }
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                                && let Some(ip) = snapshot.users[i].ip
+                            {
+                                state.block_ip(ip);
                             }
                         }
                         KeyCode::Char('u') => {
@@ -633,15 +627,14 @@ impl TuiDashboard {
                                         }
                                     }
                                 }
-                            } else if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.users.len() {
-                                        let row = &snapshot.users[i];
-                                        state.unblock_user(&row.id);
-                                        if let Some(ip) = row.ip {
-                                            state.unblock_ip(ip);
-                                        }
-                                    }
+                            } else if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let row = &snapshot.users[i];
+                                state.unblock_user(&row.id);
+                                if let Some(ip) = row.ip {
+                                    state.unblock_ip(ip);
                                 }
                             }
                         }
@@ -957,7 +950,7 @@ impl TuiDashboard {
         let header_len = 6;
         let footer_len = 1;
         let visible =
-            inner.height.saturating_sub((header_len + footer_len) as u16) as usize;
+            inner.height.saturating_sub(header_len + footer_len) as usize;
         detail.offset = detail.offset.min(total_visual.saturating_sub(visible));
 
         let header = Paragraph::new(Text::from(vec![
@@ -1534,9 +1527,9 @@ impl TuiDashboard {
                     .as_deref()
                     .map(|u| u.replace("http://", "").replace("https://", ""))
                     .unwrap_or_else(|| "-".into());
-                let info_style = if ev.info.starts_with("dropped") {
-                    Style::default().fg(Color::Red)
-                } else if ev.info.contains("rejected") {
+                let info_style = if ev.info.starts_with("dropped")
+                    || ev.info.contains("rejected")
+                {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default().fg(Color::Gray)

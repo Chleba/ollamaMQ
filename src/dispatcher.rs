@@ -547,10 +547,10 @@ impl AppState {
     }
 
     fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
-        if let Ok(content) = fs::read_to_string(BLOCKED_FILE) {
-            if let Ok(config) = serde_json::from_str::<BlockedConfig>(&content) {
-                return (config.ips, config.users);
-            }
+        if let Ok(content) = fs::read_to_string(BLOCKED_FILE)
+            && let Ok(config) = serde_json::from_str::<BlockedConfig>(&content)
+        {
+            return (config.ips, config.users);
         }
         (HashSet::new(), HashSet::new())
     }

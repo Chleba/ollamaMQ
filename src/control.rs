@@ -710,8 +710,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                 // (which sends no context) may have the wrong context window;
                 // in that case unload and reload with the configured value
                 // instead of skipping.
-                if resident && cfg.max_ctx.is_some() {
-                    let want = cfg.max_ctx.unwrap();
+                if let Some(want) = cfg.max_ctx.filter(|_| resident) {
                     let actual = st
                         .backends
                         .lock_or_recover()
