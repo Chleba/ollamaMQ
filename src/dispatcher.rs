@@ -652,6 +652,37 @@ fn normalize_model_id(id: &str) -> String {
     no_tag.split('@').next().unwrap_or(no_tag).to_string()
 }
 
+/// If a model config entry pins `requested` (by normalized name or identifier)
+/// to a non-empty backend list, return that list. First matching entry wins
+/// (config file order). Returns None when the model is not pinned.
+fn model_pin_for(
+    requested: &str,
+    configs: &[crate::config::ModelConfig],
+) -> Option<Vec<String>> {
+    let requested_norm = normalize_model_id(requested);
+    configs
+        .iter()
+        .find(|c| {
+            !c.backends.is_empty()
+                && (requested_norm == normalize_model_id(&c.name)
+                    || c.identifier
+                        .as_deref()
+                        .map(|id| !id.is_empty() && requested_norm == normalize_model_id(id))
+                        .unwrap_or(false))
+        })
+        .map(|c| c.backends.clone())
+}
+
+/// Case-insensitive substring backend URL match for pin routing: the pin
+/// URL is normalized with `trim_end_matches('/')` + `to_lowercase()`, and a
+/// backend matches when its (lowercased) URL contains it — consistent with
+/// `control::config_targets` load targeting, so the same `backends:` entry
+/// that loads a model also routes requests for it.
+fn pin_url_matches(pin_url: &str, backend_url: &str) -> bool {
+    let pin_low = pin_url.trim_end_matches('/').to_lowercase();
+    backend_url.to_lowercase().contains(&pin_low)
+}
+
 /// Publisher-agnostic part of a normalized id (`owner/model` -> `model`).
 fn model_base(id: &str) -> String {
     let n = normalize_model_id(id);
@@ -1060,11 +1091,30 @@ pub async fn run_worker(state: Arc<AppState>) {
 
     loop {
         let selection_opt = {
+            // Snapshot the model config once, before the queues lock, so the
+            // per-task pin lookup below never takes model_config (lock order:
+            // model_config -> queues -> backends).
+            let configs = state.model_config.lock_or_recover().clone();
             let mut queues = state.queues.lock_or_recover();
             // Backends with a model control op (load/unload) in flight are treated as
             // busy: loading a new model can evict whatever is currently running.
             let control_busy: HashSet<usize> =
                 state.control_ops.lock_or_recover().keys().copied().collect();
+            // Model pins for every queued task, computed BEFORE taking the
+            // backends lock (the model_config lock must not nest under it —
+            // config reloads run concurrently). A pin restricts a model's
+            // requests to the backends listed in appconf.yaml (strict).
+            let task_pins: HashMap<(String, usize), Vec<String>> = queues
+                .iter()
+                .flat_map(|(user, q)| {
+                    q.iter().enumerate().filter_map(|(pos, t)| match &t.requested_model {
+                        Some(model) => {
+                            model_pin_for(model, &configs).map(|pin| ((user.clone(), pos), pin))
+                        }
+                        None => None,
+                    })
+                })
+                .collect();
             let mut backends = state.backends.lock_or_recover();
             let mut last_idx = state
                 .last_backend_idx
@@ -1157,6 +1207,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                             user_id, pos, task_ref.path, api_family
                         );
 
+                        // Backend pin for this task (pre-computed above, before
+                        // the backends lock): Some(urls) restricts routing to
+                        // exactly those backends; None = no restriction.
+                        let pin = task_pins.get(&(user_id.clone(), pos)).cloned();
+
                         // Find eligible backends: online, has capacity (global per-backend
                         // cap + per-model limit), and support the required API + Model.
                         // `limits` is taken once per selection round, above —
@@ -1167,7 +1222,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             Some(k) => limits.get(k).copied().unwrap_or(1),
                             None => 0, // unused for model-less requests
                         };
-                        let eligible_indices: Vec<usize> = backends.iter()
+                        let mut eligible_indices: Vec<usize> = backends.iter()
                             .enumerate()
                             .filter(|(i, b)| {
                                 let online = b.is_online;
@@ -1224,6 +1279,14 @@ pub async fn run_worker(state: Arc<AppState>) {
                             })
                             .map(|(i, _)| i)
                             .collect();
+
+                        // Apply the pin filter upstream of tiering/selection: a
+                        // pinned model may only be served by its listed backends.
+                        if let Some(ref pins) = pin {
+                            eligible_indices.retain(|&i| {
+                                pins.iter().any(|p| pin_url_matches(p, &backends[i].url))
+                            });
+                        }
 
                         // Model-load-aware selection among eligible backends (see model_loaded_on):
                         //   tier 1 — the requested model is confirmed loaded on the backend, or the
@@ -1288,7 +1351,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                             let satisfiable = backends.iter().any(|b| {
                                 family_compatible(b, api_family)
                                     && match &task_ref.requested_model {
-                                        Some(model) => model_routable(model, &b.available_models),
+                                        // A pinned model is only satisfiable by a backend
+                                        // that also passes the pin filter — strict pinning
+                                        // fails with 503 instead of routing elsewhere.
+                                        Some(model) => {
+                                            model_routable(model, &b.available_models)
+                                                && pin.as_ref().map_or(true, |pins| {
+                                                    pins.iter()
+                                                        .any(|p| pin_url_matches(p, &b.url))
+                                                })
+                                        }
                                         None => true,
                                     }
                             });
@@ -1306,6 +1378,27 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     .global_counter
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let waited = dropped.queued_at.elapsed().as_secs();
+                                // Pinned models get a distinct, user-diagnosable message.
+                                let (log_info, error_msg) = match &pin {
+                                    Some(_) => {
+                                        let model =
+                                            dropped.requested_model.clone().unwrap_or_default();
+                                        (
+                                            format!(
+                                                "503 no pinned backend can serve model '{}' (waited {}s)",
+                                                model, waited
+                                            ),
+                                            format!(
+                                                "no configured backend available for model '{}'",
+                                                model
+                                            ),
+                                        )
+                                    }
+                                    None => (
+                                        format!("503 no backend can serve (waited {}s)", waited),
+                                        "no backend available to serve this request".to_string(),
+                                    ),
+                                };
                                 let mut dropped_counts = state.dropped_counts.lock_or_recover();
                                 *dropped_counts.entry(user_id.clone()).or_insert(0) += 1;
                                 drop(dropped_counts);
@@ -1315,18 +1408,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     user: user_id.clone(),
                                     model: dropped.requested_model.clone(),
                                     backend: None,
-                                    info: format!(
-                                        "503 no backend can serve (waited {}s)",
-                                        waited
-                                    ),
+                                    info: log_info,
                                     content: None,
                                 });
                                 let responder = dropped.responder;
                                 tokio::spawn(async move {
-                                    let body = serde_json::json!({
-                                        "error": "no backend available to serve this request"
-                                    })
-                                    .to_string();
+                                    let body =
+                                        serde_json::json!({ "error": error_msg }).to_string();
                                     let mut headers = HeaderMap::new();
                                     headers.insert(
                                         axum::http::header::CONTENT_TYPE,
@@ -1347,12 +1435,30 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                             if !task_ref.stuck_warned {
                                 let msg_prefix = if satisfiable {
-                                    "No backend free".to_string()
+                                    match &pin {
+                                        // Satisfiable: some pinned backend may still serve
+                                        // the request, so there is no 503 to promise — we
+                                        // are merely waiting for it.
+                                        Some(pins) => format!(
+                                            "model '{}' is pinned to backend(s) {} which are not currently eligible; waiting for a pinned backend to become eligible",
+                                            task_ref.requested_model.as_deref().unwrap_or("-"),
+                                            pins.join(", ")
+                                        ),
+                                        None => "No backend free".to_string(),
+                                    }
                                 } else {
-                                    format!(
-                                        "No backend can serve; will fail with 503 after {}s",
-                                        state.stuck_timeout.as_secs()
-                                    )
+                                    match &pin {
+                                        Some(pins) => format!(
+                                            "no backend can serve model '{}' (pinned to: {}); will fail with 503 after {}s",
+                                            task_ref.requested_model.as_deref().unwrap_or("-"),
+                                            pins.join(", "),
+                                            state.stuck_timeout.as_secs()
+                                        ),
+                                        None => format!(
+                                            "No backend can serve; will fail with 503 after {}s",
+                                            state.stuck_timeout.as_secs()
+                                        ),
+                                    }
                                 };
                                 warn!(
                                     "{} for {} {} (model: {}, family: {:?}) for user {}",
@@ -3249,5 +3355,368 @@ mod tests {
         for b in state.backends.lock_or_recover().iter() {
             assert!(!b.is_online, "black-holed backend must be marked offline");
         }
+    }
+
+    // -- Backend-pinning tests -------------------------------------------------
+    //
+    // A non-empty `backends:` list in the model config pins routing: requests
+    // for that model may only go to the listed backends (strict — no fallback
+    // to other online backends, 503 after stuck_timeout when none can serve).
+
+    /// OpenAI-style mock model list for a single bare model id "m".
+    const M_V1_MODELS: &str = r#"{"data":[{"id":"m"}]}"#;
+
+    /// Marks `b` as an online OpenAI backend listing the given models (no
+    /// loaded-state reporting) — exactly the state the matching mock's probe
+    /// answers produce.
+    fn openai_backend_state(b: &mut BackendStatus, available: &[&str]) {
+        b.is_online = true;
+        b.api_type = BackendApiType::OpenAi;
+        b.available_models = Arc::new(set(available));
+        b.loaded_models = Arc::default();
+        b.loaded_state_known = false;
+    }
+
+    /// Enqueue one `POST /v1/chat/completions` request for `model` under user
+    /// "tester" (same shape as enqueue_qwen_request). Returns the receiver —
+    /// keep it alive for the test's duration.
+    fn enqueue_chat_request(
+        state: &Arc<AppState>,
+        model: &str,
+    ) -> mpsc::Receiver<ResponsePart> {
+        let (tx, rx) = mpsc::channel(32);
+        state
+            .queues
+            .lock()
+            .unwrap()
+            .entry("tester".to_string())
+            .or_default()
+            .push_back(Task {
+                method: Method::POST,
+                user: "127.0.0.1:41000".to_string(),
+                path: "/v1/chat/completions".into(),
+                headers: HeaderMap::new(),
+                body: Bytes::from(format!(r#"{{"model":"{}","messages":[]}}"#, model)),
+                responder: tx,
+                requested_model: Some(model.to_string()),
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+            });
+        rx
+    }
+
+    /// Append a model entry to the test state's model config (the pin under
+    /// test). `backends` empty = the entry does NOT pin.
+    fn pin_model(state: &Arc<AppState>, name: &str, identifier: Option<&str>, backends: Vec<String>) {
+        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+            name: name.to_string(),
+            identifier: identifier.map(|s| s.to_string()),
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends,
+        });
+    }
+
+    /// Two-backend test AppState with a per-backend cap high enough that a
+    /// pre-busy backend (active_requests = 1) still has capacity for the
+    /// enqueued request (same shape as new_test_state).
+    fn new_test_state_cap(urls: Vec<String>, cap: u32) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            urls,
+            5,     // request timeout
+            86400, // load keep alive
+            1,     // stuck_timeout: fail fast after 1s
+            cap,   // max concurrent per backend
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        ))
+    }
+
+    /// Wait until the single enqueued request has been COMPLETED by one of the
+    /// backends (processed_count == 1) and return which one. Unlike
+    /// wait_for_picked_backend this ignores pre-set active_requests counts.
+    async fn wait_for_served_by(state: &Arc<AppState>) -> Option<usize> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let done = state
+                    .backends
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b.processed_count)
+                    .collect::<Vec<_>>();
+                if let Some(pos) = done.iter().position(|&c| c == 1) {
+                    return pos;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Pinning restricts eligibility: a model pinned to backend A must be
+    /// served by A even when the unpinned min-active-requests selection would
+    /// pick the freer backend B.
+    #[tokio::test]
+    async fn pin_restricts_eligibility() {
+        let mock0 = spawn_mock_backend(M_V1_MODELS, None).await; // A: pinned
+        let mock1 = spawn_mock_backend(M_V1_MODELS, None).await; // B: freer
+
+        let state = new_test_state_cap(vec![mock0.0.clone(), mock1.0.clone()], 2);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            openai_backend_state(&mut backends[0], &["m"]);
+            openai_backend_state(&mut backends[1], &["m"]);
+            // B has fewer active requests: unpinned selection would pick B.
+            backends[0].active_requests = 1;
+        }
+        pin_model(&state, "m", None, vec![mock0.0.clone()]);
+
+        let _rx = enqueue_chat_request(&state, "m");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // The pin forces backend A despite B being freer.
+        let served = wait_for_served_by(&state)
+            .await
+            .expect("no backend served the request within 10s");
+        assert_eq!(served, 0);
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[0].processed_count, 1);
+            assert_eq!(backends[1].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// A pin matches by identifier as well as name: entry name "x/y" with
+    /// identifier "m" pins requests for model "m" to backend A only.
+    #[tokio::test]
+    async fn pin_matches_by_identifier() {
+        let mock0 = spawn_mock_backend(M_V1_MODELS, None).await; // A: pinned
+        let mock1 = spawn_mock_backend(M_V1_MODELS, None).await;
+
+        let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            openai_backend_state(&mut backends[0], &["m"]);
+            openai_backend_state(&mut backends[1], &["m"]);
+        }
+        pin_model(&state, "x/y", Some("m"), vec![mock0.0.clone()]);
+
+        let _rx = enqueue_chat_request(&state, "m");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // Unpinned round-robin (last_backend_idx = 0) would pick backend 1;
+        // the identifier pin forces backend A.
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 0);
+        wait_for_completion(&state, picked).await;
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[0].processed_count, 1);
+            assert_eq!(backends[1].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// A pin URL matches by substring (case-insensitive), consistent with
+    /// `control::config_targets` load targeting: a scheme-less `backends:`
+    /// entry (as in appconf.yaml.example) routes as well as loads. The pin is
+    /// derived from backend A's actual URL with the `http://` prefix
+    /// stripped, so only A's full URL contains it.
+    #[tokio::test]
+    async fn pin_matches_by_substring_url() {
+        let mock0 = spawn_mock_backend(M_V1_MODELS, None).await; // A: pinned
+        let mock1 = spawn_mock_backend(M_V1_MODELS, None).await;
+
+        let state = new_test_state(vec![mock0.0.clone(), mock1.0.clone()]);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            openai_backend_state(&mut backends[0], &["m"]);
+            openai_backend_state(&mut backends[1], &["m"]);
+        }
+        // Substring pin: A's URL without the scheme (B is a different port).
+        let pin_url = mock0.0.trim_start_matches("http://").to_string();
+        assert!(
+            !pin_url.is_empty()
+                && pin_url != mock0.0
+                && !mock1.0.contains(&pin_url),
+            "pin must be a proper substring of A's URL only: pin={} a={} b={}",
+            pin_url,
+            mock0.0,
+            mock1.0
+        );
+        pin_model(&state, "m", None, vec![pin_url]);
+
+        let _rx = enqueue_chat_request(&state, "m");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let served = wait_for_served_by(&state)
+            .await
+            .expect("no backend served the request within 10s");
+        assert_eq!(served, 0);
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[0].processed_count, 1);
+            assert_eq!(backends[1].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// A model absent from the config is unpinned: both backends stay
+    /// eligible and selection follows the existing min-active-requests rule
+    /// (the freer backend B wins).
+    #[tokio::test]
+    async fn unpinned_model_unchanged() {
+        let mock0 = spawn_mock_backend(M_V1_MODELS, None).await;
+        let mock1 = spawn_mock_backend(M_V1_MODELS, None).await;
+
+        let state = new_test_state_cap(vec![mock0.0.clone(), mock1.0.clone()], 2);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            openai_backend_state(&mut backends[0], &["m"]);
+            openai_backend_state(&mut backends[1], &["m"]);
+            // Backend A is busier: min-active selection must pick B.
+            backends[0].active_requests = 1;
+        }
+        // No config entry for "m" at all (state was built with an empty list).
+
+        let _rx = enqueue_chat_request(&state, "m");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let served = wait_for_served_by(&state)
+            .await
+            .expect("no backend served the request within 10s");
+        assert_eq!(served, 1);
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[1].processed_count, 1);
+            assert_eq!(backends[0].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// A config entry with an empty `backends:` list is NOT a pin: the model
+    /// stays eligible on every backend (min-active selection picks the freer
+    /// backend B; a spurious pin to nothing would 503 instead).
+    #[tokio::test]
+    async fn empty_backends_not_a_pin() {
+        let mock0 = spawn_mock_backend(M_V1_MODELS, None).await;
+        let mock1 = spawn_mock_backend(M_V1_MODELS, None).await;
+
+        let state = new_test_state_cap(vec![mock0.0.clone(), mock1.0.clone()], 2);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            openai_backend_state(&mut backends[0], &["m"]);
+            openai_backend_state(&mut backends[1], &["m"]);
+            backends[0].active_requests = 1; // B is freer
+        }
+        pin_model(&state, "m", None, Vec::new()); // empty list → no pin
+
+        let _rx = enqueue_chat_request(&state, "m");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let served = wait_for_served_by(&state)
+            .await
+            .expect("no backend served the request within 10s");
+        assert_eq!(served, 1);
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[1].processed_count, 1);
+            assert_eq!(backends[0].processed_count, 0);
+        }
+
+        worker.abort();
+        mock0.1.abort();
+        mock1.1.abort();
+    }
+
+    /// Strict pinning: when the only pinned backend is offline, an online
+    /// unpinned backend that lists the model must NOT serve it — the request
+    /// fails with 503 and the pinned error message after the stuck timeout.
+    #[tokio::test]
+    async fn pin_all_pinned_offline_fails_503() {
+        // A: a port that was just closed: the "offline" pinned backend never
+        // answers a probe (its available list is empty, like after an
+        // outage), so nothing about it is satisfiable.
+        let offline_url = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind temp listener");
+            let addr = l.local_addr().expect("temp addr");
+            drop(l);
+            format!("http://{}", addr)
+        };
+        // B: online and lists the model, but is not in the pin.
+        let mock1 = spawn_mock_backend(M_V1_MODELS, None).await;
+
+        let state = new_test_state(vec![offline_url.clone(), mock1.0.clone()]);
+        {
+            let mut backends = state.backends.lock().unwrap();
+            openai_backend_state(&mut backends[0], &[]);
+            backends[0].is_online = false; // pinned backend offline
+            openai_backend_state(&mut backends[1], &["m"]);
+        }
+        pin_model(&state, "m", None, vec![offline_url.clone()]);
+
+        let mut rx = enqueue_chat_request(&state, "m");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        // stuck_timeout is 1s: the request must be dropped with 503 and the
+        // pinned (user-diagnosable) error message.
+        let part = tokio::time::timeout(std::time::Duration::from_secs(6), rx.recv())
+            .await
+            .expect("no response within 6s")
+            .expect("responder closed");
+        match part {
+            ResponsePart::Status(status, _) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE)
+            }
+            _ => panic!("expected Status(503), got another part"),
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no body within 2s")
+            .expect("responder closed");
+        match &chunk {
+            ResponsePart::Chunk(bytes) => {
+                let body = String::from_utf8_lossy(&bytes);
+                assert!(
+                    body.contains(r#"no configured backend available for model 'm'"#),
+                    "unexpected 503 body: {}",
+                    body
+                );
+            }
+            _ => panic!("expected Chunk with the error body, got another part"),
+        }
+
+        // The unpinned online backend must never have served the request.
+        {
+            let backends = state.backends.lock().unwrap();
+            assert_eq!(backends[1].processed_count, 0);
+            assert_eq!(backends[1].active_requests, 0);
+        }
+
+        worker.abort();
+        mock1.1.abort();
     }
 }

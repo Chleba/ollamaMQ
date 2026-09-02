@@ -68,7 +68,10 @@ settings:
 #                            against this one entry.
 #   backends                 URLs to load on — EVERY backend whose URL contains the
 #                            string is targeted, so '- :11434' covers all backends on
-#                            that port; empty/omitted = any suitable backend
+#                            that port. A non-empty list ALSO pins routing: requests
+#                            for this model only go to these backends, and fail with
+#                            503 after stuck_timeout if none of them can serve.
+#                            Empty/omitted = any suitable backend
 models:
   # Big MoE model pinned to two specific backends with a large context
   - name: "gpt-oss:120b"

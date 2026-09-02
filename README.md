@@ -295,7 +295,8 @@ models:
     keep_alive: 86400           # seconds the model stays resident after load (Ollama; -1 = forever)
     max_concurrent_requests: 3  # in-flight requests allowed for this model on one backend (default 1)
     backends:                   # which backends to load it on — every backend whose URL contains the string is
-                                #   targeted, so `- :11434` covers all backends on that port; omitted/empty = any suitable backend
+                                #   targeted, so `- :11434` covers all backends on that port. A non-empty list also
+                                #   PINS routing for this model (see below); omitted/empty = any suitable backend
       - http://10.137.1.1:11434
 ```
 
@@ -307,6 +308,7 @@ models:
 - `models` is applied automatically at startup (once backend probes have run) and re-applied any time you press **`r`** in the TUI. Application is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models already resident there — e.g. still loaded from an earlier run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything, and loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL`) and in the log output.
 - A backend won't accept a load while it is serving requests, so each entry **waits for that backend to go idle** (up to 5 minutes) before loading. Without this, restarting the proxy under live traffic meant every configured model was refused on the spot and never retried — leaving models unloaded, or loaded with the wrong `max_ctx`.
 - Explicit CLI flags override file values when given (e.g. `--backend-urls` over `backends`, `--port`/`--host`/`--timeout` over `settings`).
+- A non-empty `models[].backends` list also **pins routing**: requests for that model are only sent to the listed backends (case-insensitive substring URL match, the same rule as load targeting) and never to other suitable ones. If none of the pinned backends is online/eligible, the request fails with HTTP 503 after `stuck_timeout` (error: `no configured backend available for model '<model>'`) instead of being routed elsewhere. If `backends` is empty/omitted, or the model is not in the config at all, the existing behavior applies — any online backend that lists the model may serve it.
 
 See [`appconf.yaml.example`](appconf.yaml.example) for a fully commented template.
 
