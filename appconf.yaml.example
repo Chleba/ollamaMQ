@@ -51,8 +51,11 @@ settings:
 #                            default: settings.load_keep_alive; -1 = forever)
 #   max_concurrent_requests  max in-flight requests for this model on one backend
 #                            (default 1; also bounded by settings.max_concurrent_per_backend)
-#   backends                 URLs to load on (exact or substring match);
-#                            empty/omitted = any suitable backend
+#   backends                 URLs to load on (exact or substring match); a
+#                            non-empty list ALSO pins routing — requests for
+#                            this model only go to these backends, and fail
+#                            with 503 after stuck_timeout if none of them can
+#                            serve; empty/omitted = any suitable backend
 models:
   # Big MoE model pinned to two specific backends with a large context
   - name: "gpt-oss:120b"
