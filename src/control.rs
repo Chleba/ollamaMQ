@@ -24,6 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
+use crate::lock::LockExt;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,6 +36,18 @@ const MAX_HISTORY: usize = 20;
 
 /// How long a finished op stays visible in the TUI.
 pub const RESULT_VISIBLE: Duration = Duration::from_secs(10);
+
+/// How long applying the model config waits for a backend to go idle before
+/// attempting the load anyway.
+///
+/// `start_model_control` refuses to load while a backend has requests in
+/// flight — loading can evict the model those requests are using. Config apply
+/// runs at startup and on TUI 'r', so on a proxy restarted under live traffic
+/// every entry used to be rejected on the spot and never retried: the
+/// configured models, and in particular their `max_ctx`, were silently never
+/// applied. Waiting for the in-flight requests to drain fixes that; the bound
+/// keeps a permanently busy backend from parking the task forever.
+const CONFIG_APPLY_IDLE_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlAction {
@@ -123,12 +136,25 @@ pub struct BackendProbe {
     pub good_endpoints: HashSet<String>,
 }
 
+/// Per-request timeout for health probes.
+///
+/// Probes must NOT inherit the shared client's request timeout: that is sized
+/// for inference (`settings.timeout`, 300 s by default), so a backend that
+/// accepts connections but never answers would hold the health loop for
+/// minutes per endpoint. A backend that cannot answer a metadata endpoint in
+/// this long is effectively down, which is exactly what the probe records.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Probe one backend: online status, API type, available models, loaded
 /// models, and (for LM Studio) the native model list.
+///
+/// `timeout` bounds every individual HTTP request made here (see
+/// [`PROBE_TIMEOUT`]); it is a parameter so tests can drive it down.
 pub async fn probe_backend(
     client: &reqwest::Client,
     url: &str,
     skip: &HashSet<String>,
+    timeout: Duration,
 ) -> BackendProbe {
     let mut is_online = false;
     let mut detected_type = BackendApiType::Unknown;
@@ -143,7 +169,7 @@ pub async fn probe_backend(
     // Probe Ollama API: /api/tags → expects {"models": [...]}
     if !skip.contains("/api/tags") {
         let check_url = format!("{}/api/tags", url);
-        match client.get(&check_url).send().await {
+        match client.get(&check_url).timeout(timeout).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 let body = res.text().await.unwrap_or_default();
@@ -191,7 +217,7 @@ pub async fn probe_backend(
         // Also check for loaded models via /api/ps if it was an Ollama-like response
         if is_online && !skip.contains("/api/ps") {
             let ps_url = format!("{}/api/ps", url);
-            match client.get(&ps_url).send().await {
+            match client.get(&ps_url).timeout(timeout).send().await {
                 Ok(res) if res.status().is_success() => {
                     let body = res.text().await.unwrap_or_default();
                     match serde_json::from_str::<serde_json::Value>(&body)
@@ -238,7 +264,7 @@ pub async fn probe_backend(
 // Probe OpenAI API: /v1/models → expects {"data": [...]}
     if !skip.contains("/v1/models") {
         let check_url = format!("{}/v1/models", url);
-        match client.get(&check_url).send().await {
+        match client.get(&check_url).timeout(timeout).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 let body = res.text().await.unwrap_or_default();
@@ -285,7 +311,7 @@ pub async fn probe_backend(
     // generic OpenAI servers 404 it. The outcome is remembered so we stop
     // re-probing backends that don't have the endpoint.
         if !skip.contains("/api/v1/models") {
-            match probe_lmstudio_native(client, url).await {
+            match probe_lmstudio_native(client, url, timeout).await {
                 NativeProbeOutcome::Found(ls_loaded, ls_native, ls_ctx) => {
                     lmstudio = true;
                     native_models = ls_native;
@@ -305,7 +331,7 @@ pub async fn probe_backend(
     // Fallback: just check root if both specific probes failed
     if !is_online && !skip.contains("/") {
         let check_url = format!("{}/", url);
-        match client.get(&check_url).send().await {
+        match client.get(&check_url).timeout(timeout).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 good_endpoints.insert("/".to_string());
@@ -340,8 +366,8 @@ pub async fn probe_backend(
 pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
     b.is_online = probe.is_online;
     b.api_type = probe.api_type;
-    b.available_models = probe.available_models;
-    b.loaded_models = probe.loaded_models;
+    b.available_models = Arc::new(probe.available_models);
+    b.loaded_models = Arc::new(probe.loaded_models);
     // Loaded state is only KNOWN when the latest probe actually got data from
     // a loaded-models endpoint; otherwise "available" implies "ready".
     b.loaded_state_known = probe
@@ -350,7 +376,7 @@ pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
         .any(|e| e == "/api/ps" || e == "/api/v1/models");
     b.loaded_ctx = probe.loaded_ctx;
     b.lmstudio = probe.lmstudio;
-    b.native_models = probe.native_models;
+    b.native_models = Arc::new(probe.native_models);
     for e in &probe.good_endpoints {
         b.known_bad_endpoints.remove(e);
     }
@@ -377,8 +403,14 @@ enum NativeProbeOutcome {
 async fn probe_lmstudio_native(
     client: &reqwest::Client,
     url: &str,
+    timeout: Duration,
 ) -> NativeProbeOutcome {
-    let res = match client.get(format!("{}/api/v1/models", url)).send().await {
+    let res = match client
+        .get(format!("{}/api/v1/models", url))
+        .timeout(timeout)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return NativeProbeOutcome::Unknown,
     };
@@ -551,19 +583,51 @@ fn supports_control(b: &BackendStatus) -> bool {
 /// backend URLs (exact or substring match against configured backends), or
 /// every backend when the list is empty ("any suitable").
 fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usize> {
-    let backends = state.backends.lock().unwrap();
+    let backends = state.backends.lock_or_recover();
     if cfg.backends.is_empty() {
-        (0..backends.len()).collect()
-    } else {
-        cfg.backends
-            .iter()
-            .filter_map(|u| {
-                let u_low = u.trim_end_matches('/').to_lowercase();
-                backends
-                    .iter()
-                    .position(|b| b.url.to_lowercase().contains(&u_low))
-            })
-            .collect()
+        return (0..backends.len()).collect();
+    }
+    // Every backend matching a selector is a target, not just the first: an
+    // entry like `- :11434` is meant to cover all the Ollama backends. Results
+    // are deduped and keep configuration order, so overlapping selectors don't
+    // queue the same model twice on one backend.
+    let mut targets: Vec<usize> = Vec::new();
+    for u in &cfg.backends {
+        let u_low = u.trim_end_matches('/').to_lowercase();
+        if u_low.is_empty() {
+            continue; // an empty selector would match every backend
+        }
+        for (i, b) in backends.iter().enumerate() {
+            if b.url.to_lowercase().contains(&u_low) && !targets.contains(&i) {
+                targets.push(i);
+            }
+        }
+    }
+    targets
+}
+
+/// Wait until backend `idx` can accept a control op: no control op already in
+/// flight, and no requests being served. Returns false when `deadline` passes
+/// first (the caller then attempts anyway and reports the usual rejection).
+///
+/// Locks are taken one at a time, so this never nests `backends` inside
+/// `control_ops`.
+async fn wait_until_idle(state: &Arc<AppState>, idx: usize, deadline: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        let control_busy = state.control_ops.lock_or_recover().contains_key(&idx);
+        let serving = state
+            .backends
+            .lock_or_recover()
+            .get(idx)
+            .is_some_and(|b| b.active_requests > 0);
+        if !control_busy && !serving {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -577,7 +641,7 @@ fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usi
 /// rejects parallel control ops); different backends proceed in parallel.
 /// Returns the number of entries applied.
 pub fn apply_model_config(state: &Arc<AppState>) -> usize {
-    let configs = state.model_config.lock().unwrap().clone();
+    let configs = state.model_config.lock_or_recover().clone();
     if configs.is_empty() {
         return 0;
     }
@@ -597,9 +661,15 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
         started += cfgs.len();
         tokio::spawn(async move {
             for cfg in cfgs {
-                // Wait for any earlier control op on this backend to finish.
-                while st.control_ops.lock().unwrap().contains_key(&backend_idx) {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                // Wait for an earlier control op to finish AND for in-flight
+                // requests to drain — a load is refused while either is true.
+                if !wait_until_idle(&st, backend_idx, CONFIG_APPLY_IDLE_WAIT).await {
+                    warn!(
+                        "load '{}': backend {} still busy after {}s; attempting anyway",
+                        cfg.name,
+                        backend_idx,
+                        CONFIG_APPLY_IDLE_WAIT.as_secs()
+                    );
                 }
 
                 // Check the endpoint live (the health loop only ticks every 10 s,
@@ -609,21 +679,21 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                 // it twice.
                 let url = st
                     .backends
-                    .lock()
-                    .unwrap()
+                    .lock_or_recover()
                     .get(backend_idx)
                     .map(|b| b.url.clone())
                     .unwrap_or_default();
                 if !url.is_empty() {
-                    let probe = probe_backend(&st.client, &url, &HashSet::new()).await;
-                    let mut backends = st.backends.lock().unwrap();
+                    let probe =
+                        probe_backend(&st.client, &url, &HashSet::new(), PROBE_TIMEOUT).await;
+                    let mut backends = st.backends.lock_or_recover();
                     if let Some(b) = backends.get_mut(backend_idx) {
                         apply_probe(b, probe);
                     }
                 }
 
                 let (resident, lmstudio, native_models, control_timeout) = {
-                    let backends = st.backends.lock().unwrap();
+                    let backends = st.backends.lock_or_recover();
                     let b = backends.get(backend_idx);
                     let resident = b.is_some_and(|b| b.is_online && is_already_loaded(b, &cfg.name));
                     (
@@ -640,12 +710,10 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                 // (which sends no context) may have the wrong context window;
                 // in that case unload and reload with the configured value
                 // instead of skipping.
-                if resident && cfg.max_ctx.is_some() {
-                    let want = cfg.max_ctx.unwrap();
+                if let Some(want) = cfg.max_ctx.filter(|_| resident) {
                     let actual = st
                         .backends
-                        .lock()
-                        .unwrap()
+                        .lock_or_recover()
                         .get(backend_idx)
                         .and_then(|b| resident_ctx(b, &cfg.name));
                     match actual {
@@ -668,7 +736,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                 content: None,
                             });
                             let canonical = {
-                                let backends = st.backends.lock().unwrap();
+                                let backends = st.backends.lock_or_recover();
                                 backends
                                     .get(backend_idx)
                                     .and_then(|b| resolve_model_name(b, &cfg.name))
@@ -689,8 +757,9 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                 // Give the backend a moment to release the model.
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 let probe =
-                                    probe_backend(&st.client, &url, &HashSet::new()).await;
-                                let mut backends = st.backends.lock().unwrap();
+                                    probe_backend(&st.client, &url, &HashSet::new(), PROBE_TIMEOUT)
+                                        .await;
+                                let mut backends = st.backends.lock_or_recover();
                                 if let Some(b) = backends.get_mut(backend_idx) {
                                     apply_probe(b, probe);
                                 }
@@ -705,8 +774,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
 
                 let skip = st
                     .backends
-                    .lock()
-                    .unwrap()
+                    .lock_or_recover()
                     .get(backend_idx)
                     .filter(|b| b.is_online)
                     .is_some_and(|b| is_already_loaded(b, &cfg.name));
@@ -763,8 +831,8 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
 pub fn reload_model_config(state: &Arc<AppState>) -> Result<usize, String> {
     let configs = crate::config::load_config(&state.model_config_path)?.models;
     let n = configs.len();
-    *state.model_limits.lock().unwrap() = crate::dispatcher::build_model_limits(&configs);
-    *state.model_config.lock().unwrap() = configs;
+    *state.model_limits.lock_or_recover() = crate::dispatcher::build_model_limits(&configs);
+    *state.model_config.lock_or_recover() = configs;
     apply_model_config(state);
     Ok(n)
 }
@@ -981,11 +1049,11 @@ pub fn start_model_control(
     options: LoadOptions,
 ) -> Result<String, String> {
     let canonical = {
-        let ops = state.control_ops.lock().unwrap();
+        let ops = state.control_ops.lock_or_recover();
         if ops.contains_key(&backend_idx) {
             return Err("a model control operation is already in progress on this backend".into());
         }
-        let backends = state.backends.lock().unwrap();
+        let backends = state.backends.lock_or_recover();
         let b = backends
             .get(backend_idx)
             .ok_or_else(|| format!("unknown backend index {}", backend_idx))?;
@@ -1030,8 +1098,7 @@ pub fn start_model_control(
 
     let url = state
         .backends
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .get(backend_idx)
         .map(|b| b.url.clone())
         .unwrap_or_default();
@@ -1048,7 +1115,7 @@ pub fn start_model_control(
             .unwrap_or_default()
     );
 
-    state.control_ops.lock().unwrap().insert(
+    state.control_ops.lock_or_recover().insert(
         backend_idx,
         ControlOp {
             backend_idx,
@@ -1071,7 +1138,7 @@ pub fn start_model_control(
     tokio::spawn(async move {
         let canonical = op_model;
         let (backend_url, lmstudio, timeout, keep_alive, cached_native) = {
-            let backends = state.backends.lock().unwrap();
+            let backends = state.backends.lock_or_recover();
             let b = &backends[backend_idx];
             (
                 b.url.clone(),
@@ -1127,9 +1194,9 @@ pub fn start_model_control(
         // backend's model state immediately (instead of waiting for the 10s
         // health tick).
         {
-            let mut ops = state.control_ops.lock().unwrap();
+            let mut ops = state.control_ops.lock_or_recover();
             ops.remove(&backend_idx);
-            let mut hist = state.control_history.lock().unwrap();
+            let mut hist = state.control_history.lock_or_recover();
             hist.push_back(ControlResult {
                 backend_idx,
                 action,
@@ -1144,9 +1211,10 @@ pub fn start_model_control(
             }
         }
 
-        let probe = probe_backend(&state.client, &backend_url, &HashSet::new()).await;
+        let probe =
+            probe_backend(&state.client, &backend_url, &HashSet::new(), PROBE_TIMEOUT).await;
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             if let Some(b) = backends.get_mut(backend_idx) {
                 apply_probe(b, probe);
                 if result.is_ok() && action == ControlAction::Load {
@@ -1192,7 +1260,7 @@ fn parse_backend_selector(
     action: ControlAction,
     model: &str,
 ) -> Result<usize, AdminError> {
-    let backends = state.backends.lock().unwrap();
+    let backends = state.backends.lock_or_recover();
     let n = backends.len();
 
     let idx = if let Some(i) = sel.as_u64() {
@@ -1270,8 +1338,7 @@ async fn handle_control(
 
     let url = state
         .backends
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .get(idx)
         .map(|b| b.url.clone())
         .unwrap_or_default();
@@ -1328,8 +1395,8 @@ pub async fn admin_model_unload(
 
 /// `GET /admin/models` — per-backend model inventory + in-flight operations.
 pub async fn admin_models_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let ops = state.control_ops.lock().unwrap();
-    let backends = state.backends.lock().unwrap();
+    let ops = state.control_ops.lock_or_recover();
+    let backends = state.backends.lock_or_recover();
     let arr: Vec<Value> = backends
         .iter()
         .enumerate()
@@ -1380,14 +1447,14 @@ mod tests {
             processed_count: 0,
             is_online: true,
             api_type,
-            available_models: available.iter().map(|s| s.to_string()).collect(),
-            loaded_models: loaded.iter().map(|s| s.to_string()).collect(),
+            available_models: Arc::new(available.iter().map(|s| s.to_string()).collect()),
+            loaded_models: Arc::new(loaded.iter().map(|s| s.to_string()).collect()),
             loaded_state_known: false,
             loaded_ctx: HashMap::new(),
             current_model: None,
             active_by_model: HashMap::new(),
             lmstudio,
-            native_models: Vec::new(),
+            native_models: Arc::default(),
             known_bad_endpoints: HashSet::new(),
             rejected_families: HashSet::new(),
             family_fail_counts: HashMap::new(),
@@ -1448,11 +1515,11 @@ mod tests {
     #[test]
     fn resolve_lmstudio_display_name() {
         let mut b = test_backend(BackendApiType::OpenAi, true, &["mock/qwen2-7b"], &[]);
-        b.native_models.push(LmModelInfo {
+        b.native_models = Arc::new(vec![LmModelInfo {
             key: "mock/qwen2-7b".into(),
             display_name: Some("Mock Qwen2 7B".into()),
             loaded_instance_ids: Vec::new(),
-        });
+        }]);
         assert_eq!(
             resolve_model_name(&b, "Mock Qwen2 7B").as_deref(),
             Some("mock/qwen2-7b")
@@ -1460,6 +1527,42 @@ mod tests {
         assert_eq!(
             resolve_model_name(&b, "qwen2").as_deref(),
             Some("mock/qwen2-7b")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gives_up_on_a_black_holed_backend() {
+        // Reachable but never answers — the case that used to hold the health
+        // loop for the whole inference timeout, once per endpoint.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind black-holed backend");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let acceptor = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // hold it open, answer nothing
+            }
+        });
+
+        // A client carrying the shared inference timeout: the probe must use
+        // its own budget rather than inheriting this one.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .expect("build client");
+
+        let started = std::time::Instant::now();
+        let probe =
+            probe_backend(&client, &url, &HashSet::new(), Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+        acceptor.abort();
+
+        assert!(!probe.is_online, "a backend that never answers is not online");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "probe took {:?} — it inherited the client timeout",
+            elapsed
         );
     }
 
@@ -1493,12 +1596,11 @@ mod tests {
             let c = c.clone();
             let resident = resident_gen.clone();
             async move {
-                c.lock()
-                    .unwrap()
+                c.lock_or_recover()
                     .push(("/api/generate".into(), body.clone()));
                 if body.get("keep_alive").and_then(|k| k.as_i64()) == Some(0) {
                     if let Some(name) = body.get("model").and_then(|m| m.as_str()) {
-                        resident.lock().unwrap().remove(name);
+                        resident.lock_or_recover().remove(name);
                     }
                     Json(json!({"model": body["model"], "done": true, "done_reason": "unload"}))
                 } else {
@@ -1508,7 +1610,7 @@ mod tests {
                             .and_then(|o| o.get("num_ctx"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(2048);
-                        resident.lock().unwrap().insert(name.to_string(), ctx);
+                        resident.lock_or_recover().insert(name.to_string(), ctx);
                     }
                     Json(json!({"model": body["model"], "done": true}))
                 }
@@ -1519,8 +1621,7 @@ mod tests {
         let ls_load = move |Json(body): Json<Value>| {
             let c = c.clone();
             async move {
-                c.lock()
-                    .unwrap()
+                c.lock_or_recover()
                     .push(("/api/v1/models/load".into(), body.clone()));
                 Json(
                     json!({"type": "llm", "instance_id": body["model"], "status": "loaded", "load_time_seconds": 0.1}),
@@ -1534,11 +1635,10 @@ mod tests {
             let c = c.clone();
             let resident = resident_ls_unload.clone();
             async move {
-                c.lock()
-                    .unwrap()
+                c.lock_or_recover()
                     .push(("/api/v1/models/unload".into(), body.clone()));
                 if let Some(id) = body.get("instance_id").and_then(|v| v.as_str()) {
-                    resident.lock().unwrap().remove(id);
+                    resident.lock_or_recover().remove(id);
                 }
                 Json(json!({"instance_id": body["instance_id"]}))
             }
@@ -1556,7 +1656,7 @@ mod tests {
             .route(
                 "/api/ps",
                 get(move || async move {
-                    let resident = resident_ps.lock().unwrap();
+                    let resident = resident_ps.lock_or_recover();
                     let models: Vec<Value> = resident
                         .iter()
                         .map(|(name, ctx)| json!({"name": name, "context_length": ctx}))
@@ -1568,7 +1668,7 @@ mod tests {
             .route(
                 "/api/v1/models",
                 get(move || async move {
-                    let resident = resident_native.lock().unwrap();
+                    let resident = resident_native.lock_or_recover();
                     let mut models = vec![json!({
                         "key": "mock/qwen2-7b",
                         "id": "mock/qwen2-7b",
@@ -1604,7 +1704,7 @@ mod tests {
     async fn probe_detects_ollama_and_lmstudio() {
         let (url, _calls) = start_mock_backend().await;
         let client = reqwest::Client::new();
-        let probe = probe_backend(&client, &url, &HashSet::new()).await;
+        let probe = probe_backend(&client, &url, &HashSet::new(), PROBE_TIMEOUT).await;
 
         assert!(probe.is_online);
         // This mock speaks both Ollama and LM Studio -> Both + lmstudio flag
@@ -1661,7 +1761,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         // Full probe: both rejection styles are remembered as bad.
-        let probe = probe_backend(&client, &url, &HashSet::new()).await;
+        let probe = probe_backend(&client, &url, &HashSet::new(), PROBE_TIMEOUT).await;
         assert!(probe.is_online);
         assert!(probe.good_endpoints.contains("/api/tags"));
         assert!(probe.bad_endpoints.contains("/api/ps"), "200+error body must be bad");
@@ -1670,7 +1770,7 @@ mod tests {
         // Second probe skipping the bad endpoints: they are not hit again,
         // while good endpoints stay fresh.
         let skip = probe.bad_endpoints.clone();
-        let probe2 = probe_backend(&client, &url, &skip).await;
+        let probe2 = probe_backend(&client, &url, &skip, PROBE_TIMEOUT).await;
         assert_eq!(extra_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(probe2.good_endpoints.contains("/api/tags"));
     }
@@ -1738,7 +1838,7 @@ mod tests {
             .await
             .unwrap();
 
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock_or_recover();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "/api/generate");
         assert_eq!(calls[0].1["model"], "llama3:latest");
@@ -1763,7 +1863,7 @@ mod tests {
             .await
             .unwrap();
 
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock_or_recover();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1["keep_alive"], 3600); // override beats default
         assert_eq!(calls[0].1["options"]["num_ctx"], 16384);
@@ -1784,7 +1884,7 @@ mod tests {
             .await
             .unwrap();
 
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock_or_recover();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "/api/v1/models/load");
         assert_eq!(calls[0].1["model"], "mock/qwen2-7b");
@@ -1805,7 +1905,7 @@ mod tests {
             .unwrap();
 
         {
-            let calls = calls.lock().unwrap();
+            let calls = calls.lock_or_recover();
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0].0, "/api/v1/models/load");
             assert_eq!(calls[0].1["model"], "mock/qwen2-7b");
@@ -1824,7 +1924,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let calls = calls.lock().unwrap();
+            let calls = calls.lock_or_recover();
             assert_eq!(calls.len(), 3);
             assert_eq!(calls[2].0, "/api/v1/models/unload");
             assert_eq!(calls[2].1["instance_id"], "cached-instance");
@@ -1870,18 +1970,17 @@ mod tests {
             Vec::new(),
             crate::reqlog::RequestLogger::disabled(),
             65_536,
+            512 * 1024 * 1024,
         ));
         // Simulate a probed backend: model available AND resident.
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = true;
             backends[0].api_type = BackendApiType::Ollama;
-            backends[0]
-                .available_models
-                .insert("qwen2.5:7b".into());
-            backends[0].loaded_models.insert("qwen2.5:7b".into());
+            backends[0].available_models = Arc::new(["qwen2.5:7b".to_string()].into());
+            backends[0].loaded_models = Arc::new(["qwen2.5:7b".to_string()].into());
         }
-        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+        state.model_config.lock_or_recover().push(crate::config::ModelConfig {
             name: "qwen2.5:7b".into(),
             identifier: None,
             max_ctx: None,
@@ -1895,7 +1994,7 @@ mod tests {
         // Wait for the skip event to land in the log ring.
         let mut info = String::new();
         for _ in 0..200 {
-            if let Some(ev) = state.logs.lock().unwrap().iter().find(|e| e.dir == "CTL") {
+            if let Some(ev) = state.logs.lock_or_recover().iter().find(|e| e.dir == "CTL") {
                 info = ev.info.clone();
                 break;
             }
@@ -1904,7 +2003,7 @@ mod tests {
         assert!(info.contains("skipped"), "expected a skip event, got: {}", info);
 
         // No load request may have hit the backend.
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock_or_recover();
         assert!(calls.is_empty(), "no control call expected, got {:?}", calls);
     }
 
@@ -1921,20 +2020,19 @@ mod tests {
             Vec::new(),
             crate::reqlog::RequestLogger::disabled(),
             65_536,
+            512 * 1024 * 1024,
         ));
         // Simulate a probed backend: model resident with context 2048 (the
         // mock's /api/ps reports context_length), config wants 16384.
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = true;
             backends[0].api_type = BackendApiType::Ollama;
-            backends[0]
-                .available_models
-                .insert("qwen2.5:7b".into());
-            backends[0].loaded_models.insert("qwen2.5:7b".into());
+            backends[0].available_models = Arc::new(["qwen2.5:7b".to_string()].into());
+            backends[0].loaded_models = Arc::new(["qwen2.5:7b".to_string()].into());
             backends[0].loaded_ctx.insert("qwen2.5:7b".into(), 2048);
         }
-        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+        state.model_config.lock_or_recover().push(crate::config::ModelConfig {
             name: "qwen2.5:7b".into(),
             identifier: None,
             max_ctx: Some(16384),
@@ -1948,7 +2046,7 @@ mod tests {
         // Wait for the load op to finish and be recorded in history.
         let mut ok = false;
         for _ in 0..200 {
-            if state.control_history.lock().unwrap().back().is_some_and(|r| r.ok) {
+            if state.control_history.lock_or_recover().back().is_some_and(|r| r.ok) {
                 ok = true;
                 break;
             }
@@ -1959,7 +2057,7 @@ mod tests {
         // Unload + reload with the configured context_length must have been
         // sent (the mock speaks LM Studio native, so the control path is
         // /api/v1/models/unload + /api/v1/models/load).
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock_or_recover();
         assert!(
             calls.iter().any(|(ep, b)| ep == "/api/v1/models/unload"
                 && b["instance_id"] == "qwen2.5:7b"),
@@ -1976,6 +2074,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_targets_match_every_selected_backend() {
+        let state = AppState::new(
+            vec![
+                "http://10.0.0.1:11434".into(),
+                "http://10.0.0.2:11434".into(),
+                "http://10.0.0.3:1234".into(),
+            ],
+            30,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        );
+        let cfg = |backends: Vec<String>| crate::config::ModelConfig {
+            name: "llama3".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends,
+        };
+
+        // A port selector covers BOTH Ollama backends — only the first one
+        // used to be targeted, so the model silently loaded on one of them.
+        assert_eq!(config_targets(&state, &cfg(vec![":11434".into()])), vec![0, 1]);
+        // An exact URL still resolves to exactly its backend.
+        assert_eq!(
+            config_targets(&state, &cfg(vec!["http://10.0.0.2:11434".into()])),
+            vec![1]
+        );
+        // Overlapping selectors are deduped, keeping configuration order.
+        assert_eq!(
+            config_targets(&state, &cfg(vec!["10.0.0.3".into(), ":1234".into()])),
+            vec![2]
+        );
+        // No list at all = every backend.
+        assert_eq!(config_targets(&state, &cfg(vec![])), vec![0, 1, 2]);
+        // An unmatched selector targets nothing...
+        assert!(config_targets(&state, &cfg(vec!["10.9.9.9".into()])).is_empty());
+        // ...and an empty selector must not silently match everything.
+        assert!(config_targets(&state, &cfg(vec!["".into()])).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_model_config_waits_for_a_busy_backend() {
+        let (url, calls) = start_mock_backend().await;
+        let state = Arc::new(AppState::new(
+            vec![url.clone()],
+            30,
+            86400,
+            60,
+            1, // max concurrent per backend
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        ));
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::Ollama;
+            backends[0].available_models = Arc::new(["llama3:latest".to_string()].into());
+            // A generation is in flight — a load is refused outright while it runs.
+            backends[0].active_requests = 1;
+        }
+        state.model_config.lock_or_recover().push(crate::config::ModelConfig {
+            name: "llama3".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends: Vec::new(),
+        });
+
+        apply_model_config(&state);
+
+        // While the backend serves that request the entry waits: it is neither
+        // loaded nor recorded as a failed op (it used to be rejected here and
+        // never retried).
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            calls.lock_or_recover().is_empty(),
+            "no load may be issued while the backend is serving"
+        );
+        assert!(
+            state.control_history.lock_or_recover().is_empty(),
+            "the entry must be waiting, not abandoned"
+        );
+
+        // The request finishes; the load then proceeds on its own.
+        state.backends.lock_or_recover()[0].active_requests = 0;
+
+        let mut ok = false;
+        for _ in 0..200 {
+            if state.control_history.lock_or_recover().back().is_some_and(|r| r.ok) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ok, "load should run once the backend goes idle");
+        let calls = calls.lock_or_recover();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["model"], "llama3:latest");
+    }
+
+    #[tokio::test]
     async fn apply_model_config_loads_missing_models() {
         let (url, calls) = start_mock_backend().await;
         let state = Arc::new(AppState::new(
@@ -1988,17 +2198,16 @@ mod tests {
             Vec::new(),
             crate::reqlog::RequestLogger::disabled(),
             65_536,
+            512 * 1024 * 1024,
         ));
         // llama3 is available but NOT resident (mock /api/ps lists only qwen2.5:7b).
         {
-            let mut backends = state.backends.lock().unwrap();
+            let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = true;
             backends[0].api_type = BackendApiType::Ollama;
-            backends[0]
-                .available_models
-                .insert("llama3:latest".into());
+            backends[0].available_models = Arc::new(["llama3:latest".to_string()].into());
         }
-        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
+        state.model_config.lock_or_recover().push(crate::config::ModelConfig {
             name: "llama3".into(),
             identifier: None,
             max_ctx: None,
@@ -2012,7 +2221,7 @@ mod tests {
         // Wait for the load op to finish and be recorded in history.
         let mut ok = false;
         for _ in 0..200 {
-            if state.control_history.lock().unwrap().back().is_some_and(|r| r.ok) {
+            if state.control_history.lock_or_recover().back().is_some_and(|r| r.ok) {
                 ok = true;
                 break;
             }
@@ -2020,7 +2229,7 @@ mod tests {
         }
         assert!(ok, "load should succeed");
 
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock_or_recover();
         assert_eq!(calls.len(), 1);
         // The mock speaks both Ollama and LM Studio, so the load may go out on
         // either path — what matters is exactly one load for the canonical name.

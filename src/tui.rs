@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use crate::control::{self, ControlAction, LoadOptions, RESULT_VISIBLE};
 use crate::dispatcher::{AppState, BackendApiType, BackendStatus, LogEvent};
+use crate::lock::LockExt;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Panel {
@@ -62,6 +63,9 @@ enum InputMode {
 }
 
 /// Transient feedback line (shown after a control op is started/rejected).
+/// How long a flash message stays on screen.
+const FLASH_VISIBLE: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct FlashMsg {
     text: String,
     ok: bool,
@@ -79,6 +83,7 @@ struct LogDetail {
 /// Lines scrolled per PageUp/PageDown in the log detail view.
 const DETAIL_PAGE: usize = 10;
 
+#[derive(PartialEq, Eq)]
 struct ActiveOpView {
     backend_idx: usize,
     verb: String,
@@ -87,6 +92,7 @@ struct ActiveOpView {
     elapsed_secs: u64,
 }
 
+#[derive(PartialEq, Eq)]
 struct RecentResultView {
     backend_idx: usize,
     ok: bool,
@@ -96,19 +102,39 @@ struct RecentResultView {
     error: Option<String>,
 }
 
+/// One row of the users table.
+///
+/// The snapshot used to carry five whole `HashMap<String, _>` clones of the
+/// per-user bookkeeping and a sixth `Vec` of the ids — six allocations per
+/// tracked user, rebuilt ten times a second. Everything the dashboard shows
+/// about a user now lives in one row, built in a single pass.
+#[derive(PartialEq, Eq)]
+struct UserRow {
+    id: String,
+    queued: usize,
+    processing: usize,
+    processed: usize,
+    dropped: usize,
+    ip: Option<IpAddr>,
+}
+
+impl UserRow {
+    /// Requests of this user's that are queued or in flight.
+    fn outstanding(&self) -> usize {
+        self.queued + self.processing
+    }
+}
+
+#[derive(PartialEq, Eq)]
 struct StateSnapshot {
-    queues_len: HashMap<String, usize>,
-    processing_counts: HashMap<String, usize>,
-    processed_counts: HashMap<String, usize>,
-    dropped_counts: HashMap<String, usize>,
+    /// Users in display order.
+    users: Vec<UserRow>,
     /// Request-log records dropped because the log channel was full.
     reqlog_dropped: u64,
-    user_ips: HashMap<String, IpAddr>,
     blocked_ips: HashSet<IpAddr>,
     blocked_users: HashSet<String>,
     vip_user: Option<String>,
     boost_user: Option<String>,
-    user_ids: Vec<String>,
     backends: Vec<BackendStatus>,
     /// Recent request/control events (newest first) for the Logs panel.
     logs: Vec<LogEvent>,
@@ -154,24 +180,33 @@ impl TuiDashboard {
     }
 
     fn capture_snapshot(&self, state: &Arc<AppState>) -> StateSnapshot {
-        let queues_len: HashMap<String, usize> = {
-            let q = state.queues.lock().unwrap();
-            q.iter().map(|(k, v)| (k.clone(), v.len())).collect()
+        let mut users: Vec<UserRow> = {
+            let queues = state.queues.lock_or_recover();
+            let processing = state.processing_counts.lock_or_recover();
+            let processed = state.processed_counts.lock_or_recover();
+            let dropped = state.dropped_counts.lock_or_recover();
+            let ips = state.user_ips.lock_or_recover();
+            queues
+                .iter()
+                .map(|(id, q)| UserRow {
+                    queued: q.len(),
+                    processing: processing.get(id).copied().unwrap_or(0),
+                    processed: processed.get(id).copied().unwrap_or(0),
+                    dropped: dropped.get(id).copied().unwrap_or(0),
+                    ip: ips.get(id).copied(),
+                    id: id.clone(),
+                })
+                .collect()
         };
-        let processing_counts = state.processing_counts.lock().unwrap().clone();
-        let processed_counts = state.processed_counts.lock().unwrap().clone();
-        let dropped_counts = state.dropped_counts.lock().unwrap().clone();
         let reqlog_dropped = state.reqlog.dropped_count();
-        let user_ips = state.user_ips.lock().unwrap().clone();
-        let blocked_ips = state.blocked_ips.lock().unwrap().clone();
-        let blocked_users = state.blocked_users.lock().unwrap().clone();
-        let vip_user = state.vip_user.lock().unwrap().clone();
-        let boost_user = state.boost_user.lock().unwrap().clone();
-        let backends = state.backends.lock().unwrap().clone();
+        let blocked_ips = state.blocked_ips.lock_or_recover().clone();
+        let blocked_users = state.blocked_users.lock_or_recover().clone();
+        let vip_user = state.vip_user.lock_or_recover().clone();
+        let boost_user = state.boost_user.lock_or_recover().clone();
+        let backends = state.backends.lock_or_recover().clone();
         let logs: Vec<LogEvent> = state
             .logs
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .iter()
             .rev()
             .take(50)
@@ -179,8 +214,7 @@ impl TuiDashboard {
             .collect();
         let active_ops: Vec<ActiveOpView> = state
             .control_ops
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .values()
             .map(|op| ActiveOpView {
                 backend_idx: op.backend_idx,
@@ -192,8 +226,7 @@ impl TuiDashboard {
             .collect();
         let recent_results: Vec<RecentResultView> = state
             .control_history
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .iter()
             .filter(|r| r.finished_at.elapsed() < RESULT_VISIBLE)
             .map(|r| RecentResultView {
@@ -206,32 +239,21 @@ impl TuiDashboard {
             })
             .collect();
 
-        let mut user_ids: Vec<String> = queues_len.keys().cloned().collect();
-        user_ids.sort_by(|a, b| {
-            let a_q = queues_len.get(a).unwrap_or(&0) + processing_counts.get(a).unwrap_or(&0);
-            let b_q = queues_len.get(b).unwrap_or(&0) + processing_counts.get(b).unwrap_or(&0);
-            let a_total =
-                processed_counts.get(a).unwrap_or(&0) + dropped_counts.get(a).unwrap_or(&0);
-            let b_total =
-                processed_counts.get(b).unwrap_or(&0) + dropped_counts.get(b).unwrap_or(&0);
-
-            b_q.cmp(&a_q)
-                .then_with(|| b_total.cmp(&a_total))
-                .then_with(|| a.cmp(b))
+        // Busiest first, then most-served, then by id for a stable order.
+        users.sort_by(|a, b| {
+            b.outstanding()
+                .cmp(&a.outstanding())
+                .then_with(|| (b.processed + b.dropped).cmp(&(a.processed + a.dropped)))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         StateSnapshot {
-            queues_len,
-            processing_counts,
-            processed_counts,
-            dropped_counts,
+            users,
             reqlog_dropped,
-            user_ips,
             blocked_ips,
             blocked_users,
             vip_user,
             boost_user,
-            user_ids,
             backends,
             logs,
             active_ops,
@@ -245,12 +267,42 @@ impl TuiDashboard {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
 
+        // Nothing is redrawn unless something a viewer could see has
+        // changed: at 10 frames a second the dashboard was rebuilding and
+        // re-rendering every widget on a proxy that was sitting idle.
+        let mut last_snapshot: Option<StateSnapshot> = None;
+        let mut last_flash_visible = false;
+        let mut force_redraw = true;
+
         loop {
-            let snapshot = self.capture_snapshot(state);
-            terminal.draw(|f| self.render(f, &snapshot))?;
+            let fresh = self.capture_snapshot(state);
+            // The flash message hides itself after a timeout with no event to
+            // announce it, so its visibility is part of "has anything changed".
+            let flash_visible = self
+                .flash
+                .as_ref()
+                .is_some_and(|f| f.at.elapsed() < FLASH_VISIBLE);
+
+            if force_redraw
+                || flash_visible != last_flash_visible
+                || last_snapshot.as_ref() != Some(&fresh)
+            {
+                terminal.draw(|f| self.render(f, &fresh))?;
+                force_redraw = false;
+            }
+            last_flash_visible = flash_visible;
+            last_snapshot = Some(fresh);
+            // Borrow it back under the old name so the event handling below is
+            // unchanged; `self` is a separate binding, so this does not clash
+            // with the mutations there.
+            let snapshot = last_snapshot.as_ref().expect("just stored");
 
             if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
+                let event = event::read()?;
+                // Any input — and a resize, which is not matched below —
+                // can change what should be on screen.
+                force_redraw = true;
+                if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -343,7 +395,7 @@ impl TuiDashboard {
                             // expanded, Tab cycles its model list instead of
                             // the panels.
                             if self.active_panel == Panel::Backends
-                                && self.cycle_model_cursor(&snapshot, forward)
+                                && self.cycle_model_cursor(snapshot, forward)
                             {
                                 // model cursor moved
                             } else if forward {
@@ -359,16 +411,15 @@ impl TuiDashboard {
                             self.active_panel = self.active_panel.prev();
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
-                            if self.active_panel == Panel::Backends {
-                                if let Some(i) = self.backend_table_state.selected() {
-                                    if i < snapshot.backends.len() {
-                                        let url = snapshot.backends[i].url.clone();
-                                        if self.expanded_backends.contains(&url) {
-                                            self.expanded_backends.remove(&url);
-                                        } else {
-                                            self.expanded_backends.insert(url);
-                                        }
-                                    }
+                            if self.active_panel == Panel::Backends
+                                && let Some(i) = self.backend_table_state.selected()
+                                && i < snapshot.backends.len()
+                            {
+                                let url = snapshot.backends[i].url.clone();
+                                if self.expanded_backends.contains(&url) {
+                                    self.expanded_backends.remove(&url);
+                                } else {
+                                    self.expanded_backends.insert(url);
                                 }
                             } else if self.active_panel == Panel::Logs
                                 && key.code == KeyCode::Enter
@@ -483,79 +534,73 @@ impl TuiDashboard {
                             }
                         }
                         KeyCode::Char('p') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.user_ids.len() {
-                                        let user_id = snapshot.user_ids[i].clone();
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user_id = snapshot.users[i].id.clone();
 
-                                        // 1. Handle VIP
-                                        {
-                                            let mut vip = state.vip_user.lock().unwrap();
-                                            if vip.as_ref() == Some(&user_id) {
-                                                *vip = None;
-                                            } else {
-                                                *vip = Some(user_id.clone());
-                                            }
-                                        }
+                                // 1. Handle VIP
+                                {
+                                    let mut vip = state.vip_user.lock_or_recover();
+                                    if vip.as_ref() == Some(&user_id) {
+                                        *vip = None;
+                                    } else {
+                                        *vip = Some(user_id.clone());
+                                    }
+                                }
 
-                                        // 2. Clear Boost if we just set VIP
-                                        {
-                                            let mut boost = state.boost_user.lock().unwrap();
-                                            if boost.as_ref() == Some(&user_id) {
-                                                *boost = None;
-                                            }
-                                        }
+                                // 2. Clear Boost if we just set VIP
+                                {
+                                    let mut boost = state.boost_user.lock_or_recover();
+                                    if boost.as_ref() == Some(&user_id) {
+                                        *boost = None;
                                     }
                                 }
                             }
                         }
                         KeyCode::Char('b') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.user_ids.len() {
-                                        let user_id = snapshot.user_ids[i].clone();
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user_id = snapshot.users[i].id.clone();
 
-                                        // 1. Handle Boost
-                                        {
-                                            let mut boost = state.boost_user.lock().unwrap();
-                                            if boost.as_ref() == Some(&user_id) {
-                                                *boost = None;
-                                            } else {
-                                                *boost = Some(user_id.clone());
-                                            }
-                                        }
+                                // 1. Handle Boost
+                                {
+                                    let mut boost = state.boost_user.lock_or_recover();
+                                    if boost.as_ref() == Some(&user_id) {
+                                        *boost = None;
+                                    } else {
+                                        *boost = Some(user_id.clone());
+                                    }
+                                }
 
-                                        // 2. Clear VIP if we just set Boost
-                                        {
-                                            let mut vip = state.vip_user.lock().unwrap();
-                                            if vip.as_ref() == Some(&user_id) {
-                                                *vip = None;
-                                            }
-                                        }
+                                // 2. Clear VIP if we just set Boost
+                                {
+                                    let mut vip = state.vip_user.lock_or_recover();
+                                    if vip.as_ref() == Some(&user_id) {
+                                        *vip = None;
                                     }
                                 }
                             }
                         }
                         KeyCode::Char('x') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.user_ids.len() {
-                                        let user_id = snapshot.user_ids[i].clone();
-                                        state.block_user(user_id);
-                                    }
-                                }
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user_id = snapshot.users[i].id.clone();
+                                state.block_user(user_id);
                             }
                         }
                         KeyCode::Char('X') => {
-                            if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.user_ids.len() {
-                                        let user_id = &snapshot.user_ids[i];
-                                        if let Some(ip) = snapshot.user_ips.get(user_id) {
-                                            state.block_ip(*ip);
-                                        }
-                                    }
-                                }
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                                && let Some(ip) = snapshot.users[i].ip
+                            {
+                                state.block_ip(ip);
                             }
                         }
                         KeyCode::Char('u') => {
@@ -582,15 +627,14 @@ impl TuiDashboard {
                                         }
                                     }
                                 }
-                            } else if self.active_panel == Panel::Users {
-                                if let Some(i) = self.table_state.selected() {
-                                    if i < snapshot.user_ids.len() {
-                                        let user_id = &snapshot.user_ids[i];
-                                        state.unblock_user(user_id);
-                                        if let Some(ip) = snapshot.user_ips.get(user_id) {
-                                            state.unblock_ip(*ip);
-                                        }
-                                    }
+                            } else if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let row = &snapshot.users[i];
+                                state.unblock_user(&row.id);
+                                if let Some(ip) = row.ip {
+                                    state.unblock_ip(ip);
                                 }
                             }
                         }
@@ -633,7 +677,7 @@ impl TuiDashboard {
                                     self.backend_table_state.select(Some(i));
                                 }
                             } else if self.active_panel == Panel::Users {
-                                let len = snapshot.user_ids.len();
+                                let len = snapshot.users.len();
                                 if len > 0 {
                                     let i = self
                                         .table_state
@@ -752,7 +796,7 @@ impl TuiDashboard {
                 }
             }
             Panel::Users => {
-                if snapshot.user_ids.is_empty() {
+                if snapshot.users.is_empty() {
                     self.table_state.select(None);
                 } else if self.table_state.selected().is_none() {
                     self.table_state.select(Some(0));
@@ -877,6 +921,7 @@ impl TuiDashboard {
             .event
             .content
             .as_deref()
+            .map(String::as_str)
             .filter(|c| !c.is_empty())
             .unwrap_or("(no content captured)");
         let mut visual: Vec<String> = Vec::new();
@@ -905,7 +950,7 @@ impl TuiDashboard {
         let header_len = 6;
         let footer_len = 1;
         let visible =
-            inner.height.saturating_sub((header_len + footer_len) as u16) as usize;
+            inner.height.saturating_sub(header_len + footer_len) as usize;
         detail.offset = detail.offset.min(total_visual.saturating_sub(visible));
 
         let header = Paragraph::new(Text::from(vec![
@@ -949,10 +994,10 @@ impl TuiDashboard {
     }
 
     fn render_stats(&self, snapshot: &StateSnapshot) -> Paragraph<'static> {
-        let total_queued: usize = snapshot.queues_len.values().sum();
-        let total_processing: usize = snapshot.processing_counts.values().sum();
-        let total_processed: usize = snapshot.processed_counts.values().sum();
-        let total_dropped: usize = snapshot.dropped_counts.values().sum();
+        let total_queued: usize = snapshot.users.iter().map(|u| u.queued).sum();
+        let total_processing: usize = snapshot.users.iter().map(|u| u.processing).sum();
+        let total_processed: usize = snapshot.users.iter().map(|u| u.processed).sum();
+        let total_dropped: usize = snapshot.users.iter().map(|u| u.dropped).sum();
 
         let stats_line = vec![
             Span::styled(" ollamaMQ ", Style::default().fg(Color::Cyan).bold()),
@@ -1238,23 +1283,14 @@ impl TuiDashboard {
 
     fn render_users(&self, snapshot: &StateSnapshot) -> Table<'static> {
         let rows: Vec<Row> = snapshot
-            .user_ids
+            .users
             .iter()
-            .map(|user| {
-                let queue_len = snapshot.queues_len.get(user).unwrap_or(&0)
-                    + snapshot.processing_counts.get(user).unwrap_or(&0);
-                let processed = snapshot.processed_counts.get(user).unwrap_or(&0);
-                let dropped = snapshot.dropped_counts.get(user).unwrap_or(&0);
-                let ip_str = snapshot
-                    .user_ips
-                    .get(user)
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
+            .map(|row| {
+                let user = &row.id;
+                let queue_len = row.outstanding();
+                let ip_str = row.ip.map(|i| i.to_string()).unwrap_or_default();
                 let is_blocked = snapshot.blocked_users.contains(user)
-                    || snapshot
-                        .user_ips
-                        .get(user)
-                        .map_or(false, |ip| snapshot.blocked_ips.contains(ip));
+                    || row.ip.is_some_and(|ip| snapshot.blocked_ips.contains(&ip));
                 let is_vip = snapshot.vip_user.as_ref() == Some(user);
                 let is_boost = snapshot.boost_user.as_ref() == Some(user);
 
@@ -1264,9 +1300,9 @@ impl TuiDashboard {
                     ("★ ", Style::default().fg(Color::Magenta))
                 } else if is_boost {
                     ("⚡", Style::default().fg(Color::Yellow))
-                } else if *snapshot.processing_counts.get(user).unwrap_or(&0) > 0 {
+                } else if row.processing > 0 {
                     ("▶ ", Style::default().fg(Color::Cyan))
-                } else if *snapshot.queues_len.get(user).unwrap_or(&0) > 0 {
+                } else if row.queued > 0 {
                     ("● ", Style::default().fg(Color::Green))
                 } else {
                     ("○ ", Style::default().fg(Color::DarkGray))
@@ -1312,8 +1348,8 @@ impl TuiDashboard {
                     Cell::from(Line::from(spans)),
                     Cell::from(ip_str).style(Style::default().fg(Color::Cyan)),
                     Cell::from(queue_len.to_string()),
-                    Cell::from(processed.to_string()),
-                    Cell::from(dropped.to_string()),
+                    Cell::from(row.processed.to_string()),
+                    Cell::from(row.dropped.to_string()),
                 ])
             })
             .collect();
@@ -1352,16 +1388,15 @@ impl TuiDashboard {
     }
 
     fn render_queues(&self, snapshot: &StateSnapshot, available_width: u16) -> Table<'static> {
-        let total_queued = snapshot.queues_len.values().sum::<usize>()
-            + snapshot.processing_counts.values().sum::<usize>();
+        let total_queued: usize = snapshot.users.iter().map(|u| u.outstanding()).sum();
         let bar_max_width = ((available_width as f32) * 0.45) as usize;
 
         let rows: Vec<Row> = snapshot
-            .user_ids
+            .users
             .iter()
-            .map(|user| {
-                let q_len = snapshot.queues_len.get(user).unwrap_or(&0)
-                    + snapshot.processing_counts.get(user).unwrap_or(&0);
+            .map(|row| {
+                let user = &row.id;
+                let q_len = row.outstanding();
                 let bar_len = if q_len > 0 {
                     ((q_len as f32 / 20.0).min(1.0) * bar_max_width as f32) as usize
                 } else {
@@ -1371,7 +1406,7 @@ impl TuiDashboard {
                     Color::Magenta
                 } else if snapshot.boost_user.as_ref() == Some(user) {
                     Color::Yellow
-                } else if *snapshot.processing_counts.get(user).unwrap_or(&0) > 0 {
+                } else if row.processing > 0 {
                     Color::Cyan
                 } else {
                     Color::Green
@@ -1492,9 +1527,9 @@ impl TuiDashboard {
                     .as_deref()
                     .map(|u| u.replace("http://", "").replace("https://", ""))
                     .unwrap_or_else(|| "-".into());
-                let info_style = if ev.info.starts_with("dropped") {
-                    Style::default().fg(Color::Red)
-                } else if ev.info.contains("rejected") {
+                let info_style = if ev.info.starts_with("dropped")
+                    || ev.info.contains("rejected")
+                {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default().fg(Color::Gray)
@@ -1585,7 +1620,7 @@ impl TuiDashboard {
         } else if let Some(flash) = self
             .flash
             .as_ref()
-            .filter(|f| f.at.elapsed() < std::time::Duration::from_secs(5))
+            .filter(|f| f.at.elapsed() < FLASH_VISIBLE)
         {
             Line::from(vec![
                 Span::styled(
@@ -1612,5 +1647,107 @@ impl TuiDashboard {
         Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  CYCLE MODELS: 'Tab' / 'Shift+Tab' on an expanded backend (▶ cursor); 'L'/'U' then act on the cursor model directly\n  SHOW ALL MODELS: 'a' (in Backends panel)\n  MODEL CONTROL: 'L' load / 'U' unload (Backends panel)\n  CONFIG: 'r' re-reads appconf.yaml and re-applies it (loads listed models on their backends)\n  LOGS: bottom panel shows requests in (→) / out (←) and control ops (⟳), newest first\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing / cursor | ● Queued | ⟳ Control op in progress")
             .block(Block::default().title(" Help ").borders(Borders::ALL))
             .style(Style::default().fg(Color::Gray))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// Everything the dashboard painted, as plain text.
+    fn painted(dash: &mut TuiDashboard, snapshot: &StateSnapshot) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(140, 45)).expect("in-memory terminal");
+        terminal.draw(|f| dash.render(f, snapshot)).expect("render");
+        let buf = terminal.backend().buffer();
+        let area = *buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn user(
+        id: &str,
+        queued: usize,
+        processing: usize,
+        processed: usize,
+        dropped: usize,
+    ) -> UserRow {
+        UserRow {
+            id: id.to_string(),
+            queued,
+            processing,
+            processed,
+            dropped,
+            ip: Some("10.0.0.7".parse().expect("ip")),
+        }
+    }
+
+    fn snapshot(users: Vec<UserRow>) -> StateSnapshot {
+        StateSnapshot {
+            users,
+            reqlog_dropped: 0,
+            blocked_ips: HashSet::new(),
+            blocked_users: HashSet::new(),
+            vip_user: None,
+            boost_user: None,
+            backends: Vec::new(),
+            logs: Vec::new(),
+            active_ops: Vec::new(),
+            recent_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn users_panel_paints_each_row_from_its_own_counters() {
+        let mut dash = TuiDashboard::new();
+        dash.active_panel = Panel::Users;
+        let snap = snapshot(vec![user("alice", 2, 1, 41, 3), user("bob", 0, 0, 7, 0)]);
+        let screen = painted(&mut dash, &snap);
+
+        assert!(screen.contains("Active Users"), "users panel missing:\n{screen}");
+        assert!(screen.contains("alice"), "alice missing:\n{screen}");
+        assert!(screen.contains("bob"), "bob missing:\n{screen}");
+        assert!(screen.contains("10.0.0.7"), "last IP missing:\n{screen}");
+
+        // alice: Q = queued + processing = 3, Done = 41, Drop = 3.
+        let alice = screen
+            .lines()
+            .find(|l| l.contains("alice"))
+            .expect("alice row");
+        let cells: Vec<&str> = alice.split_whitespace().collect();
+        assert!(
+            cells.windows(3).any(|w| w == ["3", "41", "3"]),
+            "alice's Q/Done/Drop columns wrong: {alice:?}"
+        );
+    }
+
+    #[test]
+    fn header_totals_sum_the_user_rows() {
+        let mut dash = TuiDashboard::new();
+        let snap = snapshot(vec![user("alice", 2, 1, 41, 3), user("bob", 4, 2, 7, 5)]);
+        let screen = painted(&mut dash, &snap);
+        // Queued 2+4, processing 1+2, processed 41+7, dropped 3+5.
+        for expected in ["6", "3", "48", "8"] {
+            assert!(
+                screen.contains(expected),
+                "total {expected} missing from the header:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_dashboard_still_paints() {
+        let mut dash = TuiDashboard::new();
+        let screen = painted(&mut dash, &snapshot(Vec::new()));
+        assert!(screen.contains("ollamaMQ"), "title missing:\n{screen}");
     }
 }

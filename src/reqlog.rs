@@ -8,6 +8,7 @@
 //! channel is full, records are dropped and counted instead.
 
 use serde::Serialize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -31,7 +32,8 @@ pub struct ReqRecord {
     pub bytes: Option<u64>,
     pub content_type: Option<String>,
     /// Body content, truncated to the configured limit (lossy UTF-8).
-    pub content: Option<String>,
+    /// Shared (not copied) with the TUI log event built from the same body.
+    pub content: Option<Arc<String>>,
 }
 
 /// Non-blocking producer for the size-rotated request log.
@@ -127,6 +129,15 @@ pub fn truncate_utf8(data: &[u8], limit: usize) -> String {
     format!("\n...[truncated: {} bytes total]", data.len())
 }
 
+/// Open `path` for appending, creating it when missing.
+async fn open_append(path: &str) -> Result<tokio::fs::File, std::io::Error> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+}
+
 /// Writer task: appends one JSON line per record and rotates the file when it
 /// would exceed `max_bytes`. All I/O is async (`tokio::fs`).
 async fn writer_loop(
@@ -140,6 +151,11 @@ async fn writer_loop(
         Ok(m) => m.len(),
         Err(_) => 0,
     };
+    // The append handle stays open across records: re-opening per line would
+    // cost an open/close syscall pair for every logged request. It is dropped
+    // (and re-opened on the next record) after a rotation or a failed write,
+    // so a rotated-away or externally removed file is picked up again.
+    let mut file: Option<tokio::fs::File> = None;
 
     while let Some(rec) = rx.recv().await {
         let line = match serde_json::to_string(&rec) {
@@ -154,22 +170,36 @@ async fn writer_loop(
         };
 
         if current_size + line.len() as u64 > max_bytes {
+            // The open handle points at the file that rotation renames away.
+            file = None;
             rotate(&path, max_files).await;
             current_size = 0;
         }
 
-        // tokio has no `fs::append`; open in append mode and write instead.
-        match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            Ok(mut f) => match f.write_all(line.as_bytes()).await {
-                Ok(()) => current_size += line.len() as u64,
-                Err(e) => warn!("request log: failed to append to {}: {}", path, e),
-            },
-            Err(e) => warn!("request log: failed to open {} for append: {}", path, e),
+        if file.is_none() {
+            match open_append(&path).await {
+                Ok(f) => file = Some(f),
+                Err(e) => {
+                    warn!("request log: failed to open {} for append: {}", path, e);
+                    continue;
+                }
+            }
+        }
+        let Some(f) = file.as_mut() else { continue };
+
+        // `tokio::fs::File` buffers internally and only guarantees the bytes
+        // reached the OS once flushed, so both calls are needed for anything
+        // tailing the file to see complete lines.
+        let written = match f.write_all(line.as_bytes()).await {
+            Ok(()) => f.flush().await,
+            Err(e) => Err(e),
+        };
+        match written {
+            Ok(()) => current_size += line.len() as u64,
+            Err(e) => {
+                warn!("request log: failed to append to {}: {}", path, e);
+                file = None; // re-open on the next record
+            }
         }
     }
 }
@@ -211,7 +241,7 @@ mod tests {
             bytes: Some(100),
             content_type: Some("application/json".into()),
             // Padding keeps each serialized line in the ~100-250 byte range.
-            content: Some(format!("x{}", "y".repeat(20))),
+            content: Some(Arc::new(format!("x{}", "y".repeat(20)))),
         }
     }
 
@@ -287,6 +317,23 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    #[test]
+    fn shared_content_serializes_as_a_plain_string() {
+        // `content` is an `Arc<String>` so the body preview can be shared with
+        // the TUI log event instead of copied. Serde's `rc` feature makes that
+        // transparent on the wire — the log file format must not change.
+        let mut r = rec(0);
+        r.content = Some(Arc::new("hello \"world\"\nsecond line".to_string()));
+        let line = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["content"], "hello \"world\"\nsecond line");
+
+        r.content = None;
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(v["content"].is_null());
     }
 
     #[test]

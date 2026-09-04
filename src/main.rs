@@ -16,11 +16,13 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod control;
 mod dispatcher;
+mod lock;
 mod reqlog;
 mod tui;
 
 use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
 use crate::dispatcher::{AppState, proxy_handler, run_worker};
+use crate::lock::LockExt;
 
 use std::io::IsTerminal;
 
@@ -195,6 +197,17 @@ async fn main() {
         .log_content_limit
         .map(|v| v.max(1024))
         .unwrap_or(65_536);
+    // Request bodies are buffered whole (a queued request may wait before a
+    // backend takes it), so the body limit is a per-request memory commitment.
+    // It used to be a flat 1 GiB on every route.
+    let max_body_bytes = file_cfg
+        .settings
+        .max_body_bytes
+        .unwrap_or(64 * 1024 * 1024);
+    let max_queued_bytes = file_cfg
+        .settings
+        .max_queued_bytes
+        .unwrap_or(512 * 1024 * 1024);
     let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
 
     let backend_urls: Vec<String> = args
@@ -270,6 +283,7 @@ async fn main() {
         file_cfg.models,
         reqlog,
         log_content_limit,
+        max_queued_bytes,
     ));
 
     let worker_state = state.clone();
@@ -282,12 +296,12 @@ async fn main() {
     {
         let st = state.clone();
         tokio::spawn(async move {
-            if st.model_config.lock().unwrap().is_empty() {
+            if st.model_config.lock_or_recover().is_empty() {
                 return;
             }
             for _ in 0..60 {
                 let probed = {
-                    let backends = st.backends.lock().unwrap();
+                    let backends = st.backends.lock_or_recover();
                     backends
                         .iter()
                         .all(|b| b.api_type != dispatcher::BackendApiType::Unknown)
@@ -321,7 +335,14 @@ async fn main() {
         .route("/api/delete", any(proxy_handler))
         .route("/api/pull", any(proxy_handler))
         .route("/api/push", any(proxy_handler))
-        .route("/api/blobs/{digest}", any(proxy_handler))
+        // Model-layer uploads are the one route that legitimately carries
+        // hundreds of megabytes, so it keeps its own allowance. A route layer
+        // sits inside the router-wide one below, so this value wins here.
+        .route(
+            "/api/blobs/{digest}",
+            any(proxy_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(dispatcher::BLOB_BODY_LIMIT)),
+        )
         .route("/api/ps", any(proxy_handler))
         .route("/api/version", any(proxy_handler))
         // OpenAI Compatible Endpoints
@@ -345,7 +366,7 @@ async fn main() {
     // /health is registered separately below and stays unauthenticated.
     let app = app
         .layer(middleware::from_fn_with_state(api_key, auth_middleware))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB limit
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state.clone());
 
     let app = Router::new()
@@ -387,11 +408,11 @@ async fn main() {
 
 async fn tui_loop(tui_state: Arc<Mutex<TuiState>>, state: Arc<AppState>) {
     let mut dashboard = tui::TuiDashboard::new();
-    let toggle_notify = Arc::new(tui_state.lock().unwrap().toggle_notify.clone());
+    let toggle_notify = Arc::new(tui_state.lock_or_recover().toggle_notify.clone());
 
     loop {
         let visible = {
-            let tui_state = tui_state.lock().unwrap();
+            let tui_state = tui_state.lock_or_recover();
             tui_state.visible
         };
 
