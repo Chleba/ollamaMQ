@@ -310,9 +310,16 @@ async fn main() {
             for _ in 0..60 {
                 let probed = {
                     let backends = st.backends.lock_or_recover();
+                    // "Probed" means "answered at least one endpoint", not "has
+                    // a non-empty family set". A System One backend is perfectly
+                    // routable while answering nothing that used to classify a
+                    // family, and a backend that answers nothing at all is never
+                    // a load target either way — so insisting on
+                    // `api_type != Unknown` made a CLM-only deployment sit out
+                    // this whole 30 s loop before its model config was applied.
                     backends
                         .iter()
-                        .all(|b| b.api_type != dispatcher::BackendApiType::Unknown)
+                        .all(|b| b.is_online || !b.api_type.is_empty())
                 };
                 if probed {
                     break;
@@ -359,6 +366,10 @@ async fn main() {
         .route("/v1/embeddings", any(proxy_handler))
         .route("/v1/models", any(proxy_handler))
         .route("/v1/models/{model}", any(proxy_handler))
+        // System One decision-model API (CLM / Laya / Kev). Pass-through like
+        // every other proxy route — the body is never parsed — and the route
+        // table routes it to a System One backend and nowhere else.
+        .route("/v1/systemone", any(proxy_handler))
         // Local admin API (model load/unload control) — never proxied to
         // backends, protected by the same optional API-key auth.
         .route("/admin/models", get(admin_models_state))

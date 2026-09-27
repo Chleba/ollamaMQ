@@ -78,81 +78,212 @@ pub struct Task {
     pub queued_at: std::time::Instant,
 }
 
-/// Which API flavours this backend speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum BackendApiType {
-    #[default]
-    Unknown,
-    Ollama,
-    OpenAi,
-    Both,
+/// Which API flavours a backend speaks — and, on the route side of the
+/// scheduler, which flavours a route is allowed to be served by.
+///
+/// This replaced the enum `BackendApiType { Unknown, Ollama, OpenAi, Both }`.
+/// Three families need 2³ subsets, so an enum runs out of variants at the very
+/// moment a third family (`SystemOne`, the decision-model servers) is added;
+/// a bitset accepts whatever combination results from probing and needs no new
+/// plumbing per family. `EMPTY` is the old `Unknown`: nothing detected (yet),
+/// which keeps a backend eligible for every family until a probe or real
+/// traffic classifies it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ApiSet(u8);
+
+impl ApiSet {
+    /// Nothing known about this backend (the old `BackendApiType::Unknown`).
+    pub const EMPTY: ApiSet = ApiSet(0);
+    /// Ollama's native `/api/*` API.
+    pub const OLLAMA: ApiSet = ApiSet(1 << 0);
+    /// OpenAI's `/v1/*` API as served by LM Studio, vLLM and friends.
+    pub const OPENAI: ApiSet = ApiSet(1 << 1);
+    /// "System One" decision-model servers (CLM, Laya, Kev): `POST
+    /// /v1/systemone`, plus a `{"models":[{"name":…}]}` model list on all of
+    /// them except Laya. No `/api/*` route at all.
+    pub const SYSTEMONE: ApiSet = ApiSet(1 << 2);
+    /// Ollama + OpenAI: what a backend serving both flavours is tagged with.
+    pub const BOTH: ApiSet = ApiSet(1 << 0 | 1 << 1);
+    /// Every known family — the set of a route that any backend may serve.
+    pub const ALL: ApiSet = ApiSet(1 << 0 | 1 << 1 | 1 << 2);
+
+    /// One entry per bit, in `members()` order.
+    const FAMILIES: [ApiFamily; 3] =
+        [ApiFamily::Ollama, ApiFamily::OpenAi, ApiFamily::SystemOne];
+
+    /// Short labels for the dashboard and log lines, indexed by bit pattern.
+    const NAMES: [&'static str; 8] = [
+        "???",
+        "Ollama",
+        "OpenAI",
+        "O+OA",
+        "SystemOne",
+        "O+SO",
+        "OA+SO",
+        "O+OA+SO",
+    ];
+
+    const fn bit(family: ApiFamily) -> u8 {
+        match family {
+            ApiFamily::Ollama => 1 << 0,
+            ApiFamily::OpenAi => 1 << 1,
+            ApiFamily::SystemOne => 1 << 2,
+        }
+    }
+
+    pub const fn contains(self, family: ApiFamily) -> bool {
+        self.0 & Self::bit(family) != 0
+    }
+
+    pub const fn union(self, other: ApiSet) -> ApiSet {
+        ApiSet(self.0 | other.0)
+    }
+
+    pub const fn intersection(self, other: ApiSet) -> ApiSet {
+        ApiSet(self.0 & other.0)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The families in this set, in declaration order.
+    pub fn members(self) -> impl Iterator<Item = ApiFamily> {
+        Self::FAMILIES.into_iter().filter(move |f| self.contains(*f))
+    }
+
+    /// The one family in this set, or `None` when it holds none or several.
+    pub fn single(self) -> Option<ApiFamily> {
+        let mut members = self.members();
+        let one = members.next()?;
+        if members.next().is_some() {
+            None
+        } else {
+            Some(one)
+        }
+    }
+
+    /// Probe-side merge: a probe only ever *adds* flavours it observed.
+    pub const fn merge(self, other: ApiSet) -> ApiSet {
+        self.union(other)
+    }
+
+    pub const fn display(self) -> &'static str {
+        Self::NAMES[(self.0 & 0b0111) as usize]
+    }
 }
 
-impl BackendApiType {
-    pub fn supports(&self, api_family: ApiFamily) -> bool {
-        match (self, api_family) {
-            (BackendApiType::Both, _) => true,
-            (_, ApiFamily::Unknown) => true, // unknown path → any backend is fine
-            (BackendApiType::Ollama, ApiFamily::Ollama) => true,
-            (BackendApiType::OpenAi, ApiFamily::OpenAi) => true,
-            _ => false,
-        }
-    }
+/// Old variant spellings of the enum this replaced, so the probe / model-control
+/// code (`control.rs`) and its tests keep speaking in flavour names. Note that
+/// `supports_control` is now a *containment* test (`api_type.contains(ApiFamily::
+/// Ollama)`) rather than `matches!(…, Ollama | Both)`: exact set equality would
+/// drop model control from any backend whose merged set grew a second family.
+/// These aliases stay for the sites where a whole set is named, not tested.
+#[allow(non_upper_case_globals)]
+impl ApiSet {
+    pub const Unknown: ApiSet = ApiSet::EMPTY;
+    pub const Ollama: ApiSet = ApiSet::OLLAMA;
+    pub const OpenAi: ApiSet = ApiSet::OPENAI;
+    pub const Both: ApiSet = ApiSet::BOTH;
+}
 
-    pub fn merge(self, other: BackendApiType) -> BackendApiType {
-        match (self, other) {
-            (_, BackendApiType::Both) | (BackendApiType::Both, _) => BackendApiType::Both,
-            (BackendApiType::Ollama, BackendApiType::OpenAi)
-            | (BackendApiType::OpenAi, BackendApiType::Ollama) => BackendApiType::Both,
-            (_, t) => t,
-        }
-    }
+/// The backend-side set keeps its historical name across the crate.
+pub type BackendApiType = ApiSet;
 
-    pub fn display(&self) -> &'static str {
-        match self {
-            BackendApiType::Unknown => "???",
-            BackendApiType::Ollama => "Ollama",
-            BackendApiType::OpenAi => "OpenAI",
-            BackendApiType::Both => "O+OA",
-        }
+impl std::fmt::Debug for ApiSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display())
     }
 }
 
-/// Which API family a request path belongs to.
+/// Which API family a request belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ApiFamily {
     Ollama,
     OpenAi,
-    Unknown,
+    /// Decision-model servers (CLM, Laya, Kev): `POST /v1/systemone`.
+    SystemOne,
 }
 
 impl ApiFamily {
-    pub fn display(&self) -> &'static str {
+    pub fn display(self) -> &'static str {
         match self {
             ApiFamily::Ollama => "Ollama",
             ApiFamily::OpenAi => "OpenAI",
-            ApiFamily::Unknown => "unknown",
+            ApiFamily::SystemOne => "SystemOne",
         }
     }
 }
 
-pub fn detect_api_family(path: &str) -> ApiFamily {
+/// Which backend families may serve `(method, path)`.
+///
+/// Replaces the prefix rule (`/api/*` → Ollama, `/v1/*` → OpenAI), which sent
+/// `/v1/systemone` to LM Studio / vLLM backends that answer it with a 404: a
+/// route's family is now looked up rather than guessed from its prefix. Every
+/// pre-existing route keeps the family it had — only `/v1/models` (now shared
+/// with System One servers, which answer it with a different envelope) and the
+/// new `/v1/systemone` differ, and `route_table_keeps_every_registered_routes_family`
+/// guards the whole table against accidental changes.
+///
+/// `ApiSet::ALL` means "any backend may answer", the old `ApiFamily::Unknown`.
+/// The method is part of the signature because the route table is keyed by
+/// method; no route currently discriminates on it.
+pub fn families_for_route(_method: &Method, path: &str) -> ApiSet {
+    // Exact routes whose family the old prefix rule got wrong.
+    if path == "/v1/systemone" {
+        return ApiSet::SYSTEMONE;
+    }
     if path.starts_with("/api/") {
-        ApiFamily::Ollama
+        ApiSet::OLLAMA
+    } else if path == "/v1/models" || path.starts_with("/v1/models/") {
+        // Same endpoint name, two envelopes (see `aggregate_model_list`).
+        ApiSet::OPENAI.union(ApiSet::SYSTEMONE)
     } else if path.starts_with("/v1/") {
-        ApiFamily::OpenAi
+        // Chat, completions, embeddings — and anything else under `/v1/` that
+        // a fallback-routed client sends: unchanged from the prefix rule.
+        ApiSet::OPENAI
     } else {
-        ApiFamily::Unknown
+        // `/` and anything unrecognized: unchanged, any backend may answer.
+        ApiSet::ALL
     }
 }
 
-/// The model-listing endpoint of an API family: (path, array key, id field).
-fn model_list_shape(family: ApiFamily) -> Option<(&'static str, &'static str, &'static str)> {
-    match family {
-        ApiFamily::Ollama => Some(("/api/tags", "models", "name")),
-        ApiFamily::OpenAi => Some(("/v1/models", "data", "id")),
-        ApiFamily::Unknown => None,
+/// `/api/tags`: Ollama's model list.
+const OLLAMA_LIST_SHAPES: &[(&str, &str)] = &[("models", "name")];
+/// `/v1/models` is shared by two families with two different envelopes:
+/// OpenAI's `{"data":[{"id":…}]}` and the System One servers'
+/// `{"models":[{"name":…}]}`. Both are *read*, but the answer is written in the
+/// FIRST shape listed — the route's own envelope — and `data`/`id` is first
+/// because this route is advertised as OpenAI-compatible and OpenAI SDK clients
+/// require `data`. A System One backend ordered first must not re-key it.
+const V1_MODELS_SHAPES: &[(&str, &str)] = &[("data", "id"), ("models", "name")];
+
+/// The entry shape(s) of a model-listing endpoint: `(array key, name field)`,
+/// **first = the envelope that route answers in**, the rest accepted on input
+/// only, or `None` for any path that is not a listing.
+fn model_list_shapes(path: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    match path {
+        "/api/tags" => Some(OLLAMA_LIST_SHAPES),
+        "/v1/models" => Some(V1_MODELS_SHAPES),
+        _ => None,
     }
+}
+
+/// Re-key one listing entry to the envelope's name field (`id` ⇄ `name`),
+/// leaving every other field exactly as that backend reported it. Only needed
+/// when a `/v1/models` answer arrives in the other family's envelope.
+fn retitled_entry(entry: &serde_json::Value, from: &str, to: &str) -> serde_json::Value {
+    if from == to {
+        return entry.clone();
+    }
+    let serde_json::Value::Object(map) = entry else {
+        return entry.clone();
+    };
+    let mut map = map.clone();
+    if let Some(value) = map.remove(from) {
+        map.insert(to.to_string(), value);
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Answer a model listing from EVERY compatible backend at once.
@@ -165,10 +296,20 @@ fn model_list_shape(family: ApiFamily) -> Option<(&'static str, &'static str, &'
 /// merged, so per-model metadata (size, digest, details, ...) stays exactly as
 /// that backend reported it instead of being synthesized here.
 ///
-/// Entries are deduped by name/id with the first backend winning, and the
-/// envelope of the first answering backend is reused so any extra top-level
-/// fields survive. Returns `None` when no compatible backend produced a
-/// listing — the caller then falls back to the normal queued proxy path.
+/// Entries are deduped by name/id with the first backend winning, and the first
+/// answering body is reused so its extra top-level fields survive. Returns
+/// `None` when no compatible backend produced a listing — the caller then falls
+/// back to the normal queued proxy path.
+///
+/// Both listing envelopes are *read*, but only one is ever *answered*, and which
+/// one is decided by the ROUTE, never by whichever backend happens to answer
+/// first (that ordering was a real regression: with a System One backend
+/// configured first, `GET /v1/models` answered `{"models":[{"name":…}]}` and
+/// broke OpenAI SDK clients on a route the README advertises as
+/// OpenAI-compatible). So `/v1/models` always emits `{"data":[{"id":…}]}` and
+/// `/api/tags` always `{"models":[{"name":…}]}`; an entry read through the other
+/// envelope is re-keyed to the answer's name field, and the first answerer's own
+/// foreign array key is dropped so the reply is one envelope, not two.
 ///
 /// Backends are queried without the client's headers (as health probes are),
 /// so a backend that demands its own credentials on this endpoint contributes
@@ -176,15 +317,23 @@ fn model_list_shape(family: ApiFamily) -> Option<(&'static str, &'static str, &'
 /// attached like everywhere else.
 async fn aggregate_model_list(
     state: &AppState,
-    family: ApiFamily,
+    endpoint: &str,
 ) -> Option<axum::response::Response> {
-    let (endpoint, array_key, id_field) = model_list_shape(family)?;
+    let shapes = model_list_shapes(endpoint)?;
+    // The envelope this route answers in: the first declared shape, fixed by
+    // the route itself (`/v1/models` → OpenAI's `data`/`id`, `/api/tags` →
+    // Ollama's `models`/`name`). Everything after `shapes[0]` is accepted on
+    // input only.
+    let (out_key, out_field) = *shapes
+        .first()
+        .expect("a listing endpoint declares at least one shape");
+    let route = families_for_route(&Method::GET, endpoint);
 
     let targets: Vec<(String, Option<String>)> = state
         .backends
         .lock_or_recover()
         .iter()
-        .filter(|b| b.is_online && family_compatible(b, family))
+        .filter(|b| b.is_online && family_compatible(b, route))
         .map(|b| (b.url.clone(), b.token.clone()))
         .collect();
     if targets.is_empty() {
@@ -208,37 +357,61 @@ async fn aggregate_model_list(
     }))
     .await;
 
-    let mut envelope: Option<serde_json::Value> = None;
+    // The first answering body, with the array key *it* reported its listing
+    // under — on a route shared by two families that is not the key the merged
+    // answer is written in.
+    let mut envelope: Option<(serde_json::Value, &'static str)> = None;
     let mut merged: Vec<serde_json::Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut answered = 0usize;
     for body in bodies.into_iter().flatten() {
         // A backend that answers 200 with an error object (LM Studio does this
-        // for foreign endpoints) has no listing to contribute.
-        let Some(entries) = body.get(array_key).and_then(|m| m.as_array()) else {
+        // for foreign endpoints) has no listing to contribute. Likewise one
+        // whose listing uses a shape this endpoint does not recognise.
+        let Some((array_key, name_field)) = shapes
+            .iter()
+            .copied()
+            .find(|(key, _)| body.get(*key).is_some_and(|v| v.is_array()))
+        else {
             continue;
         };
+        let entries = body
+            .get(array_key)
+            .and_then(|m| m.as_array())
+            .expect("array shape was just checked");
+        // The merged list is always written in the route's own envelope, so an
+        // entry read through the other one is re-keyed on the way in.
         for entry in entries {
-            match entry.get(id_field).and_then(|v| v.as_str()) {
+            match entry.get(name_field).and_then(|v| v.as_str()) {
                 // Already listed by an earlier backend.
                 Some(id) if !seen.insert(id.to_string()) => continue,
-                _ => merged.push(entry.clone()),
+                Some(_) => merged.push(retitled_entry(entry, name_field, out_field)),
+                // Unnamed entry: pass it through rather than dropping it.
+                None => merged.push(entry.clone()),
             }
         }
         answered += 1;
         if envelope.is_none() {
-            envelope = Some(body);
+            envelope = Some((body, array_key));
         }
     }
 
-    let mut envelope = envelope?;
+    // `array_key` is the key the first answering backend reported its listing
+    // under — on a shared route that is not the key the answer uses, in which
+    // case that array must not survive alongside the merged one.
+    let (mut envelope, consumed_key) = envelope?;
     debug!(
         "aggregated {} at {} model(s) from {} backend(s)",
         endpoint,
         merged.len(),
         answered
     );
-    envelope[array_key] = serde_json::Value::Array(merged);
+    if consumed_key != out_key
+        && let Some(map) = envelope.as_object_mut()
+    {
+        map.remove(consumed_key);
+    }
+    envelope[out_key] = serde_json::Value::Array(merged);
     Some((StatusCode::OK, axum::Json(envelope)).into_response())
 }
 
@@ -810,17 +983,53 @@ fn backend_has_capacity(
     }
 }
 
+/// Which families this backend could serve `route` with: what it speaks ∩ what
+/// the route accepts. A backend that has not been classified yet (`api_type`
+/// empty) is a candidate for every family the route accepts, exactly as the old
+/// `Unknown` variant was.
+fn route_candidates(b: &BackendStatus, route: ApiSet) -> ApiSet {
+    if b.api_type.is_empty() {
+        route
+    } else {
+        b.api_type.intersection(route)
+    }
+}
+
 /// True when the backend can speak the request's API dialect. Unknown-type
 /// backends are allowed until the health check classifies them; families this
 /// backend has been observed rejecting in real traffic (see
 /// `apply_family_learning`) are excluded until a request of that family
 /// succeeds or the backend restarts.
-fn family_compatible(b: &BackendStatus, family: ApiFamily) -> bool {
-    if b.rejected_families.contains(&family) {
+fn family_compatible(b: &BackendStatus, route: ApiSet) -> bool {
+    let candidates = route_candidates(b, route);
+    if candidates.is_empty() {
         return false;
     }
-    matches!(b.api_type, BackendApiType::Unknown | BackendApiType::Both)
-        || b.api_type.supports(family)
+    // Excluded only when the backend has been seen rejecting *every* family
+    // this route could be served by — a `/v1/models` request is answered by
+    // OpenAI and System One backends alike, so one rejecting family must not
+    // disqualify a backend that still serves the other.
+    !candidates
+        .members()
+        .all(|family| b.rejected_families.contains(&family))
+}
+
+/// Which single family a response on `route` teaches something about, if any.
+///
+/// For every route that existed before the System One family this is exactly
+/// the family the old prefix rule named, so learning behaviour is unchanged.
+/// A multi-family route (`GET /v1/models`) is only attributable when the
+/// backend's own detected type pins it to one of the two, and a catch-all route
+/// (`/`) or an unclassified backend teaches nothing — a wrong strike removes a
+/// healthy backend from rotation for that family.
+fn learnable_family(b: &BackendStatus, route: ApiSet) -> Option<ApiFamily> {
+    if let Some(family) = route.single() {
+        return Some(family);
+    }
+    if route == ApiSet::ALL || b.api_type.is_empty() {
+        return None;
+    }
+    b.api_type.intersection(route).single()
 }
 
 /// Heuristic: did this response reject the request's API *dialect* (as opposed
@@ -859,14 +1068,16 @@ fn is_endpoint_rejection(status: StatusCode, body_prefix: &str) -> bool {
 fn apply_family_learning(
     state: &AppState,
     backend_idx: usize,
-    family: ApiFamily,
+    route: ApiSet,
     rejected: bool,
 ) {
-    if family == ApiFamily::Unknown {
-        return; // nothing to learn from unrecognized paths
-    }
     let mut backends = state.backends.lock_or_recover();
     let Some(b) = backends.get_mut(backend_idx) else {
+        return;
+    };
+    // Nothing to learn from a path no family owns, or one the answer is
+    // ambiguous about (see `learnable_family`).
+    let Some(family) = learnable_family(b, route) else {
         return;
     };
     if rejected {
@@ -1238,14 +1449,15 @@ pub async fn run_worker(state: Arc<AppState>) {
                             Some(t) => t,
                             None => continue,
                         };
-                        let api_family = detect_api_family(&task_ref.path);
+                        let route_families =
+                            families_for_route(&task_ref.method, &task_ref.path);
                         // Metadata reads are cheap and don't use the model
                         // runner: they ignore backend capacity and in-flight
                         // control ops, and are not accounted against either.
                         let metadata = is_metadata_path(&task_ref.path);
                         debug!(
                             "Request for user {}: pos={} path={} family={:?}",
-                            user_id, pos, task_ref.path, api_family
+                            user_id, pos, task_ref.path, route_families
                         );
 
                         // Backend pin for this task (pre-computed above, before
@@ -1295,10 +1507,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 // matching model.) Unknown-type backends are allowed until the
                                 // health check classifies them; families observed rejecting
                                 // real traffic are excluded (see apply_family_learning).
-                                if !family_compatible(b, api_family) {
+                                if !family_compatible(b, route_families) {
                                     debug!(
-                                        "Backend {} rejected: api_family {:?} not supported by {:?}",
-                                        b.url, api_family, b.api_type
+                                        "Backend {} rejected: route families {:?} not supported by {:?}",
+                                        b.url, route_families, b.api_type
                                     );
                                     return false;
                                 }
@@ -1390,7 +1602,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             // nothing will ever pick it up: warn once, then fail fast with 503
                             // after stuck_timeout instead of letting the client hang forever.
                             let satisfiable = backends.iter().any(|b| {
-                                family_compatible(b, api_family)
+                                family_compatible(b, route_families)
                                     && match &task_ref.requested_model {
                                         // A pinned model is only satisfiable by a backend
                                         // that also passes the pin filter — strict pinning
@@ -1507,7 +1719,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     task_ref.method,
                                     task_ref.path,
                                     task_ref.requested_model.as_deref().unwrap_or("-"),
-                                    api_family,
+                                    route_families,
                                     user_id
                                 );
                                 if let Some(task_mut) =
@@ -1595,7 +1807,7 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                 tokio::spawn(async move {
                     let log_model = task.requested_model.clone();
-                    let api_family = detect_api_family(&task.path);
+                    let route_families = families_for_route(&task.method, &task.path);
                     let log_out = |info: String,
                                    backend: Option<String>,
                                    content: Option<Arc<String>>| {
@@ -1727,7 +1939,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     apply_family_learning(
                                         &state_clone,
                                         backend_idx,
-                                        api_family,
+                                        route_families,
                                         is_endpoint_rejection(status, &prefix),
                                     );
 
@@ -1898,10 +2110,9 @@ pub async fn proxy_handler(
     // Model listings are answered from every backend at once instead of being
     // routed to one of them (see `aggregate_model_list`). If nothing can be
     // merged, fall through to the normal queued path.
-    let family = detect_api_family(&path);
     if method == Method::GET
-        && model_list_shape(family).is_some_and(|(endpoint, _, _)| endpoint == path)
-        && let Some(response) = aggregate_model_list(&state, family).await
+        && model_list_shapes(&path).is_some()
+        && let Some(response) = aggregate_model_list(&state, &path).await
     {
         let ts = crate::reqlog::now_unix_millis();
         for (dir, info) in [
@@ -2336,26 +2547,307 @@ mod tests {
         // Unknown type is allowed until the health check classifies it.
         assert!(family_compatible(
             &backend_with(BackendApiType::Unknown, &[]),
-            ApiFamily::Ollama
+            ApiSet::OLLAMA
         ));
         // Ollama-only backend cannot serve OpenAI-family requests (and vice versa).
         assert!(!family_compatible(
             &backend_with(BackendApiType::Ollama, &[]),
-            ApiFamily::OpenAi
+            ApiSet::OPENAI
         ));
         assert!(family_compatible(
             &backend_with(BackendApiType::Ollama, &[]),
-            ApiFamily::Ollama
+            ApiSet::OLLAMA
         ));
-        // Both serves everything.
+        // Both = Ollama + OpenAI: everything the two-family world had.
         assert!(family_compatible(
             &backend_with(BackendApiType::Both, &[]),
-            ApiFamily::OpenAi
+            ApiSet::OPENAI
+        ));
+        assert!(family_compatible(
+            &backend_with(BackendApiType::Both, &[]),
+            ApiSet::OLLAMA
+        ));
+        // …but it does not include the new family: that needs its own bit.
+        assert!(!family_compatible(
+            &backend_with(BackendApiType::Both, &[]),
+            ApiSet::SYSTEMONE
+        ));
+        assert!(family_compatible(
+            &backend_with(ApiSet::ALL, &[]),
+            ApiSet::SYSTEMONE
         ));
         // Learned rejections override the detected type.
         let b = backend_with(BackendApiType::Both, &[ApiFamily::Ollama]);
-        assert!(!family_compatible(&b, ApiFamily::Ollama));
-        assert!(family_compatible(&b, ApiFamily::OpenAi));
+        assert!(!family_compatible(&b, ApiSet::OLLAMA));
+        assert!(family_compatible(&b, ApiSet::OPENAI));
+    }
+
+    #[test]
+    fn api_set_is_a_bitset() {
+        let both = ApiSet::OLLAMA.union(ApiSet::OPENAI);
+        assert_eq!(both, ApiSet::BOTH);
+        assert!(both.contains(ApiFamily::Ollama) && both.contains(ApiFamily::OpenAi));
+        assert!(!both.contains(ApiFamily::SystemOne));
+        assert!(ApiSet::EMPTY.is_empty());
+        assert!(!both.is_empty());
+        assert_eq!(ApiSet::OLLAMA.intersection(ApiSet::OPENAI), ApiSet::EMPTY);
+        assert_eq!(ApiSet::OLLAMA.intersection(ApiSet::BOTH), ApiSet::OLLAMA);
+        // A probe only ever adds flavours, and a set no enum variant could have
+        // named is representable: Ollama + OpenAI + System One.
+        assert_eq!(ApiSet::Unknown.merge(ApiSet::Ollama), ApiSet::Ollama);
+        assert_eq!(ApiSet::Ollama.merge(ApiSet::OpenAi), ApiSet::BOTH);
+        let everything = ApiSet::BOTH.merge(ApiSet::SYSTEMONE);
+        assert_eq!(everything, ApiSet::ALL);
+        // Only a single-family set names one family; mixed and empty sets do not.
+        assert_eq!(ApiSet::SYSTEMONE.single(), Some(ApiFamily::SystemOne));
+        assert_eq!(ApiSet::BOTH.single(), None);
+        assert_eq!(ApiSet::EMPTY.single(), None);
+        assert_eq!(ApiSet::SYSTEMONE.display(), "SystemOne");
+        assert_eq!(ApiSet::EMPTY.display(), "???");
+        assert_eq!(format!("{:?}", ApiSet::BOTH), "O+OA");
+        assert_eq!(format!("{:?}", everything), "O+OA+SO");
+    }
+
+    /// The prefix rule that decided routing before the System One family
+    /// existed, reproduced verbatim from the old `detect_api_family` (including
+    /// its `ApiFamily::Unknown`, now `ApiSet::ALL`), so the route table below
+    /// is checked against the *behaviour being preserved* rather than against
+    /// the new implementation.
+    fn legacy_route_families(path: &str) -> ApiSet {
+        if path.starts_with("/api/") {
+            ApiSet::OLLAMA
+        } else if path.starts_with("/v1/") {
+            ApiSet::OPENAI
+        } else {
+            ApiSet::ALL
+        }
+    }
+
+    /// THE REGRESSION GUARD. Every proxy route registered in `main.rs`
+    /// (each is `any(proxy_handler)`; the method column records how clients
+    /// actually use it) with the family set it must be routed with. A row that
+    /// changes family means existing Ollama / LM Studio / OpenAI traffic
+    /// changes which backends it can reach.
+    /// The route's own answer envelope is the FIRST declared listing shape (see
+    /// `aggregate_model_list`); the remaining shapes are accepted on input only.
+    /// `/v1/models` therefore always answers OpenAI's `data`/`id` and `/api/tags`
+    /// always Ollama's `models`/`name`, whatever the backends answer with.
+    #[test]
+    fn each_listing_route_answers_in_its_own_envelope() {
+        assert_eq!(
+            model_list_shapes("/v1/models").expect("v1 models is a listing")[0],
+            ("data", "id")
+        );
+        assert_eq!(
+            model_list_shapes("/api/tags").expect("api tags is a listing")[0],
+            ("models", "name")
+        );
+        assert!(model_list_shapes("/v1/chat/completions").is_none());
+    }
+
+    #[test]
+    fn route_table_keeps_every_registered_routes_family() {
+        let models_pair = ApiSet::OPENAI.union(ApiSet::SYSTEMONE);
+        let table: Vec<(Method, &str, ApiSet)> = vec![
+            // Root: "Ollama is running" — any backend may answer, as before.
+            (Method::GET, "/", ApiSet::ALL),
+            // Ollama API endpoints.
+            (Method::POST, "/api/generate", ApiSet::OLLAMA),
+            (Method::POST, "/api/chat", ApiSet::OLLAMA),
+            (Method::POST, "/api/embed", ApiSet::OLLAMA),
+            (Method::POST, "/api/embeddings", ApiSet::OLLAMA),
+            (Method::GET, "/api/tags", ApiSet::OLLAMA),
+            (Method::POST, "/api/show", ApiSet::OLLAMA),
+            (Method::POST, "/api/create", ApiSet::OLLAMA),
+            (Method::POST, "/api/copy", ApiSet::OLLAMA),
+            (Method::POST, "/api/delete", ApiSet::OLLAMA),
+            (Method::POST, "/api/pull", ApiSet::OLLAMA),
+            (Method::POST, "/api/push", ApiSet::OLLAMA),
+            (Method::PUT, "/api/blobs/sha256:aaaa", ApiSet::OLLAMA),
+            (Method::GET, "/api/ps", ApiSet::OLLAMA),
+            (Method::GET, "/api/version", ApiSet::OLLAMA),
+            // OpenAI-compatible endpoints.
+            (Method::POST, "/v1/chat/completions", ApiSet::OPENAI),
+            (Method::POST, "/v1/completions", ApiSet::OPENAI),
+            (Method::POST, "/v1/embeddings", ApiSet::OPENAI),
+            // Listing endpoints. `/v1/models` (and `/v1/models/{model}`) is now
+            // shared with the System One servers, which answer it with
+            // `{"models":[{"name":…}]}` instead of OpenAI's envelope.
+            (Method::GET, "/v1/models", models_pair),
+            (Method::GET, "/v1/models/clm-latest", models_pair),
+            // NEW in P1: the decision-model route. The old prefix rule handed
+            // it to OpenAI backends, which 404 it — it must reach System One
+            // backends and nothing else.
+            (Method::POST, "/v1/systemone", ApiSet::SYSTEMONE),
+        ];
+
+        for (method, path, expected) in &table {
+            let got = families_for_route(method, path);
+            assert_eq!(&got, expected, "family set of {} changed", path);
+            // `any(proxy_handler)` means the family may not depend on method.
+            assert_eq!(
+                families_for_route(&Method::GET, path),
+                got,
+                "{}: family must not depend on the method",
+                path
+            );
+        }
+
+        // Every row except the deliberately changed ones must be exactly what
+        // the old prefix rule decided — and a row listed as changed must
+        // actually differ, so this list cannot silently go stale.
+        let changed = ["/v1/models", "/v1/models/clm-latest", "/v1/systemone"];
+        for (_, path, expected) in &table {
+            if changed.contains(path) {
+                assert_ne!(
+                    *expected,
+                    legacy_route_families(path),
+                    "{}: listed as changed but agrees with the legacy rule — stale row",
+                    path
+                );
+            } else {
+                assert_eq!(
+                    *expected,
+                    legacy_route_families(path),
+                    "{}: must keep the family it has today",
+                    path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unregistered_paths_keep_todays_classification() {
+        // Paths that are not in main.rs's route table: reachable only through
+        // the optional `allow_all_routes` fallback (`/v1/rank`, the Kev/CLM
+        // extra routes — P3 work), never proxied (`/health`, `/admin/*`: both
+        // are served by ollamaMQ itself), or simply unknown. P1 changes none.
+        for path in [
+            "/v1/rank",
+            "/v1/systemone/permute",
+            "/v1/systemone/separate",
+            "/health",
+            "/admin/models",
+            "/made/up",
+            "/v1",
+        ] {
+            assert_eq!(
+                families_for_route(&Method::POST, path),
+                legacy_route_families(path),
+                "{}: classification must not change in P1",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn system_one_and_ollama_backends_are_not_interchangeable() {
+        // The point of the new family: a decision-model backend implements no
+        // `/api/*` route at all, so it must never be handed Ollama traffic...
+        let sysone = backend_with(ApiSet::SYSTEMONE, &[]);
+        assert!(!family_compatible(
+            &sysone,
+            families_for_route(&Method::POST, "/api/chat")
+        ));
+        assert!(!family_compatible(
+            &sysone,
+            families_for_route(&Method::GET, "/api/tags")
+        ));
+        // ...while serving its own route and the shared listing endpoint.
+        assert!(family_compatible(
+            &sysone,
+            families_for_route(&Method::POST, "/v1/systemone")
+        ));
+        assert!(family_compatible(
+            &sysone,
+            families_for_route(&Method::GET, "/v1/models")
+        ));
+
+        // An Ollama backend must not be handed the decision-model route.
+        let ollama = backend_with(BackendApiType::Ollama, &[]);
+        assert!(!family_compatible(
+            &ollama,
+            families_for_route(&Method::POST, "/v1/systemone")
+        ));
+        assert!(family_compatible(
+            &ollama,
+            families_for_route(&Method::POST, "/api/chat")
+        ));
+        // An Ollama-only backend was never eligible for /v1/models and is still
+        // not: only OpenAI and System One servers answer it.
+        assert!(!family_compatible(
+            &ollama,
+            families_for_route(&Method::GET, "/v1/models")
+        ));
+
+        // Nor an OpenAI backend — that is the misroute this family exists to end.
+        let openai = backend_with(BackendApiType::OpenAi, &[]);
+        assert!(!family_compatible(
+            &openai,
+            families_for_route(&Method::POST, "/v1/systemone")
+        ));
+        assert!(family_compatible(
+            &openai,
+            families_for_route(&Method::POST, "/v1/chat/completions")
+        ));
+
+        // A learned rejection of one family must not cost a backend its duty in
+        // another: `/v1/models` is answered by OpenAI and System One servers.
+        let openai_rejecting_openai = backend_with(BackendApiType::OpenAi, &[ApiFamily::OpenAi]);
+        assert!(!family_compatible(
+            &openai_rejecting_openai,
+            families_for_route(&Method::GET, "/v1/models")
+        ));
+        let dual_rejecting_sysone = backend_with(
+            ApiSet::OPENAI.union(ApiSet::SYSTEMONE),
+            &[ApiFamily::SystemOne],
+        );
+        assert!(family_compatible(
+            &dual_rejecting_sysone,
+            families_for_route(&Method::GET, "/v1/models")
+        ));
+    }
+
+    #[test]
+    fn family_learning_blames_the_family_the_route_named() {
+        let openai = backend_with(BackendApiType::OpenAi, &[]);
+        // Single-family routes blame the route's family, as before — even when
+        // the backend would not have been served by it.
+        assert_eq!(
+            learnable_family(&openai, families_for_route(&Method::POST, "/api/chat")),
+            Some(ApiFamily::Ollama)
+        );
+        assert_eq!(
+            learnable_family(
+                &openai,
+                families_for_route(&Method::POST, "/v1/chat/completions")
+            ),
+            Some(ApiFamily::OpenAi)
+        );
+        // The shared listing endpoint is pinned down by the backend's own type.
+        assert_eq!(
+            learnable_family(&openai, families_for_route(&Method::GET, "/v1/models")),
+            Some(ApiFamily::OpenAi)
+        );
+        assert_eq!(
+            learnable_family(
+                &backend_with(ApiSet::SYSTEMONE, &[]),
+                families_for_route(&Method::GET, "/v1/models")
+            ),
+            Some(ApiFamily::SystemOne)
+        );
+        // A catch-all route and an unclassified backend teach nothing, as before.
+        assert_eq!(
+            learnable_family(&openai, families_for_route(&Method::GET, "/")),
+            None
+        );
+        assert_eq!(
+            learnable_family(
+                &backend_with(BackendApiType::Unknown, &[]),
+                families_for_route(&Method::GET, "/v1/models")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3316,7 +3808,7 @@ mod tests {
             }
         }
 
-        let res = aggregate_model_list(&state, ApiFamily::OpenAi)
+        let res = aggregate_model_list(&state, "/v1/models")
             .await
             .expect("both backends answer");
         let v = response_json(res).await;
@@ -3335,6 +3827,101 @@ mod tests {
 
         mock_a.abort();
         mock_b.abort();
+    }
+
+    /// How CLM / Kev answer `GET /v1/models` — the System One envelope, not
+    /// OpenAI's `{"data":[{"id":…}]}`.
+    const SYSTEMONE_V1_MODELS: &str =
+        r#"{"models":[{"name":"shared"},{"name":"clm-latest","description":"decision model"}]}"#;
+
+    #[tokio::test]
+    async fn model_listing_merges_openai_and_system_one_envelopes() {
+        let (url_openai, mock_openai) = spawn_mock_backend(
+            r#"{"object":"list","data":[{"id":"a"},{"id":"shared"}]}"#,
+            None,
+        )
+        .await;
+        let (url_sysone, mock_sysone) = spawn_mock_backend(SYSTEMONE_V1_MODELS, None).await;
+        let state = new_test_state(vec![url_openai, url_sysone]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::OpenAi;
+            backends[1].is_online = true;
+            backends[1].api_type = ApiSet::SYSTEMONE;
+        }
+
+        let v = response_json(
+            aggregate_model_list(&state, "/v1/models")
+                .await
+                .expect("both envelopes merge into one list"),
+        )
+        .await;
+
+        // The first answering backend's envelope is still the one reused...
+        assert_eq!(v["object"], "list");
+        // ...and both envelopes are in it, deduped by name with the first writer
+        // winning. Before this, the System One backend contributed nothing at
+        // all: its array is called `models`, not `data`.
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["a", "shared", "clm-latest"]);
+        // The foreign entry is only re-keyed (`name` → `id`); its own metadata
+        // survives untouched, as every other entry's does.
+        assert_eq!(v["data"][2]["description"], "decision model");
+        assert!(v["data"][2].get("name").is_none());
+        // The merged answer stays a single envelope, not both side by side.
+        assert!(v.get("models").is_none());
+
+        mock_openai.abort();
+        mock_sysone.abort();
+    }
+
+    /// The ordering that regressed in P1: a System One backend configured FIRST
+    /// answers `/v1/models` as `{"models":[{"name":…}]}`, and reusing *that*
+    /// body as the answer envelope re-keyed the merged list — breaking OpenAI SDK
+    /// clients on a route the README advertises as OpenAI-compatible. The answer
+    /// envelope is fixed by the route, so it stays `data`/`id`.
+    #[tokio::test]
+    async fn v1_models_answers_in_openai_envelope_when_system_one_is_first() {
+        let (url_sysone, mock_sysone) = spawn_mock_backend(SYSTEMONE_V1_MODELS, None).await;
+        let (url_openai, mock_openai) = spawn_mock_backend(QWEN_V1_MODELS, None).await;
+        let state = new_test_state(vec![url_sysone, url_openai]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = ApiSet::SYSTEMONE;
+            backends[1].is_online = true;
+            backends[1].api_type = BackendApiType::OpenAi;
+        }
+
+        let v = response_json(
+            aggregate_model_list(&state, "/v1/models")
+                .await
+                .expect("both backends answer"),
+        )
+        .await;
+
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .expect("data array — the first answerer must not re-key it")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["shared", "clm-latest", "qwen3.8-27b"]);
+        // One envelope, never both: the array the System One body reported its
+        // listing under is dropped once it has been read into `data`.
+        assert!(v.get("models").is_none());
+        // The foreign entry keeps its own metadata through the re-key.
+        assert_eq!(v["data"][1]["description"], "decision model");
+        assert!(v["data"][1].get("name").is_none());
+
+        mock_sysone.abort();
+        mock_openai.abort();
     }
 
     #[tokio::test]
@@ -3356,7 +3943,7 @@ mod tests {
         }
 
         let v = response_json(
-            aggregate_model_list(&state, ApiFamily::OpenAi)
+            aggregate_model_list(&state, "/v1/models")
                 .await
                 .expect("the OpenAI backend answers"),
         )
@@ -3375,7 +3962,7 @@ mod tests {
             let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = false;
         }
-        assert!(aggregate_model_list(&state, ApiFamily::OpenAi).await.is_none());
+        assert!(aggregate_model_list(&state, "/v1/models").await.is_none());
 
         mock_a.abort();
         mock_b.abort();

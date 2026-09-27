@@ -15,7 +15,7 @@
 //!   instance id comes from `GET /api/v1/models` -> `loaded_instances[].id`.
 
 use crate::dispatcher::{
-    AppState, BackendApiType, BackendStatus, LmModelInfo, smart_model_match_one,
+    ApiFamily, ApiSet, AppState, BackendApiType, BackendStatus, LmModelInfo, smart_model_match_one,
 };
 use axum::{
     Json,
@@ -169,6 +169,10 @@ pub async fn probe_backend(
     let mut native_models: Vec<LmModelInfo> = Vec::new();
     let mut bad_endpoints: HashSet<String> = HashSet::new();
     let mut good_endpoints: HashSet<String> = HashSet::new();
+    // Set when `/v1/models` answered in the System One envelope. Decisive:
+    // those servers expose no `/api/*` route at all, so any other flavour bit
+    // seen this round is a false tag (see the mask before `BackendProbe`).
+    let mut systemone_listed = false;
 
     // Every request here carries the backend's configured token when one is set.
     let authed = |req: reqwest::RequestBuilder| match token {
@@ -271,18 +275,34 @@ pub async fn probe_backend(
         }
     }
 
-// Probe OpenAI API: /v1/models → expects {"data": [...]}
+    // Probe `/v1/models`. TWO families answer this endpoint, in two different
+    // envelopes, so both are read here:
+    //  * OpenAI servers (LM Studio, vLLM, …): `{"data":[{"id":…}]}`
+    //  * System One decision models (CLM, Kev, hosted Jev):
+    //    `{"models":[{"name":…}]}` — verified live against `clm-serve`.
+    // The shapes are mutually exclusive in practice; if a body somehow carries
+    // both, `data` wins, because that is the contract a client on this route
+    // expects and the OpenAI tag is the more specific claim.
+    //
+    // Reading the System One shape here is also what makes those model names
+    // *routable*: `available_models` has exactly one writer (`apply_probe`), so
+    // a name the probe does not collect is a name every request naming it gets
+    // a 503 for (`model_routable` rejects the backend until `stuck_timeout`).
     if !skip.contains("/v1/models") {
         let check_url = format!("{}/v1/models", url);
         match authed(client.get(&check_url).timeout(timeout)).send().await {
             Ok(res) if res.status().is_success() => {
                 is_online = true;
                 let body = res.text().await.unwrap_or_default();
-                match serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|j| j.get("data").and_then(|d| d.as_array()).cloned())
-                {
-                    Some(data_json) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+                let openai_data = parsed
+                    .as_ref()
+                    .and_then(|j| j.get("data").and_then(|d| d.as_array()).cloned());
+                let systemone_models = parsed
+                    .as_ref()
+                    .and_then(|j| j.get("models").and_then(|m| m.as_array()).cloned());
+                match (openai_data, systemone_models) {
+                    (Some(data_json), _) => {
                         detected_type = detected_type.merge(BackendApiType::OpenAi);
                         good_endpoints.insert("/v1/models".to_string());
                         debug!("Backend {} confirmed OpenAI API via /v1/models", url);
@@ -292,10 +312,42 @@ pub async fn probe_backend(
                             }
                         }
                     }
-                    None => {
+                    // The System One envelope is *not* the OpenAI family:
+                    // tagging CLM/Kev as OpenAI would put them in rotation for
+                    // `/v1/chat/completions`, which they 404.
+                    (None, Some(models_json)) => {
+                        let names: Vec<String> = models_json
+                            .iter()
+                            .filter_map(|m| {
+                                m.get("name").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .collect();
+                        if names.is_empty() {
+                            // A `models` array without `name` fields is neither
+                            // envelope (LM Studio answers foreign endpoints
+                            // with a 200 + error object): remember the endpoint.
+                            bad_endpoints.insert("/v1/models".to_string());
+                            debug!(
+                                "Backend {} /v1/models has a 'models' array without 'name' fields (neither an OpenAI nor a System One endpoint). Body: {}",
+                                url,
+                                body.chars().take(200).collect::<String>()
+                            );
+                        } else {
+                            detected_type = detected_type.merge(ApiSet::SYSTEMONE);
+                            systemone_listed = true;
+                            good_endpoints.insert("/v1/models".to_string());
+                            debug!(
+                                "Backend {} confirmed System One API via /v1/models ({} model(s))",
+                                url,
+                                names.len()
+                            );
+                            models.extend(names);
+                        }
+                    }
+                    (None, None) => {
                         bad_endpoints.insert("/v1/models".to_string());
                         debug!(
-                            "Backend {} /v1/models has no 'data' array (not an OpenAI endpoint). Body: {}",
+                            "Backend {} /v1/models has no 'data' or 'models' array (not an OpenAI or System One endpoint). Body: {}",
                             url,
                             body.chars().take(200).collect::<String>()
                         );
@@ -355,6 +407,19 @@ pub async fn probe_backend(
             }
         }
     }
+
+    // A System One model listing is positive identification of a server that
+    // has no `/api/*` surface whatsoever, so the Ollama / OpenAI bits any other
+    // probe merged this round were false positives (a proxy answering 200 with
+    // a foreign body, a port that is really two servers, ...). Leaving them in
+    // would put the backend in rotation for `/api/chat` and
+    // `/v1/chat/completions`, which it can only reject. The `lmstudio` flag and
+    // the native model list are separate observations and stay untouched.
+    let detected_type = if systemone_listed {
+        detected_type.intersection(ApiSet::SYSTEMONE)
+    } else {
+        detected_type
+    };
 
     BackendProbe {
         is_online,
@@ -586,8 +651,16 @@ fn resident_ctx(b: &BackendStatus, name: &str) -> Option<u64> {
 }
 
 /// Does this backend expose a model load/unload API?
+///
+/// A *containment* test, deliberately not set equality: `api_type` is a bitset
+/// that probes merge, so a backend speaking Ollama's `/api/generate` keeps that
+/// load path no matter which other families are later observed on it (e.g.
+/// `Ollama|SystemOne`). Comparing the set for equality against `Ollama`/`Both`
+/// would silently take model control away from any backend that gained a
+/// second family. A SystemOne-only backend has no model-control API at all
+/// (load is implicit there), so it stays `false`.
 fn supports_control(b: &BackendStatus) -> bool {
-    b.lmstudio || matches!(b.api_type, BackendApiType::Ollama | BackendApiType::Both)
+    b.lmstudio || b.api_type.contains(ApiFamily::Ollama)
 }
 
 /// Resolve which backend indices a `appconf.yaml` entry targets: the listed
@@ -1855,6 +1928,157 @@ mod tests {
         let probe2 = probe_backend(&client, &url, None, &skip, PROBE_TIMEOUT).await;
         assert_eq!(extra_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(probe2.good_endpoints.contains("/api/tags"));
+    }
+
+    /// Mock for the `/v1/models` classification tests: answers
+    /// `GET /v1/models` with `v1_models`, `GET /api/tags` with `api_tags` when
+    /// one is given, and otherwise 404s — including every `/api/*` path, which
+    /// is exactly how the System One servers (CLM, Kev, Laya) behave, since they
+    /// implement no Ollama route at all.
+    async fn start_listing_mock(v1_models: Value, api_tags: Option<Value>) -> String {
+        let models_body = v1_models;
+        let tags_body = api_tags;
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let body = models_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/api/tags",
+                get(move || {
+                    let body = tags_body.clone();
+                    async move {
+                        match body {
+                            Some(v) => (StatusCode::OK, Json(v)).into_response(),
+                            None => (
+                                StatusCode::NOT_FOUND,
+                                Json(json!({ "detail": "Not Found" })),
+                            )
+                                .into_response(),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// How `clm-serve` and `kev.serve` answer `GET /v1/models` (captured live):
+    /// a `models`/`name` array, i.e. the System One envelope. It must be read
+    /// here at all, because `available_models` has one writer (`apply_probe`) and
+    /// a model name the probe misses is a name that 503s.
+    #[tokio::test]
+    async fn probe_classifies_system_one_model_listing() {
+        let url = start_listing_mock(
+            json!({"models": [
+                {"name": "clm-latest", "description": "decision model"},
+                {"name": "clm-raw"}
+            ]}),
+            None,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+
+        assert!(probe.is_online, "a listing answer means the backend is up");
+        assert_eq!(
+            probe.api_type,
+            ApiSet::SYSTEMONE,
+            "must be SystemOne only — neither ??? nor the OpenAI bit"
+        );
+        // The names reach `available_models` via the probe's model set, which is
+        // what makes `POST /v1/systemone {"model":"clm-latest"}` routable.
+        assert!(probe.available_models.contains("clm-latest"));
+        assert!(probe.available_models.contains("clm-raw"));
+        assert!(probe.good_endpoints.contains("/v1/models"));
+        // These servers have no model-control or native-list surface.
+        assert!(!probe.lmstudio);
+        assert!(probe.native_models.is_empty());
+        assert!(probe.loaded_models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_still_classifies_openai_model_listing() {
+        let url = start_listing_mock(
+            json!({"object": "list", "data": [{"id": "a"}]}),
+            None,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+
+        assert!(probe.is_online);
+        assert_eq!(probe.api_type, BackendApiType::OpenAi);
+        assert!(probe.available_models.contains("a"));
+    }
+
+    /// The two envelopes are mutually exclusive in practice; a body carrying
+    /// both is answered as OpenAI, and only `data` is read out of it.
+    #[tokio::test]
+    async fn probe_prefers_openai_shape_when_a_body_has_both() {
+        let url = start_listing_mock(
+            json!({
+                "data": [{"id": "a"}],
+                "models": [{"name": "not-an-openai-model"}]
+            }),
+            None,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+
+        assert_eq!(probe.api_type, BackendApiType::OpenAi);
+        assert!(probe.available_models.contains("a"));
+        assert!(
+            !probe.available_models.contains("not-an-openai-model"),
+            "the ignored shape must not contribute names"
+        );
+    }
+
+    /// A System One listing is positive identification, so a flavour bit merged
+    /// from another probe this round is a false tag: it would put the backend in
+    /// rotation for `/api/chat` / `/v1/chat/completions`, which it can only
+    /// reject. (A CLM answers `/api/tags` with 404, so today this cannot happen
+    /// — it is the guard against a front-end or port-swap making it happen.)
+    #[tokio::test]
+    async fn probe_suppresses_cross_family_tags_for_a_system_one_backend() {
+        let url = start_listing_mock(
+            json!({"models": [{"name": "clm-latest"}]}),
+            // An Ollama-shaped answer on top of the System One listing.
+            Some(json!({"models": [{"name": "llama3:latest"}]})),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+
+        assert_eq!(probe.api_type, ApiSet::SYSTEMONE, "no Ollama/OpenAI residue");
+        assert!(probe.available_models.contains("clm-latest"));
+    }
+
+    #[test]
+    fn supports_control_is_containment_not_set_equality() {
+        assert!(supports_control(&test_backend(BackendApiType::Ollama, false, &[], &[])));
+        assert!(supports_control(&test_backend(BackendApiType::Both, false, &[], &[])));
+        // The regression this guards: probing merged a second family into a
+        // backend that still has Ollama's `/api/generate` load path.
+        assert!(supports_control(&test_backend(
+            BackendApiType::OLLAMA.union(ApiSet::SYSTEMONE),
+            false,
+            &[],
+            &[]
+        )));
+        // System One alone has no model-control API — load is implicit there.
+        assert!(!supports_control(&test_backend(ApiSet::SYSTEMONE, false, &[], &[])));
+        assert!(!supports_control(&test_backend(BackendApiType::OpenAi, false, &[], &[])));
+        // LM Studio's native API is its own positive observation.
+        assert!(supports_control(&test_backend(ApiSet::SYSTEMONE, true, &[], &[])));
     }
 
     #[test]

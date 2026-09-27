@@ -1075,6 +1075,9 @@ impl TuiDashboard {
                     BackendApiType::Both => Style::default().fg(Color::Rgb(0, 255, 255)).bold(),
                     BackendApiType::Ollama => Style::default().fg(Color::Green),
                     BackendApiType::OpenAi => Style::default().fg(Color::Blue),
+                    // SystemOne and any mixed set (`ApiSet` is a bitset now, so
+                    // the named sets above can no longer be exhaustive).
+                    _ => Style::default().fg(Color::Magenta),
                 };
 
                 let req_style = if b.active_requests > 0 {
