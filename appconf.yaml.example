@@ -101,3 +101,61 @@ models:
     max_ctx: 130000
     backends:
       - 10.137.1.5:1234
+
+# --- Decision-model ("System One") backends: CLM / Laya / Kev ----------------
+# A third backend family next to Ollama and OpenAI/LM Studio: servers that
+# answer POST /v1/systemone with typed decisions instead of text. They
+# implement no /api/* route AT ALL, so the only route proxied to them is
+# /v1/systemone (passed through byte-for-byte); /api/chat and
+# /v1/chat/completions never reach them. /v1/rank and Kev's
+# /v1/systemone/permute|separate are not proxied. Auth on all three is
+# `Authorization: Bearer <key>` — exactly what `token:` already sends
+# (CLM_API_KEY / LAYA_API_KEY / KEV_API_KEY), so no new auth key exists.
+#
+# Things that bite here, all different from the Ollama/LM Studio sections:
+#   * Model control does not exist for this family: no load/unload, no
+#     keep_alive, no /api/ps. Residency is configured on the server itself
+#     (LAYA_PRELOAD, LAYA_MAX_LOADED, ...). A models: entry below therefore
+#     makes the name ROUTABLE and pins it — it starts no load and waits for no
+#     idle backend. /admin/models/load is refused for these backends.
+#   * CLM and Kev are auto-detected from GET /v1/models answering
+#     {"models":[{"name":…}]} and need nothing extra. Laya exposes no listing
+#     endpoint at all, so no probe can identify it — pin it with
+#     `kind: systemone` or every request naming a model 503s after
+#     stuck_timeout on an unclassified backend.
+#   * A name no probe can discover is unroutable unless declared in models:,
+#     and a models: entry WITHOUT a `backends:` selector is admitted on EVERY
+#     backend — so the selector below is required, not cosmetic.
+#   * laya-serve binds 0.0.0.0:8000 and clm-serve binds 0.0.0.0:8700 OPEN BY
+#     DEFAULT: anyone on the LAN can run inference. Bind them to loopback
+#     (e.g. LAYA_HOST=127.0.0.1) or set their API key. kev.serve binds
+#     127.0.0.1:8008 and is not exposed.
+#   * clm-serve needs a separate vLLM pooling encoder (default
+#     http://127.0.0.1:8090/v1/embeddings) and answers 502 while it is down —
+#     that is CLM replying, not the backend being offline.
+#
+# backends:
+#   - url: http://127.0.0.1:8700       # clm-serve — auto-detected: its
+#     token: "clm-key"                 #   GET /v1/models is models/name
+#   - url: http://127.0.0.1:8000       # laya-serve — nothing to probe, so the
+#     token: "laya-key"                #   family has to be pinned by hand
+#     kind: systemone
+#   - http://127.0.0.1:8008            # kev.serve — auto-detected, no key set
+#
+# models:
+#   # Laya checkpoints: not discoverable, so these entries are what make them
+#   # usable at all. Selector points at the Laya backend only.
+#   - name: "english"
+#     backends:
+#       - http://127.0.0.1:8000
+#   - name: "multilingual"
+#     backends:
+#       - http://127.0.0.1:8000
+#   - name: "typed-decisions"
+#     backends:
+#       - http://127.0.0.1:8000
+#   # Not needed for CLM/Kev — the probe discovers those names. Declaring one
+#   # anyway only makes sense to pin routing or to cap max_concurrent_requests.
+#   - name: "clm-latest"
+#     backends:
+#       - http://127.0.0.1:8700

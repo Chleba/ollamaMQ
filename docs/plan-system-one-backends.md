@@ -1,8 +1,10 @@
 # Plan: Support "System One" decision-model backends (Laya / CLM / Kev / Jev)
 
-Status: **proposal, not implemented**. Scope: attach decision-model servers **that the user runs
-locally, directly** — `laya-serve`, `clm-serve`, `kev.serve` — as ollamaMQ backends. Ollaya is
-explicitly **out of scope** (see §7).
+Status: **implemented through P1, P2a, P2b and P4 (docs)** — `8972bcc`, `a5bdd44`, `792cf88`
+and the docs commit. What was deliberately left out is listed in **§9 (Deferred, not
+forgotten)** — deferred, not forgotten. Scope: attach decision-model servers **that the user
+runs locally, directly** — `laya-serve`, `clm-serve`, `kev.serve` — as ollamaMQ backends.
+Ollaya is explicitly **out of scope** (see §7).
 
 All runtime facts below are read from the servers' **source code**, not their prose, on 2026-09-27:
 `NandhaKishorM/laya@main laya/serve.py`, `Contrastive-LM/CLM@main src/clm/server.py`,
@@ -124,6 +126,14 @@ and replace `detect_api_family(path)` with `families_for_route(method, path)`:
 | `/health` | **not a proxy route** | ollamaMQ already owns `/health` as its own liveness endpoint, registered outside the auth layer (`main.rs:380-383`). It is used **only** by the probe (3.2). A client's `GET /health` must keep answering "is ollamaMQ alive" and never reach a backend. |
 | `/api/*`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | unchanged | a SystemOne backend must never receive these |
 
+**Implemented in P1 (`8972bcc`), with one clarification.** The table is live except for the
+`/v1/decisions` alias and the CLM/Kev extra routes (dropped by decision §8.2, see §9):
+`families_for_route(method, path)` replaced the prefix rule, `/v1/systemone` is registered as a
+proxy route, and a test re-derives every registered route against the old rule so no pre-existing
+route changed family. The `/api/*` row is enforced in the strongest sense — a SystemOne backend is
+never even *asked* for `/api/tags` — yet its model **names** are still listed on that route by the
+proxy itself. That is decision (a) in §3.3, and it is deliberate.
+
 Keep `BackendApiType` as a bitset (`ApiSet(u8)`) rather than adding variants — `Ollama|OpenAi|Both`
 already exhausts the current lattice, and `apply_probe` (`control.rs:376-397`) replaces `api_type`
 wholesale each round anyway.
@@ -142,6 +152,10 @@ When SystemOne is detected, **suppress** the `/api/tags` → `Ollama` merge for 
 Also treat **404 as a family rejection** in `is_endpoint_rejection` when the backend was not
 positively detected for that family, so mis-tags self-correct.
 
+*Shipped: step 1 (`8972bcc`), step 2 and the suppression (`a5bdd44`); `/health` stayed
+probe-internal and out of the proxy route table, as required above. Deferred: step 3 (the
+inference-costing liveness probe) and the 404-as-rejection rule — §9.*
+
 **3.3 Listing aggregation must accept both envelopes — but answer in ONE.** For `/v1/models`, read
 `data`/`id` **or** `models`/`name`, normalise, dedup on name. **The response envelope must be
 route-determined, never first-answerer-determined**: `/v1/models` always answers in OpenAI's
@@ -149,6 +163,25 @@ route-determined, never first-answerer-determined**: `/v1/models` always answers
 `data`. Accepting `models`/`name` on the way in must not let a SystemOne backend ordered first
 re-key the merged list (this was a real regression introduced in P1 and caught in review).
 `/api/tags` keeps `models`/`name`.
+
+Two decisions were taken while implementing this and are now intentional, tested behaviour —
+**do not "fix" them**:
+
+- **(a) Decision-model names are surfaced in BOTH aggregated listing routes**, `GET /v1/models`
+  **and** `GET /api/tags`, even though only `POST /v1/systemone` can serve them. Deliberate:
+  ollamaMQ aggregates **one namespace** and routes by capability, so a listing advertises
+  everything the proxy can route to, and a request a backend cannot serve is **refused, not
+  misrouted**. A SystemOne backend is never contacted on `/api/tags` (`/api/*` must not reach it)
+  — the proxy contributes that backend's known names from `available_models`, appended after the
+  live entries and deduped through the existing seen set, so a live entry's
+  `size`/`digest`/`description` always wins whatever the backend order. Names for a backend that
+  cannot list anything are synthesised in the route's own envelope and sorted, so the listing does
+  not shuffle between runs (`792cf88`). Before that, a Laya-only deployment answered
+  `GET /v1/models` with Laya's own 404 and left `GET /api/tags` hanging until `stuck_timeout`.
+- **(b) `/v1/models` answers in OpenAI's `data`/`id` unconditionally**, whichever envelope the
+  backends actually replied in and whichever of them answered first. `models`/`name` is read on
+  input only and re-keyed on the way out, and the first answerer's foreign array key is dropped so
+  the reply is one envelope, not two. `/api/tags` symmetrically always answers `models`/`name`.
 
 **3.4 Model names must be admitted, and config alone does NOT do it.** ⚠️ **Corrected after P1.**
 The original text here claimed declaring models in `appconf.yaml` would make them routable. That is
@@ -202,6 +235,13 @@ precisely because Laya is hard to detect.
 backend should return a clear 400 ("backend has no model-control API; load is implicit") rather than
 the current generic unsupported message, since these servers preload via env vars, not HTTP.
 
+*The behaviour is right and the wording is not: `supports_control` is a containment test on the
+`Ollama` bit, so a SystemOne-only backend is refused while an `Ollama|SystemOne` backend keeps its
+load path. The clearer message is deferred (§9). What did land in this area is §3.4's mechanism: a
+`models:` entry makes a name **routable** on its selected backends — unioned into
+`available_models` by `apply_probe` through the existing load selector — which is what makes a
+listing-less Laya usable at all (`a5bdd44`).*
+
 **3.6 Not doing:** translating between Ollama/OpenAI and System One. Different semantics, not
 different encodings — a `/api/chat` request has no honest rendering into typed questions. Route
 away, as the codebase already does.
@@ -216,20 +256,64 @@ away, as the codebase already does.
 one `models`/`name` backend.
 *Done when:* `cargo test` green; no existing route's classification changed.
 
-**P2 — Probe discrimination.** SystemOne detection via `/v1/models` (`models`+`name`), `/health`
-fallback, suppression of the false `Ollama` merge, 404-as-rejection. Extend the mock routers
-(`control.rs:1719-1762`) with all three real shapes.
+> **DONE — `8972bcc`** (92 tests green). Also landed here: `/v1/systemone` registered as a proxy
+> route, `supports_control` switched to a containment test, and the startup readiness wait no
+> longer stalls on a decision-model-only setup. `BackendApiType` became an `ApiSet` bitset as
+> planned. `/v1/decisions`, `/v1/rank` and the Kev extras were dropped by decision §8.2 (§9).
+
+**P2a — Probe discrimination, family pin, declared names.** *(was "P2 — Probe discrimination";
+nits found in live testing split it in two)* SystemOne detection via `/v1/models`
+(`models`+`name`), `/health` fallback, suppression of the false `Ollama` merge, 404-as-rejection.
+Extend the mock routers (`control.rs:1719-1762`) with all three real shapes.
 *Done when:* three mocks — CLM (`/v1/models`+`/health`), Kev (`/v1/models` only), Laya (`/health`
 only) — are each detected online and SystemOne-only, and `/api/chat` is never routed to any of them.
+
+> **DONE — `a5bdd44`** (101 tests green), except 404-as-rejection (§9). Landed: the 2xx
+> `GET /health` fallback (any JSON body — Laya answers `{"status":"ok"}`, CLM `{"ok":true}`), the
+> per-backend `kind: systemone` pin that survives `apply_probe` replacing the detected set each
+> round, and `available_models` = **discovered ∪ declared**, admitted in `apply_probe` via the
+> existing selector so a name that cannot be discovered is still routed and still shows in
+> `/admin/models` and the TUI. The three real shapes exist as unit-test mocks in `control.rs`; the
+> e2e mocks still have no System One server (§9). Verified against a live `laya.serve` and a live
+> `clm-serve` in one pool: a decision naming `clm-latest` reached CLM, one naming `multilingual`
+> reached Laya.
+
+**P2b — Listings from backend state.** *(not in the original plan; found by running it)* A backend
+that does not implement a listing route contributed nothing to the merge, and when no backend
+answered, `aggregate_model_list` returned `None` and let the request fall through to that backend's
+own answer — so a Laya-only deployment served `GET /v1/models` → 404 and hung `GET /api/tags` until
+`stuck_timeout`, even though routing its models worked.
+*Done when:* both listing routes answer 200 with the known names on a listing-less backend, and a
+mixed pool lists every name once with the live backend's metadata intact.
+
+> **DONE — `792cf88`** (105 tests green). Backends that return no parseable listing contribute
+> their `available_models` as minimal entries in the route's own envelope, after the live entries,
+> and a 200 envelope is returned when nothing answered but names are known. Ollama / LM Studio /
+> OpenAI listings are provably unchanged: a backend incompatible with a route still contributes
+> nothing unless it is System One. Live: Laya-only returns 200 on both routes; a mixed CLM+Laya
+> pool listed `clm-latest`, `clm-raw` and `multilingual` once each with CLM's
+> `description`/`release_date` intact.
 
 **P3 — Extra routes + config.** `/v1/rank`, `/v1/systemone/permute`, `/v1/systemone/separate`,
 `/v1/decisions`; optional `kind: systemone`; explicit clear 400 on load/unload for this family.
 *Done when:* e2e asserts each extra route reaches only SystemOne backends.
 
+> **PARTIAL — `a5bdd44` shipped `kind: systemone`**, plus §3.4's declared-name unioning, which was
+> the part that actually unblocked Laya. The extra routes are excluded by decision §8.2 and the
+> clearer `/admin/models/load` message is deferred — both in §9.
+
 **P4 — Docs.** README "Supported Endpoints" (`README.md:89-111`) and model-control section
 (`README.md:127-136`), an `appconf.yaml.example` block like §3.4, and the explicit warning that
 **Laya and CLM bind `0.0.0.0` open by default** and that Laya's models must be declared by hand.
 *Done when:* README documents the family and the config example is copy-pasteable.
+
+> **DONE — docs commit** (this change; no code touched). README gained a `POST /v1/systemone` entry
+> in "Supported Endpoints", a "Decision-model backends (System One)" subsection (routes proxied,
+> detection and `kind: systemone`, declared-name routability, the aggregated-listing decision, the
+> loopback-bind warning, CLM's vLLM encoder dependency) and a System One bullet in the
+> model-control backend-support list. `appconf.yaml.example` gained the commented CLM/Laya/Kev
+> block with one comment per gotcha. Verified at this commit: `cargo test` 105 passed,
+> `tests/e2e/run.sh` 20 passed.
 
 First commit should be **P1 alone** — self-contained, cannot regress existing traffic.
 
@@ -293,3 +377,19 @@ First commit should be **P1 alone** — self-contained, cannot regress existing 
    only `/v1/systemone`? Dropping them shrinks P3 to almost nothing.
 4. Hosted Jev (`api.typesafe.ai`) — in or out? It is HTTPS, keyed, and its `/v1/models` is not a
    local model list; it likely wants `kind: systemone` forced rather than probed.
+
+---
+
+## 9. Deferred, not forgotten
+
+Everything below was specified above and then deliberately left unimplemented. None of it is a bug
+waiting to be rediscovered; each row is a scope decision with its reason.
+
+| Item | Specified in | Status and why |
+|---|---|---|
+| **404 as a family rejection** | §3.2, last line | Not implemented. `is_endpoint_rejection` still recognises only 405 and 200-with-error-JSON, so a mis-tagged backend is retried until `stuck_timeout` rather than reclassified. Deferred because P1+P2a remove the misrouting it would heal: `/v1/systemone` is looked up in the route table instead of prefix-guessed, and a `/v1/models` listing, a 2xx `/health` or a `kind:` pin classifies the backend positively. Loosening a *general* rejection predicate to "404 means wrong family" would also let a transient 404 teach the proxy something false — that deserves its own change, not a bolt-on. |
+| **FastAPI `{"detail":"Not Found"}` recognition** | §8.3 (`GET /api/tags` → 404 on a live CLM) | Not implemented. It is the JSON half of the same predicate above; they should land together. |
+| **Clear 400 on `/admin/models/load` for this family** | §3.5 | Not implemented — the generic unsupported-backend message is returned. Behaviour is already correct (SystemOne-only backends refuse control; `Ollama|SystemOne` keeps it), so this is wording only. |
+| **`/v1/rank`, `/v1/systemone/permute`, `/v1/systemone/separate`, `/v1/decisions`** | §3.1 rows, P3 | Not routed, per decision §8.2 (core routes only). Revisiting that decision means adding rows to §3.1's table plus pass-through tests; the family itself needs nothing else. |
+| **Optional authenticated `POST /v1/systemone` liveness probe** | §3.2 step 3 | Not implemented, and currently unnecessary: 2xx `/health` plus `kind: systemone` cover the only undetectable runtime (Laya). A probe that costs a forward pass every 10 s must not ship without the config gate §3.2 already demands. |
+| **e2e coverage of the family** | §5 | `tests/e2e/mock_backends.py` still ships only `OllamaMock` and `LMMock`; the 20 e2e checks never touch `/v1/systemone`. The three real route surfaces are covered as unit mocks in `control.rs`/`dispatcher.rs` and by the live `clm-serve` / `laya.serve` runs recorded in the P1/P2a/P2b commit messages. |

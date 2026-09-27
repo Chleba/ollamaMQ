@@ -96,7 +96,7 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 - `POST /api/chat`
 - `POST /api/embed`
 - `POST /api/embeddings`
-- `GET /api/tags` (answered by the proxy — merged from all Ollama-compatible backends)
+- `GET /api/tags` (answered by the proxy — merged from all Ollama-compatible backends; decision-model backends contribute their model *names*, never a live listing, since they implement no `/api/*` route)
 - `POST /api/show`
 - `POST /api/create`
 - `POST /api/copy`
@@ -109,8 +109,9 @@ Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-
 - `POST /v1/chat/completions` (OpenAI Compatible)
 - `POST /v1/completions` (OpenAI Compatible)
 - `POST /v1/embeddings` (OpenAI Compatible)
-- `GET /v1/models` (OpenAI Compatible — answered by the proxy, merged from all OpenAI-compatible backends)
+- `GET /v1/models` (OpenAI Compatible — answered by the proxy, merged from all backends that can list models, and always answered in OpenAI's `data`/`id` envelope regardless of which backend answered first)
 - `GET /v1/models/{model}` (OpenAI Compatible)
+- `POST /v1/systemone` (System One decision models — CLM, Laya, Kev; routed to those backends **only**)
 
 
 #### Example (cURL):
@@ -125,6 +126,24 @@ curl -X POST http://localhost:11435/api/chat \
   }'
 ```
 
+#### Decision-model backends (System One)
+
+A third backend family: "decision model" servers — `clm-serve` ([CLM](https://github.com/Contrastive-LM/CLM)), `laya-serve` ([Laya](https://github.com/NandhaKishorM/laya)), `kev.serve` ([Kev](https://github.com/jaredpalmer/kev)) — which answer `POST /v1/systemone` with typed decisions (`choice` / `score` / `noul`) instead of text. The body is passed through byte-for-byte (never parsed), and it goes **only** to backends of this family: these servers implement **no `/api/*` route at all**, so `/api/chat`, `/api/tags` and `/v1/chat/completions` are never sent to them, and they never answer a route their family cannot serve — such a request is refused, not misrouted. Only `/v1/systemone` is proxied; `/v1/rank` and Kev's `/v1/systemone/permute|separate` are not.
+
+- **Detection** — a backend answering `GET /v1/models` with `{"models":[{"name":…}]}` (CLM, Kev) is identified as System One; a 2xx `GET /health` marks a backend online when nothing else identifies it. Laya exposes no listing endpoint and therefore cannot be positively detected — pin it with `kind: systemone` on the backend entry. Auth on all three is `Authorization: Bearer <key>`, which is exactly what the existing `token:` key already sends (`CLM_API_KEY` / `LAYA_API_KEY` / `KEV_API_KEY`).
+- **Model names** — CLM and Kev are listed by the probe automatically. A Laya server has nothing to list, so its checkpoints must be declared under `models:`: there, a `models:` entry makes a name **routable**, not merely pinned, and a `models:` entry with no `backends:` selector is admitted on *every* backend — use an explicit selector as soon as you run more than one backend.
+- **Listings** — decision-model names appear in the aggregated `GET /v1/models` **and** `GET /api/tags` even though only `/v1/systemone` can serve them. That is deliberate: ollamaMQ aggregates one namespace and routes by capability. `/v1/models` always answers in OpenAI's `data`/`id`, `/api/tags` always in Ollama's `models`/`name`; names for a backend that cannot list anything are synthesised from proxy state and appended after the live entries, so real metadata (`size`, `digest`, `description`) always wins.
+- **Model control is not available** for this family — see [Model Control](#model-control-admin-api).
+- ⚠️ **`laya-serve` binds `0.0.0.0:8000` and `clm-serve` binds `0.0.0.0:8700` open by default** — anyone on the LAN can run inference against them. Bind them to loopback or set their API key. `kev.serve` binds `127.0.0.1:8008`.
+- `clm-serve` needs a separate vLLM pooling encoder (default `http://127.0.0.1:8090/v1/embeddings`) and answers `502` while that is down. That is CLM replying, not ollamaMQ declaring the backend dead.
+
+```bash
+curl -X POST http://localhost:11435/v1/systemone \
+  -H "X-User-ID: developer-1" \
+  -d '{"model": "clm-latest", "state": "billed twice, refund please or we cancel",
+       "questions": {"refund": {"type": "noul", "instructions": "Is a refund justified?"}}}'
+```
+
 ### Model Control (Admin API)
 
 Models can be loaded and unloaded on connected backends without touching the backend servers. Supported backends:
@@ -132,6 +151,7 @@ Models can be loaded and unloaded on connected backends without touching the bac
 - **Ollama** — no dedicated endpoint exists; loading is a `POST /api/generate` with an empty prompt (the scheduler loads the model and returns immediately), unloading is the same call with `keep_alive: 0`.
 - **LM Studio 0.3.6+** — the native `POST /api/v1/models/load` / `POST /api/v1/models/unload` endpoints (unload targets a specific loaded instance). Older LM Studio versions are detected and a friendly error points at the `lms load`/`lms unload` CLI.
 - Plain OpenAI backends (vLLM, etc.) have no control API and are rejected with a clear error.
+- **System One decision-model servers (CLM, Laya, Kev)** have no model-control API either — no load/unload, no `keep_alive`, not even `/api/ps`. Residency is configured on the server itself (e.g. `LAYA_PRELOAD`, `LAYA_MAX_LOADED`), so a `models:` entry for these backends only makes the name routable and pins it; it never starts a load.
 
 All three endpoints are served by the proxy itself (they are never proxied to a backend) and are protected by the same optional `OLLAMA_MQ_API_KEY` auth as the proxy routes.
 
@@ -271,6 +291,8 @@ backends:
   - http://10.137.1.1:11434      # plain URL — no auth
   - url: http://10.137.1.2:1234   # object form adds an optional API token,
     token: "some-api-key"         # sent as `Authorization: Bearer <token>`
+  - url: http://10.137.1.3:8000   # and can pin the API family for a backend
+    kind: systemone               # nothing can detect (a Laya-style server)
 
 # --- Runtime settings (all optional — defaults shown)
 settings:
@@ -315,6 +337,7 @@ models:
 - A backend won't accept a load while it is serving requests, so each entry **waits for that backend to go idle** (up to 5 minutes) before loading. Without this, restarting the proxy under live traffic meant every configured model was refused on the spot and never retried — leaving models unloaded, or loaded with the wrong `max_ctx`.
 - Explicit CLI flags override file values when given (e.g. `--backend-urls` over `backends`, `--port`/`--host`/`--timeout` over `settings`).
 - A non-empty `models[].backends` list also **pins routing**: requests for that model are only sent to the listed backends (case-insensitive substring URL match, the same rule as load targeting) and never to other suitable ones. If none of the pinned backends is online/eligible, the request fails with HTTP 503 after `stuck_timeout` (error: `no configured backend available for model '<model>'`) instead of being routed elsewhere. If `backends` is empty/omitted, or the model is not in the config at all, the existing behavior applies — any online backend that lists the model may serve it.
+- A `models:` entry does two things: it **loads** the model where the backend supports control, and it makes the name **routable** on the selected backends even where nothing can list it. The second half is the only way to reach a decision-model server with no listing endpoint (Laya), and it applies to backends without model control as well — for them the entry names and pins, it does not load.
 
 See [`appconf.yaml.example`](appconf.yaml.example) for a fully commented template.
 
