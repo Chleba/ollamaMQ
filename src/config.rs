@@ -102,10 +102,21 @@ pub struct Backend {
     /// is never overridden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Pin this backend's API family instead of waiting for the health probe to
+    /// classify it. `systemone` is the only meaningful value today: Laya-style
+    /// decision-model servers expose no model-listing endpoint at all, so no
+    /// probe can positively identify them, and an unclassified family makes
+    /// every request to that backend unroutable. A pinned family is fixed for
+    /// the process lifetime — probes never talk it out of existence.
+    ///
+    /// Absent, empty or unrecognised = classify from probes (the behaviour
+    /// every existing config relies on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// YAML shape of one `backends:` entry: either a bare URL string or an object
-/// with `url` and optional `token`. Both forms are accepted so existing
+/// with `url` and optional `token`/`kind`. Both forms are accepted so existing
 /// configs keep working unchanged.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -122,7 +133,11 @@ where
     Ok(specs
         .into_iter()
         .map(|spec| match spec {
-            BackendEntrySpec::Url(url) => Backend { url, token: None },
+            BackendEntrySpec::Url(url) => Backend {
+                url,
+                token: None,
+                kind: None,
+            },
             BackendEntrySpec::Full(b) => b,
         })
         .collect())
@@ -277,6 +292,36 @@ backends:
         // Object without a token is valid too.
         assert_eq!(cfg.backends[2].url, "http://10.137.1.5:1234");
         assert_eq!(cfg.backends[2].token, None);
+    }
+
+    /// `kind:` pins a backend's API family — needed because Laya answers no
+    /// endpoint that identifies it. Bare-string entries and object entries
+    /// without the key keep parsing exactly as before, and an unrecognised
+    /// value parses (the caller ignores it) rather than rejecting the file.
+    #[test]
+    fn parse_backend_kind_key() {
+        let yaml = r#"
+backends:
+  - http://127.0.0.1:11434
+  - url: http://127.0.0.1:8772
+    kind: systemone
+  - url: http://127.0.0.1:8700
+    kind: "who-knows"
+"#;
+        let tmp = std::env::temp_dir().join("ollamamq_test_kind.yaml");
+        std::fs::write(&tmp, yaml).unwrap();
+        let cfg = load_config(tmp.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.backends.len(), 3);
+        // Bare string and object-without-kind: unchanged behaviour.
+        assert_eq!(cfg.backends[0].kind, None);
+        assert_eq!(cfg.backends[2].kind.as_deref(), Some("who-knows"));
+        assert_eq!(cfg.backends[1].kind.as_deref(), Some("systemone"));
+        // The key is only serialised when set, so configs round-trip unchanged.
+        assert!(
+            !serde_yaml::to_string(&cfg.backends[0])
+                .unwrap()
+                .contains("kind")
+        );
     }
 
     #[test]

@@ -211,20 +211,30 @@ async fn main() {
     // Request bodies are buffered whole (a queued request may wait before a
     // backend takes it), so the body limit is a per-request memory commitment.
     // It used to be a flat 1 GiB on every route.
-    let max_body_bytes = file_cfg
-        .settings
-        .max_body_bytes
-        .unwrap_or(64 * 1024 * 1024);
+    let max_body_bytes = file_cfg.settings.max_body_bytes.unwrap_or(64 * 1024 * 1024);
     let max_queued_bytes = file_cfg
         .settings
         .max_queued_bytes
         .unwrap_or(512 * 1024 * 1024);
-    let allow_all_routes = args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
+    let allow_all_routes =
+        args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
+
+    // `kind:` per backend, in config order, collected before `file_cfg.backends`
+    // is consumed below. Only the config file can carry one: `--backend-urls`
+    // takes bare URLs, so those backends stay probe-classified (an empty slice
+    // pins nothing).
+    let backend_kinds: Vec<Option<String>> = if args.backend_urls.is_some() {
+        Vec::new()
+    } else {
+        file_cfg.backends.iter().map(|b| b.kind.clone()).collect()
+    };
 
     // (url, optional auth token) per backend. The CLI --backend-urls always
     // wins; tokens only come from appconf.yaml.
     let backends: Vec<(String, Option<String>)> = if let Some(urls) = args.backend_urls {
-        urls.into_iter().map(|u| (normalize_backend_url(u), None)).collect()
+        urls.into_iter()
+            .map(|u| (normalize_backend_url(u), None))
+            .collect()
     } else if file_cfg.backends.is_empty() {
         vec![(
             normalize_backend_url("http://localhost:11434".to_string()),
@@ -268,18 +278,20 @@ async fn main() {
     // Start the size-rotated request log; fall back to a no-op logger when
     // the path is unwritable. The writer task handle is kept alive for the
     // process lifetime (same pattern as `_guard` above).
-    let (reqlog, _reqlog_guard) =
-        match crate::reqlog::RequestLogger::start(
-            request_log_path,
-            request_log_max_bytes,
-            request_log_max_files,
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::error!("request log disabled: {e}");
-                (crate::reqlog::RequestLogger::disabled(), tokio::task::spawn(async {}))
-            }
-        };
+    let (reqlog, _reqlog_guard) = match crate::reqlog::RequestLogger::start(
+        request_log_path,
+        request_log_max_bytes,
+        request_log_max_files,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!("request log disabled: {e}");
+            (
+                crate::reqlog::RequestLogger::disabled(),
+                tokio::task::spawn(async {}),
+            )
+        }
+    };
 
     let state = Arc::new(AppState::new(
         backends,
@@ -293,6 +305,12 @@ async fn main() {
         log_content_limit,
         max_queued_bytes,
     ));
+
+    // Pin the `kind:`-configured API families now, BEFORE the health loop
+    // starts: a Laya-style backend answers nothing that identifies it, so a
+    // probe round running first would classify it `???` and leave it there for
+    // a whole tick.
+    state.apply_backend_kinds(&backend_kinds);
 
     let worker_state = state.clone();
     tokio::spawn(async move {
@@ -355,8 +373,9 @@ async fn main() {
         // sits inside the router-wide one below, so this value wins here.
         .route(
             "/api/blobs/{digest}",
-            any(proxy_handler)
-                .layer(axum::extract::DefaultBodyLimit::max(dispatcher::BLOB_BODY_LIMIT)),
+            any(proxy_handler).layer(axum::extract::DefaultBodyLimit::max(
+                dispatcher::BLOB_BODY_LIMIT,
+            )),
         )
         .route("/api/ps", any(proxy_handler))
         .route("/api/version", any(proxy_handler))

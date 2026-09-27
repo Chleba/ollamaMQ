@@ -171,6 +171,28 @@ impl ApiSet {
     pub const fn display(self) -> &'static str {
         Self::NAMES[(self.0 & 0b0111) as usize]
     }
+
+    /// The family pinned by a backend's `kind:` config key (see
+    /// [`crate::config::Backend::kind`]). Case/separator insensitive
+    /// (`systemone`, `SystemOne`, `system-one` all pin the same family).
+    ///
+    /// `None` for absent AND for unrecognised values: a key this build doesn't
+    /// know must leave the backend to probe classification like any other,
+    /// not disable it. Spelling is matched leniently on purpose — a typo here
+    /// is invisible in the config file, so an unknown value is logged by the
+    /// caller rather than silently pinned to something else.
+    pub fn from_kind(kind: Option<&str>) -> Option<ApiSet> {
+        let normalised: String = kind?
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_' | ' '))
+            .collect();
+        match normalised.as_str() {
+            "systemone" => Some(ApiSet::SYSTEMONE),
+            _ => None,
+        }
+    }
 }
 
 /// Old variant spellings of the enum this replaced, so the probe / model-control
@@ -425,7 +447,9 @@ fn attach_backend_token(headers: &mut HeaderMap, token: Option<&str>) {
         Some(t)
             if !headers.contains_key(axum::http::header::AUTHORIZATION)
                 && !headers.contains_key("x-api-key") =>
-            t,
+        {
+            t
+        }
         _ => return,
     };
     if let Ok(v) = format!("Bearer {}", t).parse() {
@@ -506,6 +530,23 @@ pub struct BackendStatus {
     /// Consecutive endpoint-rejection responses per API family; at 2 the
     /// family moves into `rejected_families`. Cleared on any success.
     pub family_fail_counts: HashMap<ApiFamily, u8>,
+    /// API family pinned by this backend's `kind:` config key, empty when the
+    /// family is to be learned from probes (see [`crate::config::Backend::kind`]).
+    /// Configuration, not an observation: `apply_probe` keeps this value instead
+    /// of the probe's, because a Laya-style backend answers nothing that
+    /// identifies it and would otherwise be classified `???` forever.
+    pub forced_api: ApiSet,
+    /// Model names declared for this backend in `appconf.yaml` `models:`,
+    /// resolved with the same selector that decides where models get loaded
+    /// (`control::config_targets`). Admitted into `available_models` by
+    /// `apply_probe` alongside whatever the probe discovered, because a name the
+    /// operator wrote down is a name they will send requests for — and
+    /// `model_routable` rejects any backend that does not list it.
+    ///
+    /// Only meaningful for backends that cannot list their own models (Laya has
+    /// no listing endpoint); for backends that can, the union is a no-op in
+    /// practice because the declared names are also the discovered ones.
+    pub declared_models: Vec<String>,
 }
 
 pub struct AppState {
@@ -615,7 +656,10 @@ pub struct FairShare {
 
 impl FairShare {
     fn new(now: std::time::Instant) -> Self {
-        Self { score: 0.0, updated: now }
+        Self {
+            score: 0.0,
+            updated: now,
+        }
     }
 
     /// The score as of `now`, after decay. Cheap and side-effect free.
@@ -681,9 +725,17 @@ impl AppState {
         max_queued_bytes: u64,
     ) -> Self {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
+        // Which declared `models:` entries belong to which backend, resolved
+        // once here with the same selector the loader uses. The names are not
+        // put into `available_models` here: `apply_probe` stays the single
+        // admission rule (see `BackendStatus::declared_models`), and the health
+        // loop's first round runs immediately at startup.
+        let urls: Vec<String> = backends.iter().map(|(u, _)| u.clone()).collect();
+        let declared = crate::control::declared_models_for(&urls, &model_config);
         let backends = backends
             .into_iter()
-            .map(|(url, token)| BackendStatus {
+            .enumerate()
+            .map(|(i, (url, token))| BackendStatus {
                 url,
                 token,
                 active_requests: 0,
@@ -701,6 +753,8 @@ impl AppState {
                 known_bad_endpoints: HashSet::new(),
                 rejected_families: HashSet::new(),
                 family_fail_counts: HashMap::new(),
+                forced_api: ApiSet::EMPTY,
+                declared_models: declared.get(i).cloned().unwrap_or_default(),
             })
             .collect();
 
@@ -740,6 +794,37 @@ impl AppState {
             log_content_limit,
             max_queued_bytes,
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Pin the API family of backends whose `appconf.yaml` entry carried a
+    /// `kind:` (`[(url, token)]` order is the config order — the caller passes
+    /// one entry per backend, in the same order, empty when the backends came
+    /// from `--backend-urls`). An empty/unknown `kind:` leaves that backend to
+    /// probe classification.
+    ///
+    /// Must run BEFORE the health loop starts: the pin is what makes an
+    /// undetectable backend routable from the first probe round, and applying it
+    /// later would let a round classify it as `???` in between.
+    pub fn apply_backend_kinds(&self, kinds: &[Option<String>]) {
+        let mut backends = self.backends.lock_or_recover();
+        for (b, kind) in backends.iter_mut().zip(kinds) {
+            let Some(pinned) = ApiSet::from_kind(kind.as_deref()) else {
+                if let Some(k) = kind.as_deref().filter(|k| !k.trim().is_empty()) {
+                    warn!(
+                        "Backend {} has unknown kind '{}' — classifying it from probes instead",
+                        b.url, k
+                    );
+                }
+                continue;
+            };
+            b.forced_api = pinned;
+            b.api_type = pinned;
+            info!(
+                "Backend {} kind pinned to {} (probes will not override it)",
+                b.url,
+                pinned.display()
+            );
         }
     }
 
@@ -852,10 +937,7 @@ fn normalize_model_id(id: &str) -> String {
 /// If a model config entry pins `requested` (by normalized name or identifier)
 /// to a non-empty backend list, return that list. First matching entry wins
 /// (config file order). Returns None when the model is not pinned.
-fn model_pin_for(
-    requested: &str,
-    configs: &[crate::config::ModelConfig],
-) -> Option<Vec<String>> {
+fn model_pin_for(requested: &str, configs: &[crate::config::ModelConfig]) -> Option<Vec<String>> {
     let requested_norm = normalize_model_id(requested);
     configs
         .iter()
@@ -1065,12 +1147,7 @@ fn is_endpoint_rejection(status: StatusCode, body_prefix: &str) -> bool {
 /// Record a traffic observation for one backend + API family. Two consecutive
 /// endpoint rejections mark the family as rejected (the scheduler then excludes
 /// this backend for that family); any non-rejection response clears the memory.
-fn apply_family_learning(
-    state: &AppState,
-    backend_idx: usize,
-    route: ApiSet,
-    rejected: bool,
-) {
+fn apply_family_learning(state: &AppState, backend_idx: usize, route: ApiSet, rejected: bool) {
     let mut backends = state.backends.lock_or_recover();
     let Some(b) = backends.get_mut(backend_idx) else {
         return;
@@ -1152,9 +1229,7 @@ fn prune_idle_users(state: &AppState, retention: std::time::Duration) {
     let mut remove: Vec<String> = idle
         .iter()
         .enumerate()
-        .filter(|(i, (_, seen))| {
-            *i < over_cap || now.saturating_duration_since(*seen) > retention
-        })
+        .filter(|(i, (_, seen))| *i < over_cap || now.saturating_duration_since(*seen) > retention)
         .map(|(_, (user, _))| user.clone())
         .collect();
     if remove.is_empty() {
@@ -1265,14 +1340,21 @@ async fn health_check_round(
             .cloned()
             .collect();
 
-        let changed = b.is_online != probe.is_online
-            || b.api_type != probe.api_type
-            || *b.available_models != probe.available_models
-            || *b.loaded_models != probe.loaded_models;
-
+        // What the round actually CHANGED: compare the merged state with the
+        // state it replaced, not with the raw probe. `apply_probe` unions
+        // declared model names into `available_models` and keeps a `kind:`-pinned
+        // family, neither of which ever equals the probe's own values, so a
+        // state-vs-probe comparison would flag a change on every single round
+        // and wake the dispatcher every 10 s for nothing.
         let was_api_type = b.api_type;
         let now_online = probe.is_online;
+        let prev_available = b.available_models.clone();
+        let prev_loaded = b.loaded_models.clone();
         crate::control::apply_probe(b, probe);
+        let changed = b.is_online != now_online
+            || b.api_type != was_api_type
+            || b.available_models != prev_available
+            || b.loaded_models != prev_loaded;
 
         if !was_online && now_online {
             info!("Backend {} status changed to: ONLINE", url);
@@ -1433,14 +1515,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<(
-                    String,
-                    Task,
-                    usize,
-                    String,
-                    Option<String>,
-                    bool,
-                )> = None;
+                let mut selection: Option<(String, Task, usize, String, Option<String>, bool)> =
+                    None;
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
@@ -1842,11 +1918,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     if is_blocked || task.responder.is_closed() {
                         let mut dropped = state_clone.dropped_counts.lock_or_recover();
                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
-                        log_out(
-                            "dropped (blocked)".into(),
-                            Some(backend_url.clone()),
-                            None,
-                        );
+                        log_out("dropped (blocked)".into(), Some(backend_url.clone()), None);
                     } else {
                         {
                             let mut processing = state_clone.processing_counts.lock_or_recover();
@@ -1909,13 +1981,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 }
                                                 let n = chunk.len();
                                                 total_bytes += n as u64;
-                                                if content_acc.len() < state_clone.log_content_limit {
-                                                    let room =
-                                                        state_clone.log_content_limit
-                                                            - content_acc.len();
-                                                    content_acc.extend_from_slice(
-                                                        &chunk[..n.min(room)],
-                                                    );
+                                                if content_acc.len() < state_clone.log_content_limit
+                                                {
+                                                    let room = state_clone.log_content_limit
+                                                        - content_acc.len();
+                                                    content_acc
+                                                        .extend_from_slice(&chunk[..n.min(room)]);
                                                 }
                                                 if task
                                                     .responder
@@ -1949,12 +2020,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             state_clone.processed_counts.lock_or_recover();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
                                         drop(counts);
-                                        let content_str = Arc::new(
-                                            crate::reqlog::truncate_utf8(
-                                                &content_acc,
-                                                state_clone.log_content_limit,
-                                            ),
-                                        );
+                                        let content_str = Arc::new(crate::reqlog::truncate_utf8(
+                                            &content_acc,
+                                            state_clone.log_content_limit,
+                                        ));
                                         state_clone.reqlog.log(crate::reqlog::ReqRecord {
                                             ts: crate::reqlog::now_unix_millis(),
                                             dir: "OUT",
@@ -2446,6 +2515,8 @@ mod tests {
             known_bad_endpoints: HashSet::new(),
             rejected_families: rejected.iter().copied().collect(),
             family_fail_counts: HashMap::new(),
+            forced_api: BackendApiType::EMPTY,
+            declared_models: Vec::new(),
         }
     }
 
@@ -2606,6 +2677,34 @@ mod tests {
         assert_eq!(ApiSet::EMPTY.display(), "???");
         assert_eq!(format!("{:?}", ApiSet::BOTH), "O+OA");
         assert_eq!(format!("{:?}", everything), "O+OA+SO");
+    }
+
+    /// The `kind:` config key resolves leniently (a typo in a config file is
+    /// invisible) but never guesses: anything that is not a known family name —
+    /// including an empty value — pins nothing, leaving the backend to probe
+    /// classification.
+    #[test]
+    fn api_set_from_kind() {
+        assert_eq!(
+            ApiSet::from_kind(Some("systemone")),
+            Some(ApiSet::SYSTEMONE)
+        );
+        assert_eq!(
+            ApiSet::from_kind(Some("SystemOne")),
+            Some(ApiSet::SYSTEMONE)
+        );
+        assert_eq!(
+            ApiSet::from_kind(Some(" system-one ")),
+            Some(ApiSet::SYSTEMONE)
+        );
+        assert_eq!(
+            ApiSet::from_kind(Some("SYSTEM_ONE")),
+            Some(ApiSet::SYSTEMONE)
+        );
+        assert_eq!(ApiSet::from_kind(Some("ollama")), None);
+        assert_eq!(ApiSet::from_kind(Some("")), None);
+        assert_eq!(ApiSet::from_kind(Some("   ")), None);
+        assert_eq!(ApiSet::from_kind(None), None);
     }
 
     /// The prefix rule that decided routing before the System One family
@@ -2986,19 +3085,14 @@ mod tests {
     /// request and answers 200. `/api/tags` returns an Ollama-style listing
     /// so the health probes keep `llama3` available on it.
     #[allow(clippy::type_complexity)]
-    async fn spawn_recording_backend() -> (
-        String,
-        Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
-    ) {
+    async fn spawn_recording_backend()
+    -> (String, Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>) {
         let calls: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind recording backend");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("mock local addr")
-        );
+        let url = format!("http://{}", listener.local_addr().expect("mock local addr"));
         let c = calls.clone();
         tokio::spawn(async move {
             let app = axum::Router::new().route(
@@ -3739,13 +3833,28 @@ mod tests {
         {
             let mut scores = state.fair_share.lock_or_recover();
             // Seen a while back, nothing queued → prunable.
-            scores.insert("stale".into(), FairShare { score: 0.0, updated: a_while_ago });
+            scores.insert(
+                "stale".into(),
+                FairShare {
+                    score: 0.0,
+                    updated: a_while_ago,
+                },
+            );
             // Seen just now → kept regardless.
             scores.insert("recent".into(), FairShare::new(now));
             // Seen a while back, but still has a request waiting → kept.
-            scores.insert("waiting".into(), FairShare { score: 0.0, updated: a_while_ago });
+            scores.insert(
+                "waiting".into(),
+                FairShare {
+                    score: 0.0,
+                    updated: a_while_ago,
+                },
+            );
         }
-        state.processed_counts.lock_or_recover().insert("stale".into(), 7);
+        state
+            .processed_counts
+            .lock_or_recover()
+            .insert("stale".into(), 7);
         state
             .user_ips
             .lock_or_recover()
@@ -3927,11 +4036,8 @@ mod tests {
     #[tokio::test]
     async fn model_listing_skips_incompatible_and_offline_backends() {
         let (url_a, mock_a) = spawn_mock_backend(QWEN_V1_MODELS, None).await;
-        let (url_b, mock_b) = spawn_mock_backend(
-            r#"{"object":"list","data":[{"id":"never-listed"}]}"#,
-            None,
-        )
-        .await;
+        let (url_b, mock_b) =
+            spawn_mock_backend(r#"{"object":"list","data":[{"id":"never-listed"}]}"#, None).await;
         let state = new_test_state(vec![url_a, url_b]);
         {
             let mut backends = state.backends.lock_or_recover();
@@ -4153,10 +4259,7 @@ mod tests {
     /// Enqueue one `POST /v1/chat/completions` request for `model` under user
     /// "tester" (same shape as enqueue_qwen_request). Returns the receiver —
     /// keep it alive for the test's duration.
-    fn enqueue_chat_request(
-        state: &Arc<AppState>,
-        model: &str,
-    ) -> mpsc::Receiver<ResponsePart> {
+    fn enqueue_chat_request(state: &Arc<AppState>, model: &str) -> mpsc::Receiver<ResponsePart> {
         let (tx, rx) = mpsc::channel(32);
         state
             .queues
@@ -4180,15 +4283,24 @@ mod tests {
 
     /// Append a model entry to the test state's model config (the pin under
     /// test). `backends` empty = the entry does NOT pin.
-    fn pin_model(state: &Arc<AppState>, name: &str, identifier: Option<&str>, backends: Vec<String>) {
-        state.model_config.lock().unwrap().push(crate::config::ModelConfig {
-            name: name.to_string(),
-            identifier: identifier.map(|s| s.to_string()),
-            max_ctx: None,
-            keep_alive: None,
-            max_concurrent_requests: 1,
-            backends,
-        });
+    fn pin_model(
+        state: &Arc<AppState>,
+        name: &str,
+        identifier: Option<&str>,
+        backends: Vec<String>,
+    ) {
+        state
+            .model_config
+            .lock()
+            .unwrap()
+            .push(crate::config::ModelConfig {
+                name: name.to_string(),
+                identifier: identifier.map(|s| s.to_string()),
+                max_ctx: None,
+                keep_alive: None,
+                max_concurrent_requests: 1,
+                backends,
+            });
     }
 
     /// Two-backend test AppState with a per-backend cap high enough that a

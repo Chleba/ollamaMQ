@@ -17,6 +17,7 @@
 use crate::dispatcher::{
     ApiFamily, ApiSet, AppState, BackendApiType, BackendStatus, LmModelInfo, smart_model_match_one,
 };
+use crate::lock::LockExt;
 use axum::{
     Json,
     extract::State,
@@ -24,7 +25,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use crate::lock::LockExt;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -285,9 +285,10 @@ pub async fn probe_backend(
     // expects and the OpenAI tag is the more specific claim.
     //
     // Reading the System One shape here is also what makes those model names
-    // *routable*: `available_models` has exactly one writer (`apply_probe`), so
-    // a name the probe does not collect is a name every request naming it gets
-    // a 503 for (`model_routable` rejects the backend until `stuck_timeout`).
+    // *routable*: `available_models` has exactly one writer (`apply_probe`) and
+    // its inputs are this probe plus the names declared in appconf.yaml, so a
+    // name NEITHER supplies is a name every request naming it gets a 503 for
+    // (`model_routable` rejects the backend until `stuck_timeout`).
     if !skip.contains("/v1/models") {
         let check_url = format!("{}/v1/models", url);
         match authed(client.get(&check_url).timeout(timeout)).send().await {
@@ -372,21 +373,57 @@ pub async fn probe_backend(
     // (loaded_instances non-empty). LM-Studio-specific endpoint; Ollama and
     // generic OpenAI servers 404 it. The outcome is remembered so we stop
     // re-probing backends that don't have the endpoint.
-        if !skip.contains("/api/v1/models") {
-            match probe_lmstudio_native(client, url, token, timeout).await {
-                NativeProbeOutcome::Found(ls_loaded, ls_native, ls_ctx) => {
-                    lmstudio = true;
-                    native_models = ls_native;
-                    loaded.extend(ls_loaded);
-                    for (k, v) in ls_ctx {
-                        loaded_ctx.insert(k, v);
-                    }
-                    good_endpoints.insert("/api/v1/models".to_string());
+    if !skip.contains("/api/v1/models") {
+        match probe_lmstudio_native(client, url, token, timeout).await {
+            NativeProbeOutcome::Found(ls_loaded, ls_native, ls_ctx) => {
+                lmstudio = true;
+                native_models = ls_native;
+                loaded.extend(ls_loaded);
+                for (k, v) in ls_ctx {
+                    loaded_ctx.insert(k, v);
                 }
+                good_endpoints.insert("/api/v1/models".to_string());
+            }
             NativeProbeOutcome::Rejected => {
                 bad_endpoints.insert("/api/v1/models".to_string());
             }
             NativeProbeOutcome::Unknown => {}
+        }
+    }
+
+    // Last thing that can establish LIVENESS: a server with no model-listing
+    // endpoint at all. `laya.serve` is exactly that — it answers `/health` and
+    // `/v1/systemone` and 404s `/api/tags`, `/v1/models` and even `/` — so
+    // without this round it was recorded offline and never received the
+    // requests it does serve.
+    //
+    // Liveness ONLY: the body is never inspected for family clues. `/health` is
+    // a generic convention, so Laya's `{"status":"ok",...}` and CLM's
+    // `{"ok":true,...}` prove the same thing and say nothing about which API to
+    // route; a backend whose family matters but cannot be detected by a real
+    // endpoint is pinned with `kind:` in appconf.yaml (see
+    // `crate::config::Backend::kind`).
+    //
+    // Probe-internal on purpose: `/health` is NOT added to the proxy route
+    // table, and ollamaMQ answers its own `/health` locally (main.rs).
+    if !is_online && !skip.contains("/health") {
+        let check_url = format!("{}/health", url);
+        match authed(client.get(&check_url).timeout(timeout)).send().await {
+            Ok(res) if res.status().is_success() => {
+                is_online = true;
+                good_endpoints.insert("/health".to_string());
+                debug!(
+                    "Backend {} is online via /health (no endpoint identified its API family)",
+                    url
+                );
+            }
+            Ok(res) => {
+                bad_endpoints.insert("/health".to_string());
+                debug!("Backend {} /health returned status: {}", url, res.status());
+            }
+            Err(e) => {
+                debug!("Backend {} /health error: {}", url, e);
+            }
         }
     }
 
@@ -438,10 +475,29 @@ pub async fn probe_backend(
 /// endpoints that answered successfully clear their "bad" flag; rejected ones
 /// are remembered so future probes skip them. Shared by the periodic health
 /// loop and the one-shot re-probes after control ops / config apply.
+///
+/// This is the single admission rule for `available_models`, and it has TWO
+/// inputs: what the probe discovered, plus what the operator declared for this
+/// backend in `appconf.yaml` (`BackendStatus::declared_models`). The result is
+/// their UNION — a name the probe cannot discover (Laya has no listing
+/// endpoint) is still a name clients will send, and `model_routable` rejects
+/// any backend that does not list it; conversely a declared entry never
+/// removes a discovered one, so a backend's real listing always stays
+/// authoritative for what it actually serves.
+///
+/// `api_type` follows the same "configuration outranks observation" rule: a
+/// family pinned with `kind:` is re-asserted every round instead of being
+/// overwritten by a probe that cannot see it.
 pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
     b.is_online = probe.is_online;
-    b.api_type = probe.api_type;
-    b.available_models = Arc::new(probe.available_models);
+    if b.forced_api.is_empty() {
+        b.api_type = probe.api_type;
+    } else {
+        b.api_type = b.forced_api;
+    }
+    let mut available = probe.available_models;
+    available.extend(b.declared_models.iter().cloned());
+    b.available_models = Arc::new(available);
     b.loaded_models = Arc::new(probe.loaded_models);
     // Loaded state is only KNOWN when the latest probe actually got data from
     // a loaded-models endpoint; otherwise "available" implies "ready".
@@ -463,11 +519,7 @@ pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
 /// from "couldn't tell" (connection error / unparseable — remember nothing).
 enum NativeProbeOutcome {
     /// Endpoint exists; `(loaded_names, native_model_list, loaded_ctx)`.
-    Found(
-        HashSet<String>,
-        Vec<LmModelInfo>,
-        HashMap<String, u64>,
-    ),
+    Found(HashSet<String>, Vec<LmModelInfo>, HashMap<String, u64>),
     /// Backend answered with an HTTP error — the endpoint doesn't exist here.
     Rejected,
     /// Connection-level failure or unparseable body — say nothing.
@@ -540,9 +592,11 @@ async fn probe_lmstudio_native(
             }
             // First loaded instance's actual context window (all instances of
             // a key share the load config in practice).
-            let ctx = instances
-                .iter()
-                .find_map(|i| i.get("config").and_then(|c| c.get("context_length")).and_then(|v| v.as_u64()));
+            let ctx = instances.iter().find_map(|i| {
+                i.get("config")
+                    .and_then(|c| c.get("context_length"))
+                    .and_then(|v| v.as_u64())
+            });
             if let Some(ctx) = ctx {
                 let ctx_key = if key.is_empty() {
                     instance_ids[0].clone()
@@ -667,9 +721,23 @@ fn supports_control(b: &BackendStatus) -> bool {
 /// backend URLs (exact or substring match against configured backends), or
 /// every backend when the list is empty ("any suitable").
 fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usize> {
-    let backends = state.backends.lock_or_recover();
+    let urls: Vec<String> = state
+        .backends
+        .lock_or_recover()
+        .iter()
+        .map(|b| b.url.clone())
+        .collect();
+    config_target_indices(&urls, cfg)
+}
+
+/// `config_targets` on a bare URL list, so the selection can also be resolved
+/// while the backend state is still being built (`AppState::new`, where the
+/// declared model names per backend are derived). Kept separate from the
+/// `AppState` entry point rather than duplicating the matching rules: load
+/// targeting, request pinning and the declared-name set must agree.
+fn config_target_indices(urls: &[String], cfg: &crate::config::ModelConfig) -> Vec<usize> {
     if cfg.backends.is_empty() {
-        return (0..backends.len()).collect();
+        return (0..urls.len()).collect();
     }
     // Every backend matching a selector is a target, not just the first: an
     // entry like `- :11434` is meant to cover all the Ollama backends. Results
@@ -681,13 +749,73 @@ fn config_targets(state: &AppState, cfg: &crate::config::ModelConfig) -> Vec<usi
         if u_low.is_empty() {
             continue; // an empty selector would match every backend
         }
-        for (i, b) in backends.iter().enumerate() {
-            if b.url.to_lowercase().contains(&u_low) && !targets.contains(&i) {
+        for (i, url) in urls.iter().enumerate() {
+            if url.to_lowercase().contains(&u_low) && !targets.contains(&i) {
                 targets.push(i);
             }
         }
     }
     targets
+}
+
+/// The model names each backend has DECLARED for it in `appconf.yaml`
+/// `models:`, indexed like `urls`. One entry per backend, deduped, in config
+/// order; empty for a backend nothing declares.
+///
+/// This is what makes a name routable on a backend that cannot list its own
+/// models (`laya.serve` answers no listing endpoint, so `multilingual` is only
+/// knowable from the config file). The selector is `config_targets`' — the
+/// backends an entry loads a model onto are exactly the backends it declares it
+/// for, so "declared" never means "guessed".
+pub fn declared_models_for(
+    urls: &[String],
+    configs: &[crate::config::ModelConfig],
+) -> Vec<Vec<String>> {
+    let mut per_backend = vec![Vec::<String>::new(); urls.len()];
+    for cfg in configs {
+        for idx in config_target_indices(urls, cfg) {
+            let names = &mut per_backend[idx];
+            if !names.iter().any(|n| n == &cfg.name) {
+                names.push(cfg.name.clone());
+            }
+        }
+    }
+    per_backend
+}
+
+/// Recompute the declared model names from the CURRENT `model_config` and admit
+/// them into each backend's `available_models`.
+///
+/// Called after a config reload (`reload_model_config`), where the declared set
+/// changed but the last probe has not run again yet; the next probe round
+/// rebuilds `available_models` from scratch (discovered names union declared
+/// names), so names removed from the file disappear then rather than being
+/// tracked here.
+///
+/// Lock order: `model_config` is read and released BEFORE `backends` is taken
+/// (model_config -> queues -> backends).
+pub fn apply_declared_models(state: &AppState) {
+    let configs = state.model_config.lock_or_recover().clone();
+    let urls: Vec<String> = state
+        .backends
+        .lock_or_recover()
+        .iter()
+        .map(|b| b.url.clone())
+        .collect();
+    let declared = declared_models_for(&urls, &configs);
+    let mut backends = state.backends.lock_or_recover();
+    for (b, names) in backends.iter_mut().zip(declared) {
+        if names.is_empty() {
+            continue;
+        }
+        let mut available: HashSet<String> = b.available_models.iter().cloned().collect();
+        let known = available.len();
+        available.extend(names.iter().cloned());
+        if available.len() != known {
+            b.available_models = Arc::new(available);
+        }
+        b.declared_models = names;
+    }
 }
 
 /// Wait until backend `idx` can accept a control op: no control op already in
@@ -934,6 +1062,10 @@ pub fn reload_model_config(state: &Arc<AppState>) -> Result<usize, String> {
     let n = configs.len();
     *state.model_limits.lock_or_recover() = crate::dispatcher::build_model_limits(&configs);
     *state.model_config.lock_or_recover() = configs;
+    // The newly declared model names must become routable now, not at the next
+    // health tick: until a probe runs again `available_models` still reflects
+    // the previous file (see `apply_declared_models`).
+    apply_declared_models(state);
     apply_model_config(state);
     Ok(n)
 }
@@ -1593,6 +1725,8 @@ mod tests {
             known_bad_endpoints: HashSet::new(),
             rejected_families: HashSet::new(),
             family_fail_counts: HashMap::new(),
+            forced_api: BackendApiType::EMPTY,
+            declared_models: Vec::new(),
         }
     }
 
@@ -1725,11 +1859,10 @@ mod tests {
     ) {
         let calls: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let resident: std::sync::Arc<
-            std::sync::Mutex<std::collections::HashMap<String, u64>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(
-            [("qwen2.5:7b".to_string(), 2048u64)].into_iter().collect(),
-        ));
+        let resident: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                [("qwen2.5:7b".to_string(), 2048u64)].into_iter().collect(),
+            ));
 
         let c = calls.clone();
         let resident_gen = resident.clone();
@@ -1845,14 +1978,7 @@ mod tests {
     async fn probe_detects_ollama_and_lmstudio() {
         let (url, _calls) = start_mock_backend().await;
         let client = reqwest::Client::new();
-        let probe = probe_backend(
-            &client,
-            &url,
-            None,
-            &HashSet::new(),
-            PROBE_TIMEOUT,
-        )
-        .await;
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
 
         assert!(probe.is_online);
         // This mock speaks both Ollama and LM Studio -> Both + lmstudio flag
@@ -1879,26 +2005,30 @@ mod tests {
         let app = Router::new()
             .route(
                 "/api/tags",
-                get(|| async {
-                    Json(json!({"models": [{"name": "llama3:latest"}]}))
+                get(|| async { Json(json!({"models": [{"name": "llama3:latest"}]})) }),
+            )
+            .route(
+                "/api/ps",
+                get(move || async move {
+                    h1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(json!({"error": "Unexpected endpoint or method. (GET /api/ps)"})),
+                    )
+                        .into_response()
                 }),
             )
-            .route("/api/ps", get(move || async move {
-                h1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                (
-                    StatusCode::OK,
-                    Json(json!({"error": "Unexpected endpoint or method. (GET /api/ps)"})),
-                )
-                    .into_response()
-            }))
-            .route("/v1/models", get(move || async move {
-                h2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "Unexpected endpoint or method. (GET /v1/models)"})),
-                )
-                    .into_response()
-            }));
+            .route(
+                "/v1/models",
+                get(move || async move {
+                    h2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": "Unexpected endpoint or method. (GET /v1/models)"})),
+                    )
+                        .into_response()
+                }),
+            );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1909,18 +2039,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         // Full probe: both rejection styles are remembered as bad.
-        let probe = probe_backend(
-            &client,
-            &url,
-            None,
-            &HashSet::new(),
-            PROBE_TIMEOUT,
-        )
-        .await;
+        let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
         assert!(probe.is_online);
         assert!(probe.good_endpoints.contains("/api/tags"));
-        assert!(probe.bad_endpoints.contains("/api/ps"), "200+error body must be bad");
-        assert!(probe.bad_endpoints.contains("/v1/models"), "404 must be bad");
+        assert!(
+            probe.bad_endpoints.contains("/api/ps"),
+            "200+error body must be bad"
+        );
+        assert!(
+            probe.bad_endpoints.contains("/v1/models"),
+            "404 must be bad"
+        );
 
         // Second probe skipping the bad endpoints: they are not hit again,
         // while good endpoints stay fresh.
@@ -2006,11 +2135,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_still_classifies_openai_model_listing() {
-        let url = start_listing_mock(
-            json!({"object": "list", "data": [{"id": "a"}]}),
-            None,
-        )
-        .await;
+        let url = start_listing_mock(json!({"object": "list", "data": [{"id": "a"}]}), None).await;
         let client = reqwest::Client::new();
         let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
 
@@ -2121,6 +2246,326 @@ mod tests {
         assert!(b.known_bad_endpoints.contains("/api/ps"));
     }
 
+    /// A backend that answers `GET /health` with `body` and 404s everything
+    /// else — the `laya.serve` surface (`/health` and `POST /v1/systemone` only;
+    /// `/api/tags`, `/v1/models`, `/api/v1/models` and even `/` are 404).
+    async fn start_health_only_mock(body: Value) -> String {
+        let app = Router::new().route(
+            "/health",
+            get(move || {
+                let body = body.clone();
+                async move { (StatusCode::OK, Json(body)).into_response() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A `BackendProbe` that reports nothing but `api_type` — stands in for a
+    /// probe round whose observations must not override configuration.
+    fn probe_claiming(api_type: BackendApiType) -> BackendProbe {
+        BackendProbe {
+            is_online: true,
+            api_type,
+            available_models: HashSet::new(),
+            loaded_models: HashSet::new(),
+            loaded_ctx: HashMap::new(),
+            lmstudio: false,
+            native_models: Vec::new(),
+            bad_endpoints: HashSet::new(),
+            good_endpoints: HashSet::new(),
+        }
+    }
+
+    /// The `/health` fallback exists because `laya.serve` answers NOTHING that
+    /// identifies it: it was recorded OFFLINE while serving `POST /v1/systemone`
+    /// in ~240 ms, so every decide naming its checkpoint waited out
+    /// `stuck_timeout` and 503'd.
+    ///
+    /// Liveness only: the body shape is not read, so both Laya's
+    /// `{"status":"ok",…}` and CLM's `{"ok":true,…}` count, and neither gains a
+    /// guessed API family (a guessed family would put Laya in rotation for
+    /// routes it can only reject).
+    #[tokio::test]
+    async fn health_only_backend_is_online_but_unclassified() {
+        for body in [
+            json!({"status": "ok", "loaded": ["multilingual"], "device": "auto"}),
+            json!({"ok": true, "models": ["clm-latest"]}),
+        ] {
+            let url = start_health_only_mock(body).await;
+            let client = reqwest::Client::new();
+            let probe = probe_backend(&client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+
+            assert!(probe.is_online, "/health 2xx must mean online");
+            assert!(probe.good_endpoints.contains("/health"));
+            assert!(
+                probe.api_type.is_empty(),
+                "/health must not classify the family, got {:?}",
+                probe.api_type
+            );
+            // And it is not mistaken for a loaded-models or native-list reporter.
+            assert!(!probe.lmstudio);
+            assert!(probe.loaded_models.is_empty());
+            assert!(probe.native_models.is_empty());
+        }
+    }
+
+    /// `kind: systemone` is configuration, not an observation. A Laya-style
+    /// backend's probe result is `???` forever, so a round that overwrote the
+    /// pin with what it saw would make the backend permanently unroutable.
+    #[tokio::test]
+    async fn kind_pinned_family_survives_probe_rounds() {
+        let url = start_health_only_mock(json!({ "status": "ok" })).await;
+        let state = AppState::new(
+            vec![(url.clone(), None)],
+            30,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        );
+        state.apply_backend_kinds(&[Some("systemone".into())]);
+
+        // Round 1 — the real probe of a `/health`-only backend: online, and it
+        // classifies nothing at all.
+        let probe = probe_backend(&state.client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+        assert!(
+            probe.api_type.is_empty(),
+            "precondition: not self-identifying"
+        );
+        {
+            let mut backends = state.backends.lock_or_recover();
+            apply_probe(&mut backends[0], probe);
+        }
+        {
+            let backends = state.backends.lock_or_recover();
+            assert!(backends[0].is_online, "/health marks it online");
+            assert_eq!(
+                backends[0].api_type,
+                ApiSet::SYSTEMONE,
+                "the pin survives a round that saw nothing"
+            );
+        }
+
+        // Round 2 — even a probe that positively claims another family must not
+        // talk the pin out of existence.
+        {
+            let mut backends = state.backends.lock_or_recover();
+            apply_probe(&mut backends[0], probe_claiming(BackendApiType::OpenAi));
+        }
+        assert_eq!(
+            state.backends.lock_or_recover()[0].api_type,
+            ApiSet::SYSTEMONE,
+            "probes never override `kind:`"
+        );
+    }
+
+    /// An absent or unrecognised `kind:` keeps today's behaviour: the backend is
+    /// classified by probes, so a typo in the config file cannot pin a working
+    /// Ollama / LM Studio backend to the wrong family.
+    #[test]
+    fn unknown_or_absent_kind_pins_nothing() {
+        let state = AppState::new(
+            vec![
+                ("http://127.0.0.1:1".into(), None),
+                ("http://127.0.0.1:2".into(), None),
+            ],
+            30,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        );
+        state.apply_backend_kinds(&[Some("somethingelse".into()), None]);
+        let backends = state.backends.lock_or_recover();
+        assert!(
+            backends[0].api_type.is_empty(),
+            "unknown kind must leave the backend probe-classified"
+        );
+        assert!(backends[0].forced_api.is_empty());
+        assert!(backends[1].api_type.is_empty());
+        assert!(backends[1].forced_api.is_empty());
+    }
+
+    /// `available_models` is discovered UNION declared. CLM's discovered names
+    /// must survive (a declared entry may never hide a model a backend really
+    /// serves), and Laya's `multilingual` — undeclarable by any probe, because
+    /// it has no listing endpoint — must be admitted from appconf.yaml.
+    #[test]
+    fn apply_probe_unions_declared_with_discovered_models() {
+        let mut b = test_backend(BackendApiType::SYSTEMONE, false, &[], &[]);
+        b.declared_models = vec!["multilingual".to_string()];
+
+        let mut discovered = HashSet::new();
+        discovered.insert("clm-latest".to_string());
+        discovered.insert("clm-raw".to_string());
+        let mut probe = probe_claiming(BackendApiType::SYSTEMONE);
+        probe.available_models = discovered.clone();
+        apply_probe(&mut b, probe);
+
+        assert_eq!(
+            *b.available_models,
+            discovered
+                .iter()
+                .cloned()
+                .chain(["multilingual".to_string()])
+                .collect::<HashSet<String>>(),
+            "discovered and declared, neither side dropped"
+        );
+
+        // A declared name the backend also lists is not duplicated (a set) and
+        // a probe with nothing to report still keeps the declared one routable.
+        let mut probe_empty = probe_claiming(BackendApiType::SYSTEMONE);
+        probe_empty.available_models = discovered.clone();
+        probe_empty
+            .available_models
+            .insert("multilingual".to_string());
+        apply_probe(&mut b, probe_empty);
+        assert_eq!(b.available_models.len(), 3);
+    }
+
+    /// A declared name is declared for the backends the entry also loads onto —
+    /// the same selector, so "declared" never means "guessed".
+    #[test]
+    fn declared_models_follow_the_load_selector() {
+        let urls = vec![
+            "http://127.0.0.1:8772".to_string(),
+            "http://192.168.1.79:8700".to_string(),
+        ];
+        let entry = |name: &str, backends: Vec<String>| crate::config::ModelConfig {
+            name: name.into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends,
+        };
+
+        let declared = declared_models_for(
+            &urls,
+            &[
+                entry("multilingual", vec![":8772".into()]),
+                // No selector = "any suitable backend", like load targeting.
+                entry("clm-latest", vec![]),
+                entry("multilingual", vec![":8772".into()]),
+            ],
+        );
+        assert_eq!(declared[0], vec!["multilingual", "clm-latest"]);
+        assert_eq!(declared[1], vec!["clm-latest"]);
+        // Nothing declared at all = no names, so nothing is invented.
+        assert_eq!(
+            declared_models_for(&urls, &[]),
+            vec![Vec::<String>::new(), Vec::<String>::new()]
+        );
+    }
+
+    /// The whole Laya path in one test: a backend answering only `/health`, a
+    /// `kind: systemone` pin, and a `models:` entry naming its checkpoint. After
+    /// ONE probe round it is online, SystemOne-typed and `multilingual` is in
+    /// `available_models` — i.e. routable instead of 503 after `stuck_timeout`.
+    #[tokio::test]
+    async fn health_only_backend_with_declared_model_becomes_routable() {
+        let url = start_health_only_mock(json!({
+            "status": "ok", "loaded": ["multilingual"], "device": "auto"
+        }))
+        .await;
+        let state = AppState::new(
+            vec![(url.clone(), None)],
+            30,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            vec![crate::config::ModelConfig {
+                name: "multilingual".into(),
+                identifier: None,
+                max_ctx: None,
+                keep_alive: None,
+                max_concurrent_requests: 1,
+                backends: vec![],
+            }],
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        );
+        state.apply_backend_kinds(&[Some("systemone".into())]);
+        assert!(
+            state.backends.lock_or_recover()[0]
+                .declared_models
+                .contains(&"multilingual".to_string()),
+            "AppState::new derives the declared set from the model config"
+        );
+
+        let probe = probe_backend(&state.client, &url, None, &HashSet::new(), PROBE_TIMEOUT).await;
+        {
+            let mut backends = state.backends.lock_or_recover();
+            apply_probe(&mut backends[0], probe);
+        }
+        let backends = state.backends.lock_or_recover();
+        assert!(backends[0].is_online);
+        assert_eq!(backends[0].api_type, ApiSet::SYSTEMONE);
+        assert!(
+            backends[0].available_models.contains("multilingual"),
+            "the declared name must be routable: {:?}",
+            backends[0].available_models
+        );
+    }
+
+    /// A config reload re-declares names immediately — between the reload and
+    /// the next probe round there is no other chance to become routable.
+    #[test]
+    fn apply_declared_models_admits_names_without_a_probe_round() {
+        let state = AppState::new(
+            vec![("http://127.0.0.1:8772".into(), None)],
+            30,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        );
+        // Whatever a probe last saw on this backend.
+        {
+            let mut backends = state.backends.lock_or_recover();
+            apply_probe(&mut backends[0], probe_claiming(ApiSet::SYSTEMONE));
+        }
+
+        let entry = crate::config::ModelConfig {
+            name: "multilingual".into(),
+            identifier: None,
+            max_ctx: None,
+            keep_alive: None,
+            max_concurrent_requests: 1,
+            backends: vec![":8772".into()],
+        };
+        *state.model_config.lock_or_recover() = vec![entry];
+        apply_declared_models(&state);
+
+        let backends = state.backends.lock_or_recover();
+        assert_eq!(
+            *backends[0].available_models,
+            ["multilingual".to_string()]
+                .into_iter()
+                .collect::<HashSet<String>>()
+        );
+        assert_eq!(backends[0].declared_models, vec!["multilingual"]);
+    }
+
     #[tokio::test]
     async fn ollama_load_and_unload_bodies() {
         let (url, calls) = start_mock_backend().await;
@@ -2174,10 +2619,10 @@ mod tests {
             "llama3:latest",
             to,
             86400,
-            &options
+            &options,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let calls = calls.lock_or_recover();
         assert_eq!(calls.len(), 1);
@@ -2204,10 +2649,10 @@ mod tests {
             "mock/qwen2-7b",
             to,
             86400,
-            &options
+            &options,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let calls = calls.lock_or_recover();
         assert_eq!(calls.len(), 1);
@@ -2230,7 +2675,7 @@ mod tests {
             "mock/qwen2-7b",
             to,
             86400,
-            &LoadOptions::default()
+            &LoadOptions::default(),
         )
         .await
         .unwrap();
@@ -2501,8 +2946,14 @@ mod tests {
         assert!(!probe.is_online);
 
         // With the token: online and Ollama-typed with its model listed.
-        let probe =
-            probe_backend(&client, &url, Some("sekrit"), &HashSet::new(), PROBE_TIMEOUT).await;
+        let probe = probe_backend(
+            &client,
+            &url,
+            Some("sekrit"),
+            &HashSet::new(),
+            PROBE_TIMEOUT,
+        )
+        .await;
         assert!(probe.is_online);
         assert_eq!(probe.api_type, BackendApiType::Ollama);
         assert!(probe.available_models.contains("llama3"));
