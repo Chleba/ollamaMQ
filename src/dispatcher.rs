@@ -320,8 +320,28 @@ fn retitled_entry(entry: &serde_json::Value, from: &str, to: &str) -> serde_json
 ///
 /// Entries are deduped by name/id with the first backend winning, and the first
 /// answering body is reused so its extra top-level fields survive. Returns
-/// `None` when no compatible backend produced a listing — the caller then falls
-/// back to the normal queued proxy path.
+/// `None` when no compatible backend produced a listing AND none of them knows
+/// a single model name — the caller then falls back to the normal queued proxy
+/// path.
+///
+/// A backend that cannot answer its listing route at all still contributes. Laya
+/// has no `/v1/models` and no `/api/tags` (both are its own 404), so a Laya-only
+/// deployment advertised *nothing* and a client — which discovers models by
+/// listing them — never sent a request for a model the proxy routes perfectly
+/// well. The names such a backend already reports in `available_models` (what
+/// the probe discovered plus what `appconf.yaml` declared) are contributed as
+/// minimal entries carrying only this route's name field. They are appended
+/// after every live entry, and a name some backend did list keeps that backend's
+/// rich entry — synthesised entries never shadow size/digest/description.
+///
+/// A System One backend contributes to `/api/tags` too, a route its family does
+/// not serve. It is *not asked* anything there — `/api/*` requests must never
+/// reach a System One server — only its known names are listed, on the grounds
+/// that this route advertises what the proxy can route to and those models are
+/// routable (through `/v1/systemone`). No other family works that way: a backend
+/// that cannot serve the route's family contributes nothing, which is what keeps
+/// an existing Ollama / LM Studio / OpenAI deployment's listings exactly as they
+/// were — they answer their listing route and take the live-body path.
 ///
 /// Both listing envelopes are *read*, but only one is ever *answered*, and which
 /// one is decided by the ROUTE, never by whichever backend happens to answer
@@ -351,30 +371,65 @@ async fn aggregate_model_list(
         .expect("a listing endpoint declares at least one shape");
     let route = families_for_route(&Method::GET, endpoint);
 
-    let targets: Vec<(String, Option<String>)> = state
-        .backends
-        .lock_or_recover()
-        .iter()
-        .filter(|b| b.is_online && family_compatible(b, route))
-        .map(|b| (b.url.clone(), b.token.clone()))
-        .collect();
-    if targets.is_empty() {
+    /// The model names we know a backend serves even if it cannot list them,
+    /// sorted because `available_models` is a `HashSet` whose iteration order
+    /// changes every process run and a listing route must not shuffle.
+    fn sorted_names(models: &std::sync::Arc<HashSet<String>>) -> Vec<String> {
+        let mut names: Vec<String> = models.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    // Backends that get asked for their own listing, and the names of those
+    // that must not be asked but have models to advertise anyway (below).
+    let mut probed: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+    let mut state_only: Vec<Vec<String>> = Vec::new();
+    {
+        let backends = state.backends.lock_or_recover();
+        for b in backends.iter() {
+            if !b.is_online {
+                continue;
+            }
+            let names = sorted_names(&b.available_models);
+            if family_compatible(b, route) {
+                probed.push((b.url.clone(), b.token.clone(), names));
+            } else if b.api_type.contains(ApiFamily::SystemOne) && !names.is_empty() {
+                // A System One server has no listing route outside `/v1/models`
+                // at all — `/api/*` requests must never reach one, so asking it
+                // for `/api/tags` is both pointless and forbidden. Its models
+                // are still routable and their names are known (declared in
+                // `appconf.yaml`, kept in `available_models`), and the point of
+                // the merged listing is that a client sees everything this proxy
+                // can route to. Names only, and only for this family: a backend
+                // of any other family that cannot serve this route contributes
+                // nothing here, exactly as before.
+                state_only.push(names);
+            }
+        }
+    }
+    if probed.is_empty() && state_only.is_empty() {
         return None;
     }
 
-    let bodies = futures_util::future::join_all(targets.into_iter().map(|(base, token)| {
+    let bodies = futures_util::future::join_all(probed.into_iter().map(|(base, token, names)| {
         let client = state.client.clone();
         let url = format!("{}{}", base, endpoint);
         async move {
-            let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
-            if let Some(t) = &token {
-                req = req.header("Authorization", format!("Bearer {}", t));
+            let body = async {
+                let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
+                if let Some(t) = &token {
+                    req = req.header("Authorization", format!("Bearer {}", t));
+                }
+                let res = req.send().await.ok()?;
+                if !res.status().is_success() {
+                    return None;
+                }
+                res.json::<serde_json::Value>().await.ok()
             }
-            let res = req.send().await.ok()?;
-            if !res.status().is_success() {
-                return None;
-            }
-            res.json::<serde_json::Value>().await.ok()
+            .await;
+            // The names travel with the answer so a backend that says
+            // nothing still gets to contribute its own models.
+            (body, names)
         }
     }))
     .await;
@@ -386,15 +441,26 @@ async fn aggregate_model_list(
     let mut merged: Vec<serde_json::Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut answered = 0usize;
-    for body in bodies.into_iter().flatten() {
+    // Backends that gave no parseable listing, plus the names of backends that
+    // were never asked at all: they are contributed in a second pass below,
+    // once every live entry is in, so a bare synthesised entry can never take a
+    // rich one's place whatever the backend order is.
+    for (body, names) in bodies {
         // A backend that answers 200 with an error object (LM Studio does this
         // for foreign endpoints) has no listing to contribute. Likewise one
-        // whose listing uses a shape this endpoint does not recognise.
-        let Some((array_key, name_field)) = shapes
-            .iter()
-            .copied()
-            .find(|(key, _)| body.get(*key).is_some_and(|v| v.is_array()))
-        else {
+        // whose listing uses a shape this endpoint does not recognise, one that
+        // answers the listing route with its own 404 and one that never
+        // answers at all — all of them fall back to what we know about them.
+        let shape = body.as_ref().and_then(|body| {
+            shapes
+                .iter()
+                .copied()
+                .find(|(key, _)| body.get(*key).is_some_and(|v| v.is_array()))
+        });
+        let (Some(body), Some((array_key, name_field))) = (body, shape) else {
+            if !names.is_empty() {
+                state_only.push(names);
+            }
             continue;
         };
         let entries = body
@@ -418,16 +484,47 @@ async fn aggregate_model_list(
         }
     }
 
+    // The backends that could not list themselves, in backend order: one entry
+    // per known name, written in this route's own envelope, skipping any name a
+    // live entry already carried (first writer wins, and live writers went first).
+    let mut from_state = 0usize;
+    for names in state_only {
+        for name in names {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            from_state += 1;
+            let mut entry = serde_json::Map::new();
+            entry.insert(out_field.to_string(), serde_json::Value::String(name));
+            merged.push(serde_json::Value::Object(entry));
+        }
+    }
+
     // `array_key` is the key the first answering backend reported its listing
     // under — on a shared route that is not the key the answer uses, in which
-    // case that array must not survive alongside the merged one.
-    let (mut envelope, consumed_key) = envelope?;
+    // case that array must not survive alongside the merged one. When nobody
+    // answered but somebody has names, a fresh envelope is synthesised: the
+    // names are routable and the client must learn them, rather than receiving
+    // the backend's own 404 through the normal proxy path. `out_key` as the
+    // consumed key makes the foreign-key removal below a no-op for it.
+    let (mut envelope, consumed_key) = match envelope {
+        Some(pair) => pair,
+        None if merged.is_empty() => return None,
+        None => (serde_json::Value::Object(serde_json::Map::new()), out_key),
+    };
     debug!(
         "aggregated {} at {} model(s) from {} backend(s)",
         endpoint,
         merged.len(),
         answered
     );
+    if from_state > 0 {
+        debug!(
+            "{} model(s) in the {} answer came from backend state: those backend(s) \
+             do not answer their listing route",
+            from_state, endpoint
+        );
+    }
     if consumed_key != out_key
         && let Some(map) = envelope.as_object_mut()
     {
@@ -3225,26 +3322,28 @@ mod tests {
 
     /// Tiny backend mock: for every accepted connection it reads the
     /// request line and answers by path —
-    ///  - GET /v1/models     → 200 + the OpenAI-style model list (`v1_models`)
+    ///  - the listing paths named in `listing` → 200 + their body
+    ///  - `/v1/models` / `/api/tags` NOT named there → that backend's own 404,
+    ///    verbatim (a Laya-style server has no model-listing route at all)
     ///  - GET /api/v1/models → 200 + LM Studio native list, or 404 when None
-    ///  - GET /api/tags, /api/ps → 200 + LM Studio-style rejection (remembered
-    ///    as a bad endpoint by the health loop)
+    ///  - GET /api/ps → 200 + LM Studio-style rejection (remembered as a bad
+    ///    endpoint by the health loop)
     ///  - anything else (the actual proxied POST) → 200 {"ok":true}, quickly
     ///
     /// Returns (URL, abort handle of the accept loop).
-    async fn spawn_mock_backend(
-        v1_models: &str,
+    async fn spawn_mock_listing(
+        listing: &[(&str, &str)],
         native_models: Option<&str>,
     ) -> (String, tokio::task::AbortHandle) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listing: Vec<(String, String)> = listing
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock backend");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("mock local addr")
-        );
-        let v1 = v1_models.to_string();
+        let url = format!("http://{}", listener.local_addr().expect("mock local addr"));
         let native = native_models.map(|s| s.to_string());
         let handle = tokio::spawn(async move {
             loop {
@@ -3252,7 +3351,7 @@ mod tests {
                     Ok(pair) => pair,
                     Err(_) => break, // accept loop aborted
                 };
-                let v1 = v1.clone();
+                let listing = listing.clone();
                 let native = native.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 8192];
@@ -3269,12 +3368,19 @@ mod tests {
                         .nth(1)
                         .unwrap_or("");
                     let (status, body) = match path {
-                        "/v1/models" => ("200 OK", v1.clone()),
+                        "/v1/models" | "/api/tags" => match listing
+                            .iter()
+                            .find(|(p, _)| *p == path)
+                            .map(|(_, body)| body.clone())
+                        {
+                            Some(json) => ("200 OK", json),
+                            None => ("404 Not Found", r#"{"detail":"Not Found"}"#.to_string()),
+                        },
                         "/api/v1/models" => match &native {
                             Some(json) => ("200 OK", json.clone()),
                             None => ("404 Not Found", r#"{"detail":"Not Found"}"#.to_string()),
                         },
-                        "/api/tags" | "/api/ps" => (
+                        "/api/ps" => (
                             "200 OK",
                             r#"{"error":"Unexpected endpoint or method."}"#.to_string(),
                         ),
@@ -3292,6 +3398,28 @@ mod tests {
             }
         });
         (url, handle.abort_handle())
+    }
+
+    async fn spawn_mock_backend(
+        v1_models: &str,
+        native_models: Option<&str>,
+    ) -> (String, tokio::task::AbortHandle) {
+        spawn_mock_listing(
+            &[
+                ("/v1/models", v1_models),
+                // What a non-Ollama backend answers Ollama's listing route with
+                // (the health loop remembers it as a bad endpoint).
+                ("/api/tags", r#"{"error":"Unexpected endpoint or method."}"#),
+            ],
+            native_models,
+        )
+        .await
+    }
+
+    /// A Laya-style backend: it serves `/v1/systemone` and answers nothing that
+    /// identifies its models, so BOTH listing routes get its own 404.
+    async fn spawn_mock_backend_without_listing() -> (String, tokio::task::AbortHandle) {
+        spawn_mock_listing(&[], None).await
     }
 
     /// LM Studio backend scenario shared by the tier tests: ovisocr2 loaded,
@@ -4072,6 +4200,150 @@ mod tests {
 
         mock_a.abort();
         mock_b.abort();
+    }
+
+    /// Mark `b` as an online System One backend that serves `models` and cannot
+    /// list them itself (what `kind: systemone` + a Laya server produce).
+    fn systemone_backend_state(b: &mut BackendStatus, models: &[&str]) {
+        b.is_online = true;
+        b.api_type = ApiSet::SYSTEMONE;
+        b.available_models = Arc::new(set(models));
+    }
+
+    /// Laya answers `GET /v1/models` with its own 404, so before this fallback
+    /// the listing route had nothing to merge, returned `None`, and the request
+    /// was proxied — handing the client Laya's 404. A model nobody can list is a
+    /// model nobody sends, however well it routes, so the names the proxy already
+    /// knows (`available_models`: declared in `appconf.yaml`, kept by the probe)
+    /// are answered instead, in the envelope of the route being asked.
+    #[tokio::test]
+    async fn model_listing_falls_back_to_backend_state_when_nothing_answers() {
+        let (url, mock) = spawn_mock_backend_without_listing().await;
+        let state = new_test_state(vec![url]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            systemone_backend_state(&mut backends[0], &["multilingual"]);
+        }
+
+        let res = aggregate_model_list(&state, "/v1/models")
+            .await
+            .expect("a known name is enough to answer");
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = response_json(res).await;
+        assert_eq!(v["data"], serde_json::json!([{"id": "multilingual"}]));
+        // The route's envelope, not the other one — synthesising does not
+        // re-key `/v1/models` into the System One shape.
+        assert!(v.get("models").is_none());
+
+        let res = aggregate_model_list(&state, "/api/tags")
+            .await
+            .expect("the same names answer /api/tags");
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = response_json(res).await;
+        assert_eq!(v["models"], serde_json::json!([{"name": "multilingual"}]));
+        assert!(v.get("data").is_none());
+
+        mock.abort();
+    }
+
+    /// The mixed deployment: Laya (no listing endpoint, configured first) next
+    /// to a CLM that answers its own. Both must be visible, and CLM's rich entry
+    /// must survive a same-named synthesised one — synthesised entries are
+    /// appended after the live ones precisely so they can never shadow metadata
+    /// (`description`, `release_date`, `size`, `digest`) that only the backend
+    /// itself can report.
+    #[tokio::test]
+    async fn model_listing_keeps_live_entries_over_synthesised_ones() {
+        let (url_laya, mock_laya) = spawn_mock_backend_without_listing().await;
+        let (url_clm, mock_clm) = spawn_mock_backend(SYSTEMONE_V1_MODELS, None).await;
+        let state = new_test_state(vec![url_laya, url_clm]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            // `clm-latest` is a name Laya knows about too (shared deployment):
+            // CLM's entry for it must win even though Laya is listed first.
+            systemone_backend_state(&mut backends[0], &["clm-latest", "multilingual"]);
+            systemone_backend_state(&mut backends[1], &["shared", "clm-latest"]);
+        }
+
+        let v = response_json(
+            aggregate_model_list(&state, "/v1/models")
+                .await
+                .expect("the answering backend plus the silent one's names merge"),
+        )
+        .await;
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["shared", "clm-latest", "multilingual"]);
+        // No duplicates, and the live entry kept its own metadata.
+        assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
+        assert_eq!(v["data"][1]["description"], "decision model");
+        // The synthesised entry carries nothing but the route's name field.
+        assert_eq!(v["data"][2], serde_json::json!({"id": "multilingual"}));
+
+        mock_laya.abort();
+        mock_clm.abort();
+    }
+
+    /// Every backend failed the listing route: the answer is a synthesised 200,
+    /// not `None` (which would let the request fall through to a backend's 404).
+    #[tokio::test]
+    async fn model_listing_synthesises_200_instead_of_falling_through() {
+        let (url_a, mock_a) = spawn_mock_backend_without_listing().await;
+        let (url_b, mock_b) = spawn_mock_backend_without_listing().await;
+        let state = new_test_state(vec![url_a, url_b]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            systemone_backend_state(&mut backends[0], &["multilingual"]);
+            systemone_backend_state(&mut backends[1], &["clm-latest"]);
+        }
+
+        for (endpoint, key, field) in [
+            ("/v1/models", "data", "id"),
+            ("/api/tags", "models", "name"),
+        ] {
+            let res = aggregate_model_list(&state, endpoint)
+                .await
+                .expect("names are enough: no fall-through to a backend 404");
+            assert_eq!(res.status(), StatusCode::OK, "{endpoint} must answer 200");
+            let v = response_json(res).await;
+            let names: Vec<&str> = v[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{endpoint} answers in its own {key} envelope"))
+                .iter()
+                .map(|m| m[field].as_str().expect(field))
+                .collect();
+            assert_eq!(names, vec!["multilingual", "clm-latest"]);
+        }
+
+        mock_a.abort();
+        mock_b.abort();
+    }
+
+    /// The other side of the fallback, and the reason it is limited to the
+    /// System One family: a backend of another family that cannot serve this
+    /// route still contributes nothing, so an existing Ollama / LM Studio /
+    /// OpenAI deployment keeps taking the live-body path (or the normal proxy
+    /// fall-through) with byte-identical output.
+    #[tokio::test]
+    async fn model_listing_invents_nothing_for_an_incompatible_family() {
+        let (url, mock) = spawn_mock_backend_without_listing().await;
+        let state = new_test_state(vec![url]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            backends[0].is_online = true;
+            backends[0].api_type = BackendApiType::Ollama;
+            backends[0].available_models = Arc::new(set(&["llama3"]));
+        }
+
+        // `/v1/models` is not an Ollama route: nothing is asked, nothing is
+        // invented, and the caller falls back to the normal queued proxy path.
+        assert!(aggregate_model_list(&state, "/v1/models").await.is_none());
+
+        mock.abort();
     }
 
     #[tokio::test]
