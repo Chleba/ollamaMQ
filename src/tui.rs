@@ -846,8 +846,10 @@ impl TuiDashboard {
             ])
             .split(main_chunks[1]);
 
+        // Backends table: pass the inner height (minus the block borders)
+        // so expanded rows can be capped to the viewport.
         f.render_stateful_widget(
-            self.render_backends(snapshot),
+            self.render_backends(snapshot, content_chunks[0].height.saturating_sub(2)),
             content_chunks[0],
             &mut self.backend_table_state,
         );
@@ -1054,7 +1056,39 @@ impl TuiDashboard {
         Paragraph::new(Line::from(stats_line)).block(Block::default().borders(Borders::ALL))
     }
 
-    fn render_backends(&self, snapshot: &StateSnapshot) -> Table<'static> {
+    /// Window of model lines to render for an expanded backend so its row
+    /// never grows taller than the table viewport: returns
+    /// `(window_start, rendered_count)`. Reserves one line for the
+    /// "... and N more" hint when models stay hidden and shifts the window
+    /// so the model cursor stays visible.
+    fn model_window(
+        total_models: usize,
+        fold_limit: usize,
+        available_height: u16,
+        header_lines: usize,
+        cursor: Option<usize>,
+    ) -> (usize, usize) {
+        let max_model_lines = (available_height as usize).saturating_sub(header_lines);
+        let mut rendered = fold_limit.min(max_model_lines);
+        if rendered < total_models {
+            // The "... and N more" hint costs one of the model lines.
+            rendered = rendered.min(max_model_lines.saturating_sub(1));
+        }
+        let start = match cursor.filter(|&c| c < total_models) {
+            Some(c) if c >= rendered => {
+                (c + 1 - rendered).min(total_models.saturating_sub(rendered))
+            }
+            _ => 0,
+        };
+        (start, rendered)
+    }
+
+    fn render_backends(&self, snapshot: &StateSnapshot, inner_height: u16) -> Table<'static> {
+        // Rows render below the block borders (already subtracted by the
+        // caller) and the fixed header (1 line + 1 bottom margin); a row
+        // taller than what is left cannot be scrolled by ratatui and
+        // breaks keyboard selection.
+        let available_height = inner_height.saturating_sub(2);
         let rows: Vec<Row> = snapshot
             .backends
             .iter()
@@ -1191,13 +1225,25 @@ impl TuiDashboard {
                     } else {
                         let total_models = models.len();
                         let show_all = self.show_all_backends.contains(&b.url);
-                        let limit = if show_all {
+                        let fold_limit = if show_all {
                             total_models
                         } else {
                             5.min(total_models)
                         };
                         let cursor = self.model_cursor.get(&b.url).copied();
-                        for (mi, m) in models.into_iter().enumerate().take(limit) {
+                        let (window_start, rendered) = Self::model_window(
+                            total_models,
+                            fold_limit,
+                            available_height,
+                            name_lines.len(),
+                            cursor,
+                        );
+                        for (mi, m) in models
+                            .into_iter()
+                            .enumerate()
+                            .skip(window_start)
+                            .take(rendered)
+                        {
                             let is_cursor = cursor == Some(mi);
                             let is_loaded = b.loaded_models.contains(&m);
                             let m_style = if is_cursor {
@@ -1227,11 +1273,12 @@ impl TuiDashboard {
                                 },
                             ]));
                         }
-                        if !show_all && total_models > 5 {
+                        let hidden = total_models - rendered;
+                        if hidden > 0 {
                             name_lines.push(Line::from(vec![
                                 Span::raw("  "),
                                 Span::styled(
-                                    format!("  ... and {} more", total_models - 5),
+                                    format!("  ... and {} more", hidden),
                                     Style::default().fg(Color::DarkGray).italic(),
                                 ),
                             ]));
@@ -1239,7 +1286,7 @@ impl TuiDashboard {
                     }
                 }
 
-                let height = name_lines.len() as u16;
+                let height = name_lines.len().min(available_height as usize) as u16;
 
                 Row::new(vec![
                     Cell::from(Text::from(name_lines)),
@@ -1752,5 +1799,35 @@ mod tests {
         let mut dash = TuiDashboard::new();
         let screen = painted(&mut dash, &snapshot(Vec::new()));
         assert!(screen.contains("ollamaMQ"), "title missing:\n{screen}");
+    }
+
+    #[test]
+    fn model_window_caps_expanded_model_lines_to_the_viewport() {
+        // No cursor, everything fits: the fold limit (5) is rendered.
+        assert_eq!(TuiDashboard::model_window(10, 5, 20, 2, None), (0, 5));
+        // Fewer models than the cap: all are rendered, no hint line.
+        assert_eq!(TuiDashboard::model_window(3, 3, 20, 2, None), (0, 3));
+        // Show-all with hundreds of models: reserve a line for the hint.
+        assert_eq!(TuiDashboard::model_window(500, 500, 10, 2, None), (0, 7));
+        // Header lines already exceed the viewport: nothing fits.
+        assert_eq!(TuiDashboard::model_window(10, 5, 3, 4, None), (0, 0));
+        // Degenerate sizes must not panic.
+        assert_eq!(TuiDashboard::model_window(0, 0, 20, 2, None), (0, 0));
+        assert_eq!(TuiDashboard::model_window(10, 5, 0, 2, None), (0, 0));
+    }
+
+    #[test]
+    fn model_window_shifts_so_the_model_cursor_stays_visible() {
+        // Cursor beyond the window: shift the start so it becomes visible.
+        assert_eq!(TuiDashboard::model_window(10, 5, 20, 2, Some(7)), (3, 5));
+        // Cursor inside the window: no shift.
+        assert_eq!(TuiDashboard::model_window(10, 5, 20, 2, Some(2)), (0, 5));
+        // Cursor at the very end of a long capped list.
+        assert_eq!(
+            TuiDashboard::model_window(500, 500, 10, 2, Some(499)),
+            (493, 7)
+        );
+        // Stale cursor past the end of the model list is ignored.
+        assert_eq!(TuiDashboard::model_window(5, 5, 20, 2, Some(9)), (0, 5));
     }
 }
