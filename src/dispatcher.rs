@@ -534,21 +534,21 @@ async fn aggregate_model_list(
     Some((StatusCode::OK, axum::Json(envelope)).into_response())
 }
 
-/// Insert the backend's configured auth token into `headers` unless the
-/// client already presented its own credentials (`Authorization` or
-/// `X-Api-Key`). Client-supplied headers are never overridden; a token that
-/// cannot be encoded as an HTTP header value is skipped rather than failing
-/// the request.
+/// Attach the backend's configured auth token to outgoing `headers`. A
+/// configured token ALWAYS wins: it replaces any client-supplied
+/// `Authorization` header and any client `X-Api-Key` header is removed, so
+/// client credentials (which authenticate the client to the proxy, not the
+/// proxy to the backend) never leak upstream. Without a configured token,
+/// client headers pass through untouched. A token that cannot be encoded as
+/// an HTTP header value is skipped rather than failing the request (client
+/// credentials are stripped regardless).
 fn attach_backend_token(headers: &mut HeaderMap, token: Option<&str>) {
     let t = match token {
-        Some(t)
-            if !headers.contains_key(axum::http::header::AUTHORIZATION)
-                && !headers.contains_key("x-api-key") =>
-        {
-            t
-        }
-        _ => return,
+        Some(t) => t,
+        None => return,
     };
+    headers.remove(axum::http::header::AUTHORIZATION);
+    headers.remove("x-api-key");
     if let Ok(v) = format!("Bearer {}", t).parse() {
         headers.insert(axum::http::header::AUTHORIZATION, v);
     }
@@ -585,7 +585,7 @@ pub struct BackendStatus {
     /// Optional API key for this backend (from appconf.yaml), sent as
     /// `Authorization: Bearer <token>` on every request the proxy makes to
     /// it — proxied inference, metadata reads, health probes and model
-    /// control ops. A client's own auth header is never overridden.
+    /// control ops. A configured token always wins: client-supplied Authorization/X-Api-Key headers are replaced with the backend token before dispatch.
     pub token: Option<String>,
     pub active_requests: usize,
     pub processed_count: usize,
@@ -2032,8 +2032,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let method_str = task.method.to_string();
                         let path_str = task.path.clone();
 
-                        // Attach this backend's configured auth token unless the
-                        // client already presented its own credentials.
+                        // Attach this backend's configured auth token; it
+                        // overrides any client credentials (which never reach
+                        // the backend).
                         let mut headers = task.headers.clone();
                         attach_backend_token(&mut headers, backend_token.as_deref());
 
@@ -3178,13 +3179,16 @@ mod tests {
         worker.abort();
     }
 
-    /// Backend mock that records `(path, Authorization header)` for every
-    /// request and answers 200. `/api/tags` returns an Ollama-style listing
-    /// so the health probes keep `llama3` available on it.
+    /// Backend mock that records `(path, Authorization header, X-Api-Key
+    /// header)` for every request and answers 200. `/api/tags` returns an
+    /// Ollama-style listing so the health probes keep `llama3` available on
+    /// it.
     #[allow(clippy::type_complexity)]
-    async fn spawn_recording_backend()
-    -> (String, Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>) {
-        let calls: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
+    async fn spawn_recording_backend() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>>,
+    ) {
+        let calls: Arc<std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3202,7 +3206,11 @@ mod tests {
                             .get("authorization")
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
-                        c.lock_or_recover().push((path.clone(), auth));
+                        let api_key = headers
+                            .get("x-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        c.lock_or_recover().push((path.clone(), auth, api_key));
                         if path == "/api/tags" {
                             axum::Json(serde_json::json!({ "models": [{ "name": "llama3" }] }))
                         } else {
@@ -3276,15 +3284,18 @@ mod tests {
         worker.abort();
 
         let calls = calls.lock_or_recover().clone();
-        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        let chat: Vec<_> = calls.into_iter().filter(|(p, _, _)| p == "/api/chat").collect();
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0].1.as_deref(), Some("Bearer sekrit"));
+        assert_eq!(chat[0].2.as_deref(), None);
     }
 
-    /// A client's own Authorization header is forwarded untouched — the
-    /// configured backend token must not override it.
+    /// A configured backend token overrides client credentials: the client's
+    /// Authorization header is replaced with the token and any client
+    /// X-Api-Key header is stripped, so client credentials never reach the
+    /// backend.
     #[tokio::test]
-    async fn proxy_does_not_override_client_auth_header() {
+    async fn proxy_configured_token_overrides_client_credentials() {
         let (url, calls) = spawn_recording_backend().await;
         let state = new_test_state(vec![url.clone()]);
         arm_ollama_backend(&state, Some("sekrit".to_string()));
@@ -3293,6 +3304,10 @@ mod tests {
         headers.insert(
             axum::http::header::AUTHORIZATION,
             "Bearer client-key".parse().expect("valid header value"),
+        );
+        headers.insert(
+            "x-api-key",
+            "client-api-key".parse().expect("valid header value"),
         );
         let _rx = enqueue_llama_chat(&state, headers);
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -3305,9 +3320,45 @@ mod tests {
         worker.abort();
 
         let calls = calls.lock_or_recover().clone();
-        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        let chat: Vec<_> = calls.into_iter().filter(|(p, _, _)| p == "/api/chat").collect();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].1.as_deref(), Some("Bearer sekrit"));
+        assert_eq!(chat[0].2.as_deref(), None);
+    }
+
+    /// With no configured backend token, client headers pass through
+    /// untouched — the client's own Authorization and X-Api-Key headers reach
+    /// the backend verbatim.
+    #[tokio::test]
+    async fn proxy_forwards_client_auth_when_no_backend_token() {
+        let (url, calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url.clone()]);
+        arm_ollama_backend(&state, None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer client-key".parse().expect("valid header value"),
+        );
+        headers.insert(
+            "x-api-key",
+            "client-api-key".parse().expect("valid header value"),
+        );
+        let _rx = enqueue_llama_chat(&state, headers);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 0);
+        wait_for_completion(&state, picked).await;
+        worker.abort();
+
+        let calls = calls.lock_or_recover().clone();
+        let chat: Vec<_> = calls.into_iter().filter(|(p, _, _)| p == "/api/chat").collect();
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0].1.as_deref(), Some("Bearer client-key"));
+        assert_eq!(chat[0].2.as_deref(), Some("client-api-key"));
     }
 
     // -- Scheduler-tier integration tests ------------------------------------
