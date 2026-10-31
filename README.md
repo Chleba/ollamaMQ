@@ -22,7 +22,8 @@
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
-- **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
+- **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users. VIP, Boost and blocked users/IPs are saved and restored on restart.
+- **Web Dashboard**: The same live view in your browser at `/ui` — backends, users, queues and activity, with VIP/Boost/block controls. Optional (`--no-webui`).
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
@@ -66,20 +67,21 @@ cargo install ollamaMQ
    docker compose up -d
    ```
 
+   This pulls the published `chlebon/ollamamq` image — nothing is compiled on your machine. To build from your checkout instead (for development), add the build file:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+   ```
+   or `docker build -t chlebon/ollamamq .` for the plain CLI.
+
 #### Using Docker CLI
 
-First build the image from the local Dockerfile:
-
-```bash
-docker build -t chlebon/ollamamq .
-```
-
-Then run the container:
+Run the published image:
 
 ```bash
 docker run -d \
   --name ollamamq \
   -p 11435:11435 \
+  -v ollamamq_data:/data \
   --restart unless-stopped \
   chlebon/ollamamq
 ```
@@ -143,6 +145,16 @@ curl -X POST http://localhost:11435/v1/systemone \
   -d '{"model": "clm-latest", "state": "billed twice, refund please or we cancel",
        "questions": {"refund": {"type": "noul", "instructions": "Is a refund justified?"}}}'
 ```
+
+### Client Identification
+
+Each client gets its own queue, named by the first of these that is present:
+
+1. the `X-User-ID` header;
+2. the `X-OpenWebUI-User-Name` header — [Open WebUI](https://openwebui.com) sends it (with the logged-in user's name, e.g. from your SSO) when you set `ENABLE_FORWARD_USER_INFO_HEADERS=true`;
+3. otherwise `anonymous (<client>)`, taken from the `User-Agent` (for example `anonymous (curl)`), so scripts and monitoring pollers show up separately instead of as one `anonymous`.
+
+The **Last IP** shown for a user and used by "Block IP" is the TCP peer address. Behind a reverse proxy or a Docker bridge that is the proxy's address, not the client's. If every request reaches ollamaMQ through a proxy **you** control and that proxy sets `X-Forwarded-For` (or `X-Real-IP`), start ollamaMQ with `--trust-forwarded-for` (or `TRUST_FORWARDED_FOR=true`) to use the original client address instead. Leave it off otherwise: those headers are client-controlled, so a client that can reach ollamaMQ directly could forge an address and slip past an IP block.
 
 ### Model Control (Admin API)
 
@@ -215,6 +227,20 @@ curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecre
 ```
 
 **Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
+
+### Web Dashboard
+
+Open `http://localhost:11435/ui` (use your host and port). It mirrors the TUI: Backend Instances, Active Users, Queue Status and Blocked Items, refreshing every couple of seconds, with the same keys — `h`/`l`/`Tab` switch panel, `j`/`k` (or the arrows) move, `Space`/`Enter` expand a backend's models, `p` VIP, `b` Boost, `x` block user, `X` block IP, `u` unblock. Click a row to select it.
+
+It is served by the proxy itself (a single embedded page — nothing extra to install or build) and backed by:
+
+- `GET /admin/state` — users, backends and recent activity as JSON (request and response bodies are never included)
+- `POST /admin/users/{id}/{vip|boost|block|unblock}` and `POST /admin/ips/{ip}/{block|unblock}` — the actions
+- `GET /icon.svg` — the dashboard icon
+
+These `/admin/*` routes use the same optional API-key auth (see Security) as the rest of the admin API; the page asks for the key when one is configured. `/ui` and `/icon.svg` themselves are public. **Without an API key, anyone who can reach the port can block users**, so set `OLLAMA_MQ_API_KEY` (or keep the port private) if that matters.
+
+To turn it off, as you would with `--no-tui`: pass `--no-webui`, set `NO_WEBUI=true`, or set `webui: false` under `settings:` in `appconf.yaml`. The page and the dashboard-only admin routes then return 404.
 
 ### Logging
 
@@ -301,6 +327,7 @@ settings:
   timeout: 300                 # per-request timeout in seconds (default 300)
   load_keep_alive: 86400       # how long model-control loads stay resident; -1 = forever (default 86400)
   allow_all_routes: false      # also proxy non-standard endpoints as fallback (default false)
+  webui: true                  # serve the web dashboard at /ui (default true; --no-webui or NO_WEBUI=true also disable it)
   stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever serve a queued request (default 60)
   max_concurrent_per_backend: 1  # global cap of in-flight requests per backend; raise to let one backend handle several at once (default 1).
                                  # Metadata reads (/api/tags, /api/ps, /api/show, /v1/models, ...) are exempt: they
@@ -374,7 +401,6 @@ The included `docker-compose.yml` provides a ready-to-use configuration:
 ```yaml
 services:
   ollamamq:
-    build: .
     image: chlebon/ollamamq:latest
     container_name: ollamamq
     ports:
@@ -386,15 +412,20 @@ services:
       - TIMEOUT=300
       - RUST_LOG=info
     command: ["--no-tui"]
+    volumes:
+      - ollamamq_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:11435/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:11435/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  ollamamq_data:
 ```
 
 **Note for Linux Users:**
@@ -411,6 +442,18 @@ The Dockerfile uses a multi-stage build:
 - **Build stage**: Uses `rust:1.97-alpine` (pinned) to compile the release binary
 - **Runtime stage**: Uses `alpine:3.20` with only `ca-certificates` for a minimal footprint (~10MB)
 
+### Persistent Data
+
+ollamaMQ keeps its state in its working directory. The Docker image runs from `/data`, which is a volume:
+
+| File | Contents |
+| ---- | -------- |
+| `blocked_items.json` | Blocked users and IPs, plus the VIP and boosted user — restored on startup |
+| `ollamamq-requests.jsonl` | Request/response log (see [Request logging](#request-logging)) |
+| `appconf.yaml` | Optional configuration (see Configuration) |
+
+`docker-compose.yml` mounts the named volume `ollamamq_data` there, so these survive restarts and re-creates (image upgrades, `docker compose up -d --build`). With `docker run`, add `-v ollamamq_data:/data`. When you run the binary directly, the files live in the current directory.
+
 ### Environment Variables
 
 | Variable       | Description                                        | Default                  |
@@ -421,6 +464,8 @@ The Dockerfile uses a multi-stage build:
 | `HOST`        | Host/interface to bind to      | `0.0.0.0`                |
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
+| `NO_WEBUI`    | Set to `true` to disable the web dashboard | *(unset — dashboard enabled)* |
+| `TRUST_FORWARDED_FOR` | Set to `true` to take client addresses from `X-Forwarded-For` / `X-Real-IP` (only behind a proxy you control) | *(unset — use the TCP peer)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 
@@ -475,7 +520,7 @@ docker run -d \
 
 ## 📦 Publishing to Docker Hub
 
-To publish a new version of `ollamaMQ` to Docker Hub, follow these steps:
+Pushing a version tag (`v*`) publishes the image automatically via `.github/workflows/docker-publish.yml` (it needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`). To publish by hand instead, follow these steps:
 
 1. **Update Version**: Update the version number in `Cargo.toml`.
 2. **Build and Tag**:

@@ -19,10 +19,17 @@ use tracing::{debug, info, warn};
 
 const BLOCKED_FILE: &str = "blocked_items.json";
 
+/// What survives a restart: the block lists and the VIP / boost users. Lives in
+/// `blocked_items.json` (the name predates VIP/boost); fields added later are
+/// `#[serde(default)]` so files written by older versions still load.
 #[derive(Serialize, Deserialize, Default)]
 struct BlockedConfig {
     ips: HashSet<IpAddr>,
     users: HashSet<String>,
+    #[serde(default)]
+    vip_user: Option<String>,
+    #[serde(default)]
+    boost_user: Option<String>,
 }
 
 /// Minimal view of a request body used to pull out the requested model.
@@ -709,6 +716,11 @@ pub struct AppState {
     /// gigabytes to pile up; this bounds it in bytes. Read and updated only
     /// under the `queues` lock, so the checks are atomic with the push/pop.
     pub queued_bytes: std::sync::atomic::AtomicU64,
+    /// When set, the client address is taken from `X-Forwarded-For` /
+    /// `X-Real-IP` instead of the TCP peer (see [`client_ip`]). Off by default:
+    /// those headers are client-controlled, so trusting them is only safe when
+    /// every request arrives through a proxy you operate.
+    pub trust_forwarded_for: std::sync::atomic::AtomicBool,
 }
 
 /// One line of the TUI Logs panel: a request entering ("IN") or leaving
@@ -821,7 +833,7 @@ impl AppState {
         log_content_limit: usize,
         max_queued_bytes: u64,
     ) -> Self {
-        let (blocked_ips, blocked_users) = Self::load_blocked_items();
+        let saved = Self::load_blocked_items();
         // Which declared `models:` entries belong to which backend, resolved
         // once here with the same selector the loader uses. The names are not
         // put into `available_models` here: `apply_probe` stays the single
@@ -866,10 +878,10 @@ impl AppState {
             processed_counts: Mutex::new(HashMap::new()),
             dropped_counts: Mutex::new(HashMap::new()),
             user_ips: Mutex::new(HashMap::new()),
-            blocked_ips: Mutex::new(blocked_ips),
-            blocked_users: Mutex::new(blocked_users),
-            vip_user: Mutex::new(None),
-            boost_user: Mutex::new(None),
+            blocked_ips: Mutex::new(saved.ips),
+            blocked_users: Mutex::new(saved.users),
+            vip_user: Mutex::new(saved.vip_user),
+            boost_user: Mutex::new(saved.boost_user),
             global_counter: std::sync::atomic::AtomicUsize::new(0),
             fair_share: Mutex::new(HashMap::new()),
             notify: Notify::new(),
@@ -891,6 +903,7 @@ impl AppState {
             log_content_limit,
             max_queued_bytes,
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
+            trust_forwarded_for: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -925,23 +938,37 @@ impl AppState {
         }
     }
 
-    fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
-        if let Ok(content) = fs::read_to_string(BLOCKED_FILE)
-            && let Ok(config) = serde_json::from_str::<BlockedConfig>(&content)
-        {
-            return (config.ips, config.users);
-        }
-        (HashSet::new(), HashSet::new())
+    fn load_blocked_items() -> BlockedConfig {
+        fs::read_to_string(BLOCKED_FILE)
+            .ok()
+            .and_then(|content| serde_json::from_str::<BlockedConfig>(&content).ok())
+            .unwrap_or_default()
     }
 
     fn save_blocked_items(&self) {
         let config = BlockedConfig {
             ips: self.blocked_ips.lock_or_recover().clone(),
             users: self.blocked_users.lock_or_recover().clone(),
+            vip_user: self.vip_user.lock_or_recover().clone(),
+            boost_user: self.boost_user.lock_or_recover().clone(),
         };
         if let Ok(content) = serde_json::to_string_pretty(&config) {
             let _ = fs::write(BLOCKED_FILE, content);
         }
+    }
+
+    /// Toggle `user_id` as the VIP (absolute priority). Setting it clears the
+    /// same user's boost, and the choice is saved across restarts.
+    pub fn toggle_vip(&self, user_id: &str) {
+        toggle_exclusive(&self.vip_user, &self.boost_user, user_id);
+        self.save_blocked_items();
+    }
+
+    /// Toggle `user_id` as the boosted user. Setting it clears the same user's
+    /// VIP, and the choice is saved across restarts.
+    pub fn toggle_boost(&self, user_id: &str) {
+        toggle_exclusive(&self.boost_user, &self.vip_user, user_id);
+        self.save_blocked_items();
     }
 
     pub fn block_ip(&self, ip: IpAddr) {
@@ -1009,6 +1036,23 @@ impl AppState {
             }
             i += 1;
         }
+    }
+}
+
+/// Toggle `id` in `slot`, clearing it from `other` when it was just set, so a
+/// user is never both VIP and boosted.
+fn toggle_exclusive(slot: &Mutex<Option<String>>, other: &Mutex<Option<String>>, id: &str) {
+    {
+        let mut s = slot.lock_or_recover();
+        if s.as_deref() == Some(id) {
+            *s = None;
+            return;
+        }
+        *s = Some(id.to_string());
+    }
+    let mut o = other.lock_or_recover();
+    if o.as_deref() == Some(id) {
+        *o = None;
     }
 }
 
@@ -2231,6 +2275,55 @@ pub async fn run_worker(state: Arc<AppState>) {
     }
 }
 
+/// Who a request is attributed to. `X-User-ID` wins; Open WebUI (with
+/// ENABLE_FORWARD_USER_INFO_HEADERS) sends its own user-name header instead.
+/// Clients that identify nobody — scrapers, health pollers, plain scripts —
+/// are told apart by their `User-Agent` product (e.g. `anonymous (Go-http-client)`)
+/// so they don't all pile into one anonymous bucket. A request with no
+/// `User-Agent` either stays plain `anonymous`.
+fn client_label(headers: &HeaderMap) -> String {
+    let named = ["X-User-ID", "X-OpenWebUI-User-Name"].iter().find_map(|h| {
+        headers
+            .get(*h)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+    });
+    if let Some(name) = named {
+        return name.to_string();
+    }
+    let product = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|ua| ua.split(['/', ' ']).next())
+        .filter(|p| !p.is_empty());
+    match product {
+        Some(p) => format!("anonymous ({p})"),
+        None => "anonymous".to_string(),
+    }
+}
+
+/// The address a request is attributed to (IP blocking, the dashboard's
+/// "Last IP"). The TCP peer, unless `trust` is set and a proxy supplied the
+/// original client: the first valid address in `X-Forwarded-For` (the
+/// leftmost entry is the original client), else `X-Real-IP`.
+fn client_ip(headers: &HeaderMap, peer: IpAddr, trust: bool) -> IpAddr {
+    if !trust {
+        return peer;
+    }
+    let forwarded = headers
+        .get("X-Forwarded-For")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').find_map(|part| part.trim().parse::<IpAddr>().ok()));
+    forwarded
+        .or_else(|| {
+            headers
+                .get("X-Real-IP")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        })
+        .unwrap_or(peer)
+}
+
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -2240,12 +2333,14 @@ pub async fn proxy_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
-    let ip = addr.ip();
-    let user_id = headers
-        .get("X-User-ID")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
+    let ip = client_ip(
+        &headers,
+        addr.ip(),
+        state
+            .trust_forwarded_for
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let user_id = client_label(&headers);
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
@@ -2468,6 +2563,44 @@ pub async fn proxy_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_state_from_older_versions_still_loads() {
+        let old = r#"{"ips":["10.0.0.1"],"users":["mallory"]}"#;
+        let cfg: BlockedConfig = serde_json::from_str(old).unwrap();
+        assert!(cfg.users.contains("mallory"));
+        assert_eq!(cfg.vip_user, None);
+        assert_eq!(cfg.boost_user, None);
+    }
+
+    #[test]
+    fn saved_state_round_trips_vip_and_boost() {
+        let cfg = BlockedConfig {
+            vip_user: Some("alice".into()),
+            boost_user: Some("bob".into()),
+            ..Default::default()
+        };
+        let back: BlockedConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.vip_user.as_deref(), Some("alice"));
+        assert_eq!(back.boost_user.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn vip_and_boost_are_mutually_exclusive_and_toggle() {
+        let vip = Mutex::new(None);
+        let boost = Mutex::new(None);
+        toggle_exclusive(&boost, &vip, "alice");
+        assert_eq!(boost.lock().unwrap().as_deref(), Some("alice"));
+        // Making the same user VIP takes them out of boost.
+        toggle_exclusive(&vip, &boost, "alice");
+        assert_eq!(vip.lock().unwrap().as_deref(), Some("alice"));
+        assert_eq!(*boost.lock().unwrap(), None);
+        // A second press clears it.
+        toggle_exclusive(&vip, &boost, "alice");
+        assert_eq!(*vip.lock().unwrap(), None);
+    }
+
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -4927,5 +5060,34 @@ mod tests {
 
         worker.abort();
         mock1.1.abort();
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarding_headers_unless_trusted() {
+        let peer: IpAddr = "172.17.0.1".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(client_ip(&h, peer, false), peer);
+        assert_eq!(client_ip(&h, peer, true), "203.0.113.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_prefers_leftmost_valid_forwarded_for_then_real_ip() {
+        let peer: IpAddr = "172.17.0.1".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "garbage, 198.51.100.7, 10.0.0.2")]);
+        assert_eq!(client_ip(&h, peer, true), "198.51.100.7".parse::<IpAddr>().unwrap());
+        let h = headers(&[("x-forwarded-for", "nope"), ("x-real-ip", "2001:db8::1")]);
+        assert_eq!(client_ip(&h, peer, true), "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(&HeaderMap::new(), peer, true), peer);
     }
 }

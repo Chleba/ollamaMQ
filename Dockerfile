@@ -32,6 +32,12 @@ COPY --from=builder /build/target/release/ollamaMQ /app/ollamaMQ
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
+# Runtime state (blocked users/IPs, VIP/boost, request log, appconf.yaml) lives
+# in the working directory; mount a volume here so it survives recreation.
+RUN mkdir -p /data
+WORKDIR /data
+VOLUME ["/data"]
+
 # Expose the default port
 EXPOSE 11435
 

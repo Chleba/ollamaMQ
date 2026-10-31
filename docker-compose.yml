@@ -10,7 +10,8 @@ services:
   #   restart: unless-stopped
 
   ollamamq:
-    build: .
+    # Pulls the published image. To build from source instead, add the build file:
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
     image: chlebon/ollamamq:latest
     container_name: ollamamq
     ports:
@@ -25,15 +26,20 @@ services:
       - TIMEOUT=300
       - RUST_LOG=info
     command: ["--no-tui"]
+    volumes:
+      # Blocked users/IPs, VIP/boost, request log and appconf.yaml (the working
+      # directory) — kept across restarts and re-creates.
+      - ollamamq_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:11435/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:11435/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
 
-# volumes:
-#   ollama_data:
+volumes:
+  ollamamq_data:
+  # ollama_data:

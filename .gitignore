@@ -4,3 +4,6 @@ blocked_items.json
 appconf.yaml
 ollamamq-requests.jsonl
 
+# Local deployment settings
+.env
+docker-compose.override.yml
