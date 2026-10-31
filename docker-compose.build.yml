@@ -1,0 +1,5 @@
+# Build the image from this checkout instead of pulling the published one:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  ollamamq:
+    build: .

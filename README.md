@@ -67,15 +67,15 @@ cargo install ollamaMQ
    docker compose up -d
    ```
 
+   This pulls the published `chlebon/ollamamq` image — nothing is compiled on your machine. To build from your checkout instead (for development), add the build file:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+   ```
+   or `docker build -t chlebon/ollamamq .` for the plain CLI.
+
 #### Using Docker CLI
 
-First build the image from the local Dockerfile:
-
-```bash
-docker build -t chlebon/ollamamq .
-```
-
-Then run the container:
+Run the published image:
 
 ```bash
 docker run -d \
@@ -401,7 +401,6 @@ The included `docker-compose.yml` provides a ready-to-use configuration:
 ```yaml
 services:
   ollamamq:
-    build: .
     image: chlebon/ollamamq:latest
     container_name: ollamamq
     ports:
@@ -521,7 +520,7 @@ docker run -d \
 
 ## 📦 Publishing to Docker Hub
 
-To publish a new version of `ollamaMQ` to Docker Hub, follow these steps:
+Pushing a version tag (`v*`) publishes the image automatically via `.github/workflows/docker-publish.yml` (it needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`). To publish by hand instead, follow these steps:
 
 1. **Update Version**: Update the version number in `Cargo.toml`.
 2. **Build and Tag**:

@@ -36,3 +36,6 @@ blocked_items.json
 # CI/CD
 .github/
 .gitlab-ci.yml
+docker-compose.*.yml
+.env
+.env.*

@@ -10,7 +10,8 @@ services:
   #   restart: unless-stopped
 
   ollamamq:
-    build: .
+    # Pulls the published image. To build from source instead, add the build file:
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
     image: chlebon/ollamamq:latest
     container_name: ollamamq
     ports:
