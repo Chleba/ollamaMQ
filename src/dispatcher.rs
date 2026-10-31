@@ -716,6 +716,11 @@ pub struct AppState {
     /// gigabytes to pile up; this bounds it in bytes. Read and updated only
     /// under the `queues` lock, so the checks are atomic with the push/pop.
     pub queued_bytes: std::sync::atomic::AtomicU64,
+    /// When set, the client address is taken from `X-Forwarded-For` /
+    /// `X-Real-IP` instead of the TCP peer (see [`client_ip`]). Off by default:
+    /// those headers are client-controlled, so trusting them is only safe when
+    /// every request arrives through a proxy you operate.
+    pub trust_forwarded_for: std::sync::atomic::AtomicBool,
 }
 
 /// One line of the TUI Logs panel: a request entering ("IN") or leaving
@@ -898,6 +903,7 @@ impl AppState {
             log_content_limit,
             max_queued_bytes,
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
+            trust_forwarded_for: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2269,6 +2275,55 @@ pub async fn run_worker(state: Arc<AppState>) {
     }
 }
 
+/// Who a request is attributed to. `X-User-ID` wins; Open WebUI (with
+/// ENABLE_FORWARD_USER_INFO_HEADERS) sends its own user-name header instead.
+/// Clients that identify nobody — scrapers, health pollers, plain scripts —
+/// are told apart by their `User-Agent` product (e.g. `anonymous (Go-http-client)`)
+/// so they don't all pile into one anonymous bucket. A request with no
+/// `User-Agent` either stays plain `anonymous`.
+fn client_label(headers: &HeaderMap) -> String {
+    let named = ["X-User-ID", "X-OpenWebUI-User-Name"].iter().find_map(|h| {
+        headers
+            .get(*h)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+    });
+    if let Some(name) = named {
+        return name.to_string();
+    }
+    let product = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|ua| ua.split(['/', ' ']).next())
+        .filter(|p| !p.is_empty());
+    match product {
+        Some(p) => format!("anonymous ({p})"),
+        None => "anonymous".to_string(),
+    }
+}
+
+/// The address a request is attributed to (IP blocking, the dashboard's
+/// "Last IP"). The TCP peer, unless `trust` is set and a proxy supplied the
+/// original client: the first valid address in `X-Forwarded-For` (the
+/// leftmost entry is the original client), else `X-Real-IP`.
+fn client_ip(headers: &HeaderMap, peer: IpAddr, trust: bool) -> IpAddr {
+    if !trust {
+        return peer;
+    }
+    let forwarded = headers
+        .get("X-Forwarded-For")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').find_map(|part| part.trim().parse::<IpAddr>().ok()));
+    forwarded
+        .or_else(|| {
+            headers
+                .get("X-Real-IP")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        })
+        .unwrap_or(peer)
+}
+
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -2278,12 +2333,14 @@ pub async fn proxy_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
-    let ip = addr.ip();
-    let user_id = headers
-        .get("X-User-ID")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
+    let ip = client_ip(
+        &headers,
+        addr.ip(),
+        state
+            .trust_forwarded_for
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let user_id = client_label(&headers);
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
@@ -2506,6 +2563,7 @@ pub async fn proxy_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn saved_state_from_older_versions_still_loads() {
         let old = r#"{"ips":["10.0.0.1"],"users":["mallory"]}"#;
@@ -5004,4 +5062,32 @@ mod tests {
         mock1.1.abort();
     }
 
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarding_headers_unless_trusted() {
+        let peer: IpAddr = "172.17.0.1".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(client_ip(&h, peer, false), peer);
+        assert_eq!(client_ip(&h, peer, true), "203.0.113.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_prefers_leftmost_valid_forwarded_for_then_real_ip() {
+        let peer: IpAddr = "172.17.0.1".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "garbage, 198.51.100.7, 10.0.0.2")]);
+        assert_eq!(client_ip(&h, peer, true), "198.51.100.7".parse::<IpAddr>().unwrap());
+        let h = headers(&[("x-forwarded-for", "nope"), ("x-real-ip", "2001:db8::1")]);
+        assert_eq!(client_ip(&h, peer, true), "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(&HeaderMap::new(), peer, true), peer);
+    }
 }

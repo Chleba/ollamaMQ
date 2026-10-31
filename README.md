@@ -146,6 +146,16 @@ curl -X POST http://localhost:11435/v1/systemone \
        "questions": {"refund": {"type": "noul", "instructions": "Is a refund justified?"}}}'
 ```
 
+### Client Identification
+
+Each client gets its own queue, named by the first of these that is present:
+
+1. the `X-User-ID` header;
+2. the `X-OpenWebUI-User-Name` header — [Open WebUI](https://openwebui.com) sends it (with the logged-in user's name, e.g. from your SSO) when you set `ENABLE_FORWARD_USER_INFO_HEADERS=true`;
+3. otherwise `anonymous (<client>)`, taken from the `User-Agent` (for example `anonymous (curl)`), so scripts and monitoring pollers show up separately instead of as one `anonymous`.
+
+The **Last IP** shown for a user and used by "Block IP" is the TCP peer address. Behind a reverse proxy or a Docker bridge that is the proxy's address, not the client's. If every request reaches ollamaMQ through a proxy **you** control and that proxy sets `X-Forwarded-For` (or `X-Real-IP`), start ollamaMQ with `--trust-forwarded-for` (or `TRUST_FORWARDED_FOR=true`) to use the original client address instead. Leave it off otherwise: those headers are client-controlled, so a client that can reach ollamaMQ directly could forge an address and slip past an IP block.
+
 ### Model Control (Admin API)
 
 Models can be loaded and unloaded on connected backends without touching the backend servers. Supported backends:
@@ -456,6 +466,7 @@ ollamaMQ keeps its state in its working directory. The Docker image runs from `/
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
 | `NO_WEBUI`    | Set to `true` to disable the web dashboard | *(unset — dashboard enabled)* |
+| `TRUST_FORWARDED_FOR` | Set to `true` to take client addresses from `X-Forwarded-For` / `X-Real-IP` (only behind a proxy you control) | *(unset — use the TCP peer)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 

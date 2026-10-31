@@ -82,6 +82,12 @@ struct Args {
     #[arg(long)]
     load_keep_alive: Option<i64>,
 
+    /// Take the client address from `X-Forwarded-For` / `X-Real-IP` instead of
+    /// the TCP peer (also enabled by TRUST_FORWARDED_FOR=true). Only safe when
+    /// every request reaches ollamaMQ through a proxy you control; otherwise a
+    /// client can spoof its address and slip past IP blocks.
+    #[arg(long, default_value_t = false)]
+    trust_forwarded_for: bool,
 
     /// Path to the central configuration file: backends, settings and the
     /// models to load onto them. Applied at startup; reload with 'r' in the TUI.
@@ -329,6 +335,14 @@ async fn main() {
     // probe round running first would classify it `???` and leave it there for
     // a whole tick.
     state.apply_backend_kinds(&backend_kinds);
+
+    let trust_forwarded_for = args.trust_forwarded_for || env_flag("TRUST_FORWARDED_FOR");
+    state
+        .trust_forwarded_for
+        .store(trust_forwarded_for, std::sync::atomic::Ordering::Relaxed);
+    if trust_forwarded_for {
+        info!("Trusting X-Forwarded-For / X-Real-IP for client addresses");
+    }
 
     let worker_state = state.clone();
     tokio::spawn(async move {
