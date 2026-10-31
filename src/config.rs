@@ -52,6 +52,10 @@ pub struct Settings {
     /// Enable fallback proxy for non-standard endpoints (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_all_routes: Option<bool>,
+    /// Serve the web dashboard (`/ui`) and its admin API (default true).
+    /// `--no-webui` or `NO_WEBUI=true` turn it off regardless of this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webui: Option<bool>,
     /// How long (seconds) a request may wait when no backend can ever serve
     /// it before answering 503 (default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]

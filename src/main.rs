@@ -19,12 +19,22 @@ mod dispatcher;
 mod lock;
 mod reqlog;
 mod tui;
+mod webui;
 
 use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
 use crate::dispatcher::{AppState, proxy_handler, run_worker};
 use crate::lock::LockExt;
+use crate::webui::{admin_ip_action, admin_state, admin_user_action, icon, ui_page};
 
 use std::io::IsTerminal;
+
+/// True when the environment variable is set to a truthy value (`1`, `true`,
+/// `yes`, `on`; case-insensitive).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -55,6 +65,11 @@ struct Args {
     #[arg(long)]
     no_tui: bool,
 
+    /// Disable the web dashboard (`/ui` and its admin API). Also disabled by
+    /// NO_WEBUI=true or appconf.yaml `settings.webui: false`.
+    #[arg(long)]
+    no_webui: bool,
+
     /// Allow all routes (enable fallback proxy; overrides
     /// appconf.yaml `settings.allow_all_routes`)
     #[arg(long, default_value_t = false)]
@@ -66,6 +81,7 @@ struct Args {
     /// Overrides appconf.yaml `settings.load_keep_alive`.
     #[arg(long)]
     load_keep_alive: Option<i64>,
+
 
     /// Path to the central configuration file: backends, settings and the
     /// models to load onto them. Applied at startup; reload with 'r' in the TUI.
@@ -218,6 +234,8 @@ async fn main() {
         .unwrap_or(512 * 1024 * 1024);
     let allow_all_routes =
         args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
+    let use_webui =
+        !args.no_webui && !env_flag("NO_WEBUI") && file_cfg.settings.webui.unwrap_or(true);
 
     // `kind:` per backend, in config order, collected before `file_cfg.backends`
     // is consumed below. Only the config file can carry one: `--backend-urls`
@@ -395,6 +413,15 @@ async fn main() {
         .route("/admin/models/load", post(admin_model_load))
         .route("/admin/models/unload", post(admin_model_unload));
 
+    // Web dashboard data and user actions (the page itself is `/ui`), behind
+    // the same optional API-key auth as the rest of the admin API.
+    if use_webui {
+        app = app
+            .route("/admin/state", get(admin_state))
+            .route("/admin/users/{id}/{action}", post(admin_user_action))
+            .route("/admin/ips/{ip}/{action}", post(admin_ip_action));
+    }
+
     // Optional fallback
     if allow_all_routes {
         app = app.fallback(proxy_handler);
@@ -407,10 +434,14 @@ async fn main() {
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state.clone());
 
-    let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
-        .merge(app)
-        .with_state(state.clone());
+    let mut shell = Router::new().route("/health", get(|| async { "OK" }));
+    if use_webui {
+        // The page and icon are public; the page sends the API key (when one
+        // is configured) with its `/admin/*` calls.
+        shell = shell.route("/ui", get(ui_page)).route("/icon.svg", get(icon));
+        info!("Web dashboard enabled at /ui");
+    }
+    let app = shell.merge(app).with_state(state.clone());
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

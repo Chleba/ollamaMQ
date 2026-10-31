@@ -23,6 +23,7 @@
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users. VIP, Boost and blocked users/IPs are saved and restored on restart.
+- **Web Dashboard**: The same live view in your browser at `/ui` — backends, users, queues and activity, with VIP/Boost/block controls. Optional (`--no-webui`).
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
@@ -217,6 +218,20 @@ curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecre
 
 **Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
 
+### Web Dashboard
+
+Open `http://localhost:11435/ui` (use your host and port). It mirrors the TUI: Backend Instances, Active Users, Queue Status and Blocked Items, refreshing every couple of seconds, with the same keys — `h`/`l`/`Tab` switch panel, `j`/`k` (or the arrows) move, `Space`/`Enter` expand a backend's models, `p` VIP, `b` Boost, `x` block user, `X` block IP, `u` unblock. Click a row to select it.
+
+It is served by the proxy itself (a single embedded page — nothing extra to install or build) and backed by:
+
+- `GET /admin/state` — users, backends and recent activity as JSON (request and response bodies are never included)
+- `POST /admin/users/{id}/{vip|boost|block|unblock}` and `POST /admin/ips/{ip}/{block|unblock}` — the actions
+- `GET /icon.svg` — the dashboard icon
+
+These `/admin/*` routes use the same optional API-key auth (see Security) as the rest of the admin API; the page asks for the key when one is configured. `/ui` and `/icon.svg` themselves are public. **Without an API key, anyone who can reach the port can block users**, so set `OLLAMA_MQ_API_KEY` (or keep the port private) if that matters.
+
+To turn it off, as you would with `--no-tui`: pass `--no-webui`, set `NO_WEBUI=true`, or set `webui: false` under `settings:` in `appconf.yaml`. The page and the dashboard-only admin routes then return 404.
+
 ### Logging
 
 `ollamaMQ` uses [`tracing`](https://docs.rs/tracing) and behaves differently depending on the mode:
@@ -302,6 +317,7 @@ settings:
   timeout: 300                 # per-request timeout in seconds (default 300)
   load_keep_alive: 86400       # how long model-control loads stay resident; -1 = forever (default 86400)
   allow_all_routes: false      # also proxy non-standard endpoints as fallback (default false)
+  webui: true                  # serve the web dashboard at /ui (default true; --no-webui or NO_WEBUI=true also disable it)
   stuck_timeout: 60            # fail-fast 503 after N s when no backend can ever serve a queued request (default 60)
   max_concurrent_per_backend: 1  # global cap of in-flight requests per backend; raise to let one backend handle several at once (default 1).
                                  # Metadata reads (/api/tags, /api/ps, /api/show, /v1/models, ...) are exempt: they
@@ -439,6 +455,7 @@ ollamaMQ keeps its state in its working directory. The Docker image runs from `/
 | `HOST`        | Host/interface to bind to      | `0.0.0.0`                |
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
+| `NO_WEBUI`    | Set to `true` to disable the web dashboard | *(unset — dashboard enabled)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 

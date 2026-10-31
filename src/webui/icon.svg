@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="ollamaMQ">
+  <!-- Terminal-dashboard look: dark background, a bordered panel, and a queue of progress bars. -->
+  <rect width="128" height="128" rx="24" fill="#0c0f14"/>
+  <rect x="9" y="9" width="110" height="110" rx="12" fill="none" stroke="#e5d36b" stroke-width="4"/>
+  <!-- ">>" selection marker -->
+  <path d="M22 34l9 8-9 8M35 34l9 8-9 8" fill="none" stroke="#e5d36b" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- queue: waiting work shrinking toward the back -->
+  <rect x="54" y="35" width="54" height="14" rx="3" fill="#56d4e0"/>
+  <rect x="22" y="63" width="64" height="14" rx="3" fill="#5fd35f"/>
+  <rect x="22" y="91" width="40" height="14" rx="3" fill="#d070d0"/>
+  <rect x="92" y="63" width="16" height="14" rx="3" fill="#5fd35f" opacity=".45"/>
+  <rect x="68" y="91" width="16" height="14" rx="3" fill="#d070d0" opacity=".45"/>
+</svg>

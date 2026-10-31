@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ollamaMQ</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<style>
+:root {
+  --bg: #0c0f14; --fg: #d7dae0; --dim: #5c6370; --line: #3b4252;
+  --cyan: #56d4e0; --yellow: #e5d36b; --green: #5fd35f; --magenta: #d070d0;
+  --red: #ef5b5b; --sel: #1f2937;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); padding: 12px;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  display: flex; flex-direction: column; gap: 8px; }
+.box { position: relative; border: 1px solid var(--line); border-radius: 4px; padding: 10px 8px 4px; min-width: 0; }
+.box.active { border-color: var(--yellow); }
+.box > .title { position: absolute; top: -10px; left: 10px; background: var(--bg); padding: 0 6px; color: var(--dim); }
+.box.active > .title { color: var(--yellow); }
+#top { padding: 6px 12px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+#top .sep { color: var(--dim); }
+#grid { flex: 1; display: grid; grid-template-columns: 1.1fr 1.2fr 1fr; gap: 8px; min-height: 0; }
+#right { display: grid; grid-template-rows: 1fr 1fr; gap: 8px; min-height: 0; }
+.body { overflow: auto; height: 100%; padding-bottom: 6px; }
+.row { display: grid; align-items: baseline; padding: 0 4px; white-space: nowrap; cursor: default; }
+.row.sel { background: var(--sel); }
+.head { color: var(--yellow); font-weight: bold; }
+.cols-b { grid-template-columns: 2.5ch 1fr 6ch 4ch 5ch; }
+.cols-u { grid-template-columns: 2.5ch 1fr 12ch 4ch 5ch 5ch; }
+.cols-q { grid-template-columns: 2.5ch 1fr 14ch 9ch; }
+.cols-x { grid-template-columns: 2.5ch 8ch 1fr; }
+.r { text-align: right; }
+.cur { color: var(--yellow); }
+.dim { color: var(--dim); }
+.cyan { color: var(--cyan); } .green { color: var(--green); } .yellow { color: var(--yellow); }
+.magenta { color: var(--magenta); } .red { color: var(--red); }
+.sub { padding-left: 4ch; color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+.sub.act { color: var(--cyan); font-weight: bold; }
+.bar { color: var(--green); overflow: hidden; letter-spacing: -1px; }
+.bar.run { color: var(--cyan); }
+.empty { color: var(--dim); padding: 4px; }
+#foot { padding: 6px 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+#foot .v { margin-left: auto; color: var(--dim); }
+#login { display: none; }
+#login input { font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); padding: 2px 6px; }
+#login button { font: inherit; background: var(--sel); color: var(--fg); border: 1px solid var(--line); padding: 2px 8px; cursor: pointer; }
+@media (max-width: 900px) {
+  html, body { height: auto; }
+  #grid { grid-template-columns: 1fr; }
+  .body { max-height: 50vh; }
+}
+</style>
+</head>
+<body>
+<div class="box" id="top"></div>
+<div class="box" id="login">API key required: <input id="key" type="password" autocomplete="off"> <button id="keybtn">Save</button></div>
+<div id="grid">
+  <div class="box" id="p-backends"><span class="title">Backend Instances</span><div class="body" id="backends"></div></div>
+  <div class="box" id="p-users"><span class="title">Active Users</span><div class="body" id="users"></div></div>
+  <div id="right">
+    <div class="box" id="p-queue"><span class="title">Queue Status</span><div class="body" id="queue"></div></div>
+    <div class="box" id="p-blocked"><span class="title">Blocked Items</span><div class="body" id="blocked"></div></div>
+  </div>
+</div>
+<div class="box" id="foot"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const REFRESH_MS = 1500;
+const VERSION = "__VERSION__"; // filled in by the server; stays a placeholder if the file is opened directly
+const PANELS = ["backends", "users", "queue", "blocked"];
+const PANEL_NAME = { backends: "BACKENDS", users: "USERS", queue: "QUEUE", blocked: "BLOCKED" };
+const MODEL_ROWS = 5;
+
+let data = { users: [], backends: [], blocked_ips: [] };
+let panel = "users";
+let sel = { backends: 0, users: 0, queue: 0, blocked: 0 };
+let notice = { text: "", until: 0 };
+let expanded = new Set();
+let apiKey = "";
+try { apiKey = sessionStorage.getItem("omq-key") || ""; } catch (e) {}
+
+const head = (cls, ...cells) => el("div", "row head " + cls, cells.map((c) => (c && c.nodeType ? c : span("", c))));
+
+function el(tag, cls, ...kids) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  for (const k of kids.flat()) {
+    if (k == null || k === false) continue;
+    e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  }
+  return e;
+}
+const span = (cls, t) => el("span", cls, t);
+
+async function call(path, method) {
+  const r = await fetch(path, { method: method || "GET", headers: apiKey ? { "x-api-key": apiKey } : {} });
+  if (r.status === 401) { $("login").style.display = "block"; throw new Error("unauthorized"); }
+  $("login").style.display = "none";
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.status === 204 ? null : r.json();
+}
+
+// Views derived from the snapshot, in the same order the panels draw them.
+const sortedUsers = () => [...data.users].sort((a, b) => b.queued - a.queued || a.id.localeCompare(b.id));
+const queueUsers = () => sortedUsers().filter((u) => u.queued > 0 || u.processing > 0);
+const queueOn = (i) => panel === "queue" && sel.queue === i;
+const blockedItems = () => [
+  ...data.users.filter((u) => u.blocked).map((u) => ({ type: "User", value: u.id })),
+  ...data.blocked_ips.map((ip) => ({ type: "IP", value: ip })),
+];
+const lengths = () => ({ backends: data.backends.length, users: data.users.length, queue: queueUsers().length, blocked: blockedItems().length });
+
+function clamp() {
+  const n = lengths();
+  for (const p of PANELS) sel[p] = Math.max(0, Math.min(sel[p], n[p] - 1));
+}
+
+function statusDot(u) {
+  if (u.blocked) return span("red", "✖");
+  if (u.processing > 0) return span("cyan", "▶");
+  if (u.queued > 0) return span("green", "●");
+  return span("dim", "○");
+}
+
+function renderTop() {
+  const vip = data.users.find((u) => u.vip), boost = data.users.find((u) => u.boost);
+  const sum = (k) => data.users.reduce((a, u) => a + u[k], 0);
+  $("top").replaceChildren(
+    span("cyan", "ollamaMQ"), span("sep", "|"),
+    el("span", "", "Panel: ", span("yellow", PANEL_NAME[panel])), span("sep", "|"),
+    el("span", "", "VIP: ", span(vip ? "magenta" : "dim", vip ? vip.id : "None")), span("sep", "|"),
+    el("span", "", "Boost: ", span(boost ? "yellow" : "dim", boost ? boost.id : "None")), span("sep", "|"),
+    el("span", "", "Q: ", span("yellow", sum("queued"))), span("sep", "|"),
+    el("span", "", "Done: ", span("green", sum("processed"))), span("sep", "|"),
+    el("span", "", "Drop: ", span("red", sum("dropped"))));
+}
+
+function renderBackends() {
+  const rows = [head("cols-b", "", "Backend", "API", span("r", "Act"), span("r", "Done"))];
+  data.backends.forEach((b, i) => {
+    const open = expanded.has(b.index);
+    const r = el("div", "row cols-b" + (panel === "backends" && sel.backends === i ? " sel" : ""),
+      span("cur", panel === "backends" && sel.backends === i ? ">>" : ""),
+      el("span", "", span("dim", open ? "▼ " : "▶ "), span(b.online ? "green" : "red", "● "), b.url,
+        b.operation ? span("yellow", "  [" + b.operation.action + " " + b.operation.model + "]") : null),
+      span("dim", b.api || "?"), el("span", "r", b.active_requests), el("span", "r dim", b.processed));
+    r.addEventListener("click", () => { panel = "backends"; sel.backends = i; draw(); });
+    r.addEventListener("dblclick", () => toggleExpand());
+    rows.push(r);
+    if (open) {
+      const loaded = new Set(b.loaded_models);
+      const act = b.current_model || [...loaded][0];
+      if (act) rows.push(el("div", "sub act", "▶ Active: " + act));
+      const rest = b.available_models.filter((m) => m !== act);
+      rest.slice(0, MODEL_ROWS).forEach((m) => rows.push(el("div", "sub", "└ " + m)));
+      if (rest.length > MODEL_ROWS) rows.push(el("div", "sub", "... and " + (rest.length - MODEL_ROWS) + " more"));
+    }
+  });
+  $("backends").replaceChildren(...(data.backends.length ? rows : [el("div", "empty", "No backends configured.")]));
+}
+
+function renderUsers() {
+  const users = sortedUsers();
+  const rows = [head("cols-u", "", "User ID", "Last IP", span("r", "Q"), span("r", "Done"), span("r", "Drop"))];
+  users.forEach((u, i) => {
+    const on = panel === "users" && sel.users === i;
+    const r = el("div", "row cols-u" + (on ? " sel" : ""),
+      span("cur", on ? ">>" : ""),
+      el("span", "", statusDot(u), " ", u.id, u.vip ? span("magenta", " ★") : null, u.boost ? span("yellow", " ⚡") : null),
+      span("cyan", u.ip || ""), el("span", "r " + (u.queued ? "yellow" : "dim"), u.queued),
+      el("span", "r green", u.processed), el("span", "r " + (u.dropped ? "red" : "dim"), u.dropped));
+    r.addEventListener("click", () => { panel = "users"; sel.users = i; draw(); });
+    rows.push(r);
+  });
+  $("users").replaceChildren(...(users.length ? rows : [el("div", "empty", "No users yet. Send a request with an X-User-ID header.")]));
+}
+
+function renderQueue() {
+  const users = queueUsers();
+  const total = users.reduce((a, u) => a + u.queued, 0);
+  // Bars show waiting + in-flight work, so a running request with an empty queue still has a bar.
+  const widest = Math.max(1, ...users.map((u) => u.queued + u.processing));
+  const rows = [head("cols-q", "", "User ID", "Progress", span("r", "Num"))];
+  users.forEach((u, i) => {
+    const pct = total ? Math.round((u.queued / total) * 100) : 0;
+    const r = el("div", "row cols-q" + (queueOn(i) ? " sel" : ""), span("cur", queueOn(i) ? ">>" : ""),
+      el("span", "", statusDot(u), " ", u.id),
+      span("bar" + (u.processing ? " run" : ""), "▮".repeat(Math.ceil(((u.queued + u.processing) / widest) * 14))),
+      el("span", "r green", u.queued + " (" + pct + "%)"));
+    r.addEventListener("click", () => { panel = "queue"; sel.queue = i; draw(); });
+    rows.push(r);
+  });
+  $("queue").replaceChildren(...(users.length ? rows : [el("div", "empty", "Queue is empty.")]));
+}
+
+function renderBlocked() {
+  const items = blockedItems();
+  const rows = [head("cols-x", "", "Type", "Value")];
+  items.forEach((it, i) => {
+    const on = panel === "blocked" && sel.blocked === i;
+    const r = el("div", "row cols-x" + (on ? " sel" : ""), span("cur", on ? ">>" : ""), span("red", it.type), it.value);
+    r.addEventListener("click", () => { panel = "blocked"; sel.blocked = i; draw(); });
+    rows.push(r);
+  });
+  $("blocked").replaceChildren(...(items.length ? rows : [el("div", "empty", "Nothing blocked.")]));
+}
+
+function renderFoot(msg) {
+  const text = msg || (Date.now() < notice.until ? notice.text : "");
+  const parts = [el("span", "", "h/l/Tab: Switch Panel | j/k: Nav | Space/Enter: Expand Models | p: VIP | b: Boost | x: Block | X: Block IP | u: Unblock")];
+  if (text) parts.push(span("yellow", text));
+  if (!VERSION.startsWith("__")) parts.push(span("v", "v" + VERSION));
+  $("foot").replaceChildren(...parts);
+}
+
+function draw() {
+  clamp();
+  for (const p of PANELS) $("p-" + p).classList.toggle("active", p === panel);
+  renderTop(); renderBackends(); renderUsers(); renderQueue(); renderBlocked();
+  document.querySelectorAll(".row.sel").forEach((r) => r.scrollIntoView({ block: "nearest" }));
+}
+
+function toggleExpand() {
+  if (panel !== "backends") return;
+  const b = data.backends[sel.backends];
+  if (!b) return;
+  expanded.has(b.index) ? expanded.delete(b.index) : expanded.add(b.index);
+  draw();
+}
+
+async function act(path) {
+  try { await call(path, "POST"); await refresh(); }
+  catch (e) { renderFoot(String(e.message || e)); }
+}
+
+function selectedUser() {
+  if (panel === "users") return sortedUsers()[sel.users];
+  if (panel === "queue") return queueUsers()[sel.queue];
+  return null;
+}
+function say(text) { notice = { text, until: Date.now() + 3000 }; renderFoot(); setTimeout(renderFoot, 3100); }
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const n = lengths();
+  const k = e.key;
+  if (k === "j" || k === "ArrowDown") sel[panel] = Math.min(n[panel] - 1, sel[panel] + 1);
+  else if (k === "k" || k === "ArrowUp") sel[panel] = Math.max(0, sel[panel] - 1);
+  else if (k === "l" || k === "Tab" || k === "ArrowRight") panel = PANELS[(PANELS.indexOf(panel) + (e.shiftKey ? PANELS.length - 1 : 1)) % PANELS.length];
+  else if (k === "h" || k === "ArrowLeft") panel = PANELS[(PANELS.indexOf(panel) + PANELS.length - 1) % PANELS.length];
+  else if (k === " " || k === "Enter") toggleExpand();
+  else if (k === "p" && selectedUser()) return act("/admin/users/" + encodeURIComponent(selectedUser().id) + "/vip");
+  else if (k === "b" && selectedUser()) return act("/admin/users/" + encodeURIComponent(selectedUser().id) + "/boost");
+  else if (k === "x" && selectedUser()) return act("/admin/users/" + encodeURIComponent(selectedUser().id) + "/block");
+  else if (k === "X" && selectedUser() && selectedUser().ip) return act("/admin/ips/" + encodeURIComponent(selectedUser().ip) + "/block");
+  else if (k === "u") {
+    const u = selectedUser(), it = panel === "blocked" ? blockedItems()[sel.blocked] : null;
+    if (u && u.blocked) return act("/admin/users/" + encodeURIComponent(u.id) + "/unblock");
+    if (u && u.ip_blocked) return act("/admin/ips/" + encodeURIComponent(u.ip) + "/unblock");
+    if (it) return act(it.type === "IP" ? "/admin/ips/" + encodeURIComponent(it.value) + "/unblock" : "/admin/users/" + encodeURIComponent(it.value) + "/unblock");
+    say(panel === "backends" ? "u: select a user or a blocked item first" : "Nothing to unblock for the selected row");
+    return;
+  } else return;
+  e.preventDefault();
+  draw();
+});
+
+async function refresh() {
+  try {
+    data = await call("/admin/state");
+    draw(); renderFoot();
+  } catch (e) {
+    renderFoot(e.message === "unauthorized" ? "API key needed" : "error: " + e.message);
+  }
+}
+
+$("keybtn").addEventListener("click", () => {
+  apiKey = $("key").value;
+  try { sessionStorage.setItem("omq-key", apiKey); } catch (e) {}
+  refresh();
+});
+
+draw(); renderFoot();
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
