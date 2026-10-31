@@ -540,23 +540,7 @@ impl TuiDashboard {
                             {
                                 let user_id = snapshot.users[i].id.clone();
 
-                                // 1. Handle VIP
-                                {
-                                    let mut vip = state.vip_user.lock_or_recover();
-                                    if vip.as_ref() == Some(&user_id) {
-                                        *vip = None;
-                                    } else {
-                                        *vip = Some(user_id.clone());
-                                    }
-                                }
-
-                                // 2. Clear Boost if we just set VIP
-                                {
-                                    let mut boost = state.boost_user.lock_or_recover();
-                                    if boost.as_ref() == Some(&user_id) {
-                                        *boost = None;
-                                    }
-                                }
+                                state.toggle_vip(&user_id);
                             }
                         }
                         KeyCode::Char('b') => {
@@ -566,23 +550,7 @@ impl TuiDashboard {
                             {
                                 let user_id = snapshot.users[i].id.clone();
 
-                                // 1. Handle Boost
-                                {
-                                    let mut boost = state.boost_user.lock_or_recover();
-                                    if boost.as_ref() == Some(&user_id) {
-                                        *boost = None;
-                                    } else {
-                                        *boost = Some(user_id.clone());
-                                    }
-                                }
-
-                                // 2. Clear VIP if we just set Boost
-                                {
-                                    let mut vip = state.vip_user.lock_or_recover();
-                                    if vip.as_ref() == Some(&user_id) {
-                                        *vip = None;
-                                    }
-                                }
+                                state.toggle_boost(&user_id);
                             }
                         }
                         KeyCode::Char('x') => {

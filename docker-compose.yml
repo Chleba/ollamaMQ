@@ -25,6 +25,10 @@ services:
       - TIMEOUT=300
       - RUST_LOG=info
     command: ["--no-tui"]
+    volumes:
+      # Blocked users/IPs, VIP/boost, request log and appconf.yaml (the working
+      # directory) — kept across restarts and re-creates.
+      - ollamamq_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -35,5 +39,6 @@ services:
       retries: 3
       start_period: 10s
 
-# volumes:
-#   ollama_data:
+volumes:
+  ollamamq_data:
+  # ollama_data:

@@ -22,7 +22,7 @@
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
-- **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
+- **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users. VIP, Boost and blocked users/IPs are saved and restored on restart.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
@@ -80,6 +80,7 @@ Then run the container:
 docker run -d \
   --name ollamamq \
   -p 11435:11435 \
+  -v ollamamq_data:/data \
   --restart unless-stopped \
   chlebon/ollamamq
 ```
@@ -386,6 +387,8 @@ services:
       - TIMEOUT=300
       - RUST_LOG=info
     command: ["--no-tui"]
+    volumes:
+      - ollamamq_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -395,6 +398,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  ollamamq_data:
 ```
 
 **Note for Linux Users:**
@@ -410,6 +416,18 @@ The Dockerfile uses a multi-stage build:
 
 - **Build stage**: Uses `rust:1.97-alpine` (pinned) to compile the release binary
 - **Runtime stage**: Uses `alpine:3.20` with only `ca-certificates` for a minimal footprint (~10MB)
+
+### Persistent Data
+
+ollamaMQ keeps its state in its working directory. The Docker image runs from `/data`, which is a volume:
+
+| File | Contents |
+| ---- | -------- |
+| `blocked_items.json` | Blocked users and IPs, plus the VIP and boosted user — restored on startup |
+| `ollamamq-requests.jsonl` | Request/response log (see [Request logging](#request-logging)) |
+| `appconf.yaml` | Optional configuration (see Configuration) |
+
+`docker-compose.yml` mounts the named volume `ollamamq_data` there, so these survive restarts and re-creates (image upgrades, `docker compose up -d --build`). With `docker run`, add `-v ollamamq_data:/data`. When you run the binary directly, the files live in the current directory.
 
 ### Environment Variables
 
